@@ -114,10 +114,11 @@ def extract_json(text: str) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
+        start = text.find("{")
+        if start < 0:
             raise
-        return json.loads(m.group())
+        # 只取第一个完整的 JSON 对象：模型偶尔会在后面多输出一个 } 或别的内容
+        return json.JSONDecoder().raw_decode(text, start)[0]
 
 
 def normalize(data: dict) -> dict:

@@ -5,7 +5,7 @@ import copy
 
 from config import DEFAULT_RISK
 from engine import Reject, atr_pct, liq_distance, plan_entry, safe_leverage, simulate_candle, split_qty
-from signal_parser import clean_symbol, normalize, to_num
+from signal_parser import clean_symbol, extract_json, normalize, to_num
 
 R = copy.deepcopy(DEFAULT_RISK)
 ok = 0
@@ -45,6 +45,10 @@ n = normalize({"actions": [
 ]})
 check("AI 输出清洗", [a["type"] for a in n["actions"]] == ["open", "close"]
       and n["actions"][0]["symbol"] == "HYPE" and n["actions"][0]["take_profits"] == [99.8, 104, 113])
+# DeepSeek 真实出现过的输出：JSON 后面多了一个 }
+check("AI 输出末尾多余的 } 不影响解析",
+      extract_json('{"actions":[{"type":"close","symbol":"G","fraction":0.3}],"note":"G 再减仓30%"}}')["actions"][0]["fraction"] == 0.3
+      and extract_json('```json\n{"actions":[],"note":"x"}\n```')["note"] == "x")
 
 # ---------- 3. 风控计算（每单打到止损固定亏 10U，杠杆按止损开到最高）----------
 ALT = [{"minNotional": 0, "maxNotional": 50000, "maintenanceMarginRate": 0.01, "maxLeverage": 75}]
