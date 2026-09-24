@@ -6,7 +6,7 @@
 
 ## 你所在的环境和部署方式
 
-- 你在 Claude Code 云端沙盒里，网络经过白名单代理：**不能 SSH 到任何服务器，也连不上 Telegram 和 Bitget**。
+- 你在 Claude Code 云端沙盒里，网络经过白名单代理：**不能 SSH 到任何服务器**。（2026-09 实测：Telegram 机器人 API、Bitget 公共行情、DeepSeek 能访问，可以用 `getMe` 验证机器人 Token、用 `/models` 验证 DeepSeek Key；但 Telegram 账号登录只能在服务器上完成，Bitget API 绑定了服务器 IP，也只能在服务器上验证。）
 - 所以采用「零 SSH」部署：
   1. `deploy/do_deploy.py` 调用 DigitalOcean API，新建一台服务器，并传入开机脚本 `deploy/cloud-init.sh`。
   2. 服务器开机后自己安装 Docker，从 GitHub 拉取本仓库，启动机器人。之后每 5 分钟检查一次 main 分支，有新提交就自动更新（`deploy/update.sh`）。
@@ -41,7 +41,7 @@
 | DIGITALOCEAN_TOKEN | DigitalOcean 网页 → API → Generate New Token，勾选 **Write** |
 | TG_API_ID / TG_API_HASH | 手机浏览器打开 my.telegram.org → 用 Telegram 验证码登录 → API development tools |
 | TG_PHONE | 监听频道用的 Telegram 账号手机号，带国家码，如 +8613800000000 |
-| TG_BOT_TOKEN | Telegram 找 @BotFather → /newbot（新建一个，不要复用博悦 V9 的），同时记下机器人用户名 |
+| TG_BOT_TOKEN | Telegram 找 @BotFather → /newbot（新建一个，不要复用博悦 V9 的），同时记下机器人用户名。**用户名和显示名不要带 Telegram、GenDan / 跟单 之类的字样**（首次部署时这样的机器人两次在建好十几分钟内被 Telegram 自动删除）。拿到 Token 先用 `getMe` 验证，建服务器前再验证一次 |
 | DEEPSEEK_API_KEY | 用户已有 |
 | GITHUB_READ_TOKEN | **仓库是私有的才需要**：GitHub → Settings → Developer settings → Fine-grained tokens → 只选这个仓库 → Contents: Read-only，有效期选最长。仓库公开则不需要 |
 
@@ -79,6 +79,7 @@
 - **创建 15 分钟后机器人仍无反应**：最常见的原因是私有仓库没给 GITHUB_READ_TOKEN、代码不在 main 分支，或者 TG_BOT_TOKEN 填错。请用户用手机浏览器打开 cloud.digitalocean.com → Droplets → tg-signal-trader → Access → Launch Droplet Console，运行 `tail -50 /var/log/tgst-setup.log; docker logs --tail 30 tg-signal-trader`，把结果截图给你。首次构建失败时，自动更新任务每 5 分钟会重试一次（`/var/log/tgst-update.log`）。
 - **机器人发「❌ 发送登录验证码失败」**：TG_API_ID / TG_API_HASH / TG_PHONE 填错（服务器上的变量是创建时写入的，要改只能 `destroy --yes` 后用正确的值重新 `create`；这时还没有交易记录，没有损失）。
 - **机器人发「⚠️ 连不上 Bitget」**：服务器所在地区可能访问不了 Bitget。先看错误内容；确认是地区限制的话，征得用户同意后换 `--region`（如 `sgp1` 换 `fra1`）重建。
+- **机器人突然完全没反应**：先用 `getMe` 检查 Token。返回 401 说明机器人被删或 Token 被重置。Token 是建服务器时写入的，只能让用户新建机器人（名字按第 2 步的要求），征得同意后 `destroy --yes` 再 `create`；已登录的话，登录状态和交易记录会一起清空。
 - **改动没生效**：确认已合并进 main；在控制台运行 `tail /var/log/tgst-update.log` 查看。
 - **/bitget 验证失败**：检查 IP 白名单、合约交易权限、passphrase。
 - **DeepSeek 报 401/402**：Key 错误或余额不足；模型名应为 `deepseek-v4-flash`。
