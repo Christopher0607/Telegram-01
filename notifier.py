@@ -87,6 +87,10 @@ class Notifier:
             log.warning("这个机器人 token 正被别的程序使用（409），请给本程序单独建一个机器人")
             await asyncio.sleep(30)
             return []
+        if r.status_code != 200:  # 401 = Token 失效（机器人被删或 Token 被重置）、429 = 太频繁：别连续狂发请求
+            log.warning("机器人 getUpdates 返回 %s：%s（60 秒后重试）", r.status_code, r.text[:200])
+            await asyncio.sleep(60)
+            return []
         res = r.json().get("result") or []
         if res:
             self.offset = res[-1]["update_id"] + 1
