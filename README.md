@@ -1,0 +1,132 @@
+# Telegram 信号跟单机器人（Bitget USDT 永续）
+
+实时监听 4 个频道 → AI（DeepSeek）读懂喊单 → 代码做风控 → 模拟盘或实盘自动下单 → 跟随频道的止盈 / 提损 / 平仓 → Telegram 推送给你。
+
+**默认全部是模拟盘**，不会动你的钱。先跑 1~2 周，用 `/stats` 看每个频道扣完手续费后的真实战绩，再决定切不切实盘。
+
+## 只用手机部署（推荐：云端 Claude Code）
+
+1. 把 `tg-signal-trader.zip` 上传到你的 GitHub 空仓库：用手机浏览器打开仓库页面，点「uploading an existing file」，选择这个 zip，然后点 Commit changes。
+2. 在 Claude App 的 Code 里，对这个仓库开一个会话，说：**「请按 CLAUDE.md 的首次部署流程，帮我把机器人部署到 DigitalOcean。」**
+3. 按它的提示做：在环境设置里放行 `api.digitalocean.com`、填好几个 Key，并同意新建一台约 6 美元/月的服务器。
+4. 服务器装好后（5~10 分钟），在 Telegram 里给你的机器人发 `/start 口令`，再按提示把登录验证码发给它（数字之间加空格）。
+
+完成后，机器人会发「🚀 信号跟单已启动」。之后你只需要看通知和每晚的日报。
+想改参数或开实盘，跟 Claude Code 说一声：它改完提交到 GitHub，服务器会在 5 分钟内自动更新。
+
+Bitget API：给机器人发 `/ip` 拿到服务器 IP，在 Bitget 建子账户 API（只勾合约交易、不勾提现、IP 白名单填这个 IP），然后发 `/bitget KEY SECRET PASSPHRASE` 给机器人。机器人验证通过后才会保存，并会删掉你这条消息。
+
+下面是有电脑、能 SSH 时的手动部署步骤，用手机部署不用看。
+
+---
+
+## 一、准备（约 15 分钟）
+
+| 要准备的 | 去哪弄 | 填到 .env |
+|---|---|---|
+| Telegram API | https://my.telegram.org → API development tools，随便填个 App 名 | `TG_API_ID` `TG_API_HASH` `TG_PHONE` |
+| 通知机器人 | Telegram 搜 @BotFather → `/newbot`。**新建一个，不要和博悦 V9 共用**。建好后给它发一次 `/start` | `TG_BOT_TOKEN` |
+| DeepSeek Key | 你已经有了 | `DEEPSEEK_API_KEY` |
+| Bitget API（切实盘时再弄） | 见下面「切实盘」 | `BITGET_API_*` |
+
+监听用哪个 Telegram 号：建议用小号（程序会自动加入这 4 个频道）。用小号的话，`TG_OWNER_ID` 填你大号的数字 id（找 @userinfobot 查），通知和命令都走大号。
+
+## 二、部署到 DigitalOcean
+
+```bash
+# 1) 在电脑上把压缩包传到服务器
+scp tg-signal-trader.zip root@你的服务器IP:/root/
+
+# 2) 登录服务器
+ssh root@你的服务器IP
+cd /root && apt install -y unzip && unzip tg-signal-trader.zip && cd tg-signal-trader
+
+# 3) 填密钥
+cp .env.example .env && nano .env        # 填好后 Ctrl+O 回车保存，Ctrl+X 退出
+chmod 600 .env
+
+# 4) 构建 + 离线自检
+docker compose build
+docker compose run --rm bot python selftest.py
+
+# 5) 登录监听账号（会收到 Telegram 验证码，有二步验证还要输密码）
+docker compose run --rm bot python main.py login
+
+# 6) 检查配置：交易所 / AI / 频道 / 通知机器人
+docker compose run --rm bot python main.py check
+
+# 7) 用每个频道最近 30 条消息测试识别效果（只看不下单）
+docker compose run --rm bot python main.py replay 30
+
+# 8) 正式启动（后台运行，服务器重启会自动拉起）
+docker compose up -d
+docker compose logs -f --tail 50          # 看日志，Ctrl+C 退出查看（程序继续跑）
+```
+
+启动后机器人会给你发「🚀 信号跟单已启动」。
+
+## 三、Telegram 命令（发给你的机器人）
+
+| 命令 | 作用 |
+|---|---|
+| `/status` | 运行状态、权益、所有持仓和挂单 |
+| `/stats` | 每个频道已平仓的胜率、总 R、平均 R、盈亏 |
+| `/pause` / `/resume` | 暂停 / 恢复实盘开新仓（已有持仓照常管理） |
+| `/closeall` | 紧急：平掉本程序开的全部实盘仓位、撤挂单，并暂停 |
+| `/ip` | 服务器 IP（Bitget API 白名单填这个） |
+| `/bitget KEY SECRET PASSPHRASE` | 设置 Bitget API（先验证再保存，并删除你这条消息） |
+
+另外每天 22:00（`daily_report_hour` 可改）会自动推送日报：当前持仓 + 各频道战绩。
+
+**R 是什么**：1R = 这一单打到止损会亏的钱。+2R 就是赚了两倍止损金额。某频道 30 单以上总 R 为正，才说明跟它长期是赚的。
+
+## 四、它具体怎么跟单
+
+- **开仓**：信号必须有明确的币种和方向。价格在进场区内（或只偏离 0.5%）就市价进；价格还没到进场区就挂限价单等回调，4 小时不成交自动撤；价格已经跑过止损就不跟。
+- **没给止损的喊单**（「市價輕倉多」这种）：程序按这个币 1 小时 ATR×2 补一个止损（限制在 1.5%～8%）。波动大的币止损自动放宽、仓位自动变小，每单最多亏的钱不变。之后频道「提損」给出更近的止损会照做；这类单子在 /stats 里单独统计，方便判断值不值得跟。不想跟可以设 `fallback_sl_mode: off`。
+- **仓位**：每单打到止损固定亏 10U（含手续费估算），跟信号写几倍杠杆无关。止损越近仓位越大，止损越远仓位越小。
+- **杠杆**：按止损自动开到最高，同时保证强平价在止损之外：程序会查 Bitget 每个币的维持保证金率，让止损距离不超过强平距离的 70%。止损近的单（如 BTC 止损 0.5%）能开到 80 倍以上；止损远的单会自动降低，例如 UMIE 那单 NIL 写 50X、止损 5.6%，50 倍跌 2% 左右就强平，程序只会用 11 倍左右。杠杆越高，占用的保证金越少，每单打到止损亏的钱不变。
+- **止损**：开仓单自带交易所止损，程序挂了也有保护。频道「提損 / 保本」只收紧不放宽，由程序盯盘执行（交易所原止损保留兜底）。
+- **止盈**：按 50% / 30% / 20% 分给信号的各个止盈位，由程序每 5 秒盯盘、到价用「只减仓」市价单分批平；第一止盈后止损移到开仓价。没给止盈的按 2R 设。
+  （交易所里故意不挂止盈限价单：Bitget 的平仓挂单会冻结仓位，可能让止损或紧急平仓执行失败。交易所里只挂止损。）
+- **跟进消息**：频道「回复」原信号发的「市價止盈」「減倉30%」「提損X」「第二止盈看X」会自动关联到那一单执行；只报战绩的（「翻倍了」「tp1止盈」）会忽略。
+- **防坑**：同一个币只做一单；频道事后修改已跟过的信号不跟随；超过 5 分钟的旧消息不处理；24h 成交额低于 300 万 U 的币不做；AI 读出的价格离现价超过 15% 当作识别错误。
+
+## 五、这 4 个频道的实际情况（2026 年 9 月看过的公开消息）
+
+| 频道 | 信号格式 | 程序能跟的比例 |
+|---|---|---|
+| 財財 `zxcccckhf` | `#币 輕倉市價多/空` + 进场 + 多个止盈 + 止损，非常规整 | 高 |
+| 哈基咪 `chun77chun` | `#币 輕倉市價空` + 止盈 + 止损 | 高 |
+| UMIE `IvanCryptotalk` | `$币 (50X做多) 進場…SL…`，大多带止损，后续用回复发止盈/提损/平仓；部分单子不带止损 | 中 |
+| 預言家 `yuyanjia66` | 大多只写 `#币 市價輕倉多`，不给止损；偶尔转发完整信号 | 中（多数靠程序补止损） |
+
+几个频道都是付费会员群的引流频道，宣传的「勝率 85%+」无法核实；而且 50~100 倍杠杆下，「翻倍」只代表价格动了 1~2%。所以才要先用模拟盘拿到自己的数据。
+
+## 六、切实盘
+
+1. Bitget 新建一个**子账户**专门跟单，只划入你愿意拿来跟单的钱（别和博悦 V9 共用账户，两个程序会互相干扰仓位）。
+2. 在子账户建 API Key：只勾「合约交易」，**不要勾提现**，IP 白名单填服务器 IP。
+3. 把三个值填进 `.env`，运行 `docker compose run --rm bot python main.py check` 确认能读到余额。
+4. `config.yaml` 里把表现好的频道 `mode: live`，并把最上面 `live_trading: true`。
+5. `docker compose restart`。
+
+程序会自动把账户设为单向持仓、逐仓。**不要在这个子账户里手动开同币种的仓**。
+
+## 七、常用运维
+
+```bash
+docker compose logs -f --tail 100   # 看日志
+docker compose restart              # 改了 config.yaml 后
+docker compose up -d --build        # 改了代码后
+docker compose down                 # 停止
+```
+
+所有信号、AI 识别结果、交易记录都在 `data/trader.db`（SQLite），日志在 `data/bot.log`。
+`data/telegram.session` 等于你的 Telegram 登录凭证，不要外传。
+
+## 八、已知限制
+
+- 只能读文字，读不了图片里的点位（纯图片信号会被忽略）。
+- 止盈和移动止损由程序每 5 秒检查一次：几秒钟的插针可能吃不到，程序停机期间也不会止盈（但交易所原止损一直有效）。
+- 模拟盘用 1 分钟 K 线撮合，同一根 K 线同时碰到止损和止盈时按止损算（偏保守），不含资金费率。

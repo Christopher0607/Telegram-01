@@ -1,0 +1,65 @@
+# ================================================================
+#  Telegram 信号跟单 · 配置文件
+#  改完执行：docker compose restart
+# ================================================================
+
+# 实盘总开关。false = 所有频道只跑模拟盘，不会动你的钱。
+# 模拟跑 1~2 周，用 /stats 确认某个频道总 R 为正以后，
+# 再把那个频道的 mode 改成 live，并把这里改成 true。
+live_trading: false
+
+exchange:
+  name: bitget
+  margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓
+
+llm:
+  provider: deepseek           # deepseek 或 anthropic
+  model: deepseek-v4-flash     # 用 anthropic 时可填 claude-sonnet-5
+
+paper:
+  equity: 1000                 # 模拟盘本金（U）
+
+timezone_offset_hours: 8       # 时区：北京时间
+daily_report_hour: 22          # 每天几点推送日报（持仓 + 各频道战绩）；-1 = 不推送
+
+channels:
+  - username: IvanCryptotalk   # UMIE_加密貨幣：部分带止损；止盈/提损/平仓常用「回复」发出
+    mode: paper                # paper 模拟 / live 实盘 / off 不监听
+    risk_multiplier: 1.0       # 这个频道的仓位倍数（0.5 = 半仓）
+  - username: zxcccckhf        # 財財加密貨幣頻道：格式最规整（进场/止盈/止损齐全）
+    mode: paper
+  - username: chun77chun       # 哈基咪區塊貨幣中心：市价单 + 止盈 + 止损
+    mode: paper
+  - username: yuyanjia66       # 預言家：多数喊单不带止损，由程序补止损
+    mode: paper
+    # overrides:               # 任何风控参数都能按频道单独设置，例如这个频道的无止损单不跟：
+    #   fallback_sl_mode: off
+
+risk:
+  risk_per_trade_usdt: 10      # 每单打到止损固定亏 10U（含手续费估算）；设 0 则改用下面的百分比
+  risk_per_trade_pct: 1.0      # 只在上面设为 0 时生效：每单亏权益的 %
+  max_leverage: 0              # 0 = 按止损自动开到最高（仍遵守交易所每个币的上限）；想封顶就填数字，如 50
+  liq_safety: 0.7              # 止损距离最多是强平距离的 70%（已计入 Bitget 维持保证金率和手续费），保证先止损
+  max_margin_pct: 25           # 单笔保证金最多占权益 25%
+  max_open_positions: 3        # 同时最多 3 单（持仓 + 挂单，实盘/模拟分开算）
+  # ---- 信号没给止损时怎么办（程序永远不会不带止损下单）----
+  fallback_sl_mode: atr        # atr = 按这个币的波动率补止损（推荐）/ pct = 固定百分比 / off = 不跟
+  fallback_sl_atr_mult: 2.0    # atr：止损距离 = 1 小时 ATR × 2（波动大的币止损自动放宽、仓位自动变小）
+  fallback_sl_min_pct: 1.5     # 补的止损最近 1.5%
+  fallback_sl_max_pct: 8       # 补的止损最远 8%
+  fallback_sl_pct: 3           # pct 模式用的固定止损 %
+  fallback_tp_r: 2.0           # 信号没止盈时，按 2 倍风险设止盈；0 = 不设
+  tp_split: [0.5, 0.3, 0.2]    # 有多个止盈位时，每个位置平掉的比例
+  breakeven_after_tp1: true    # 第一止盈成交后，止损移到开仓价
+  min_rr: 1.0                  # 按实际进场价算的盈亏比低于 1 就不开
+  chase_pct: 0.5               # 价格离开进场区 0.5% 以内仍市价进；更远就挂限价等回调
+  allow_limit_orders: true
+  limit_order_ttl_min: 240     # 限价单 4 小时不成交就撤
+  max_signal_age_sec: 300      # 超过 5 分钟的旧消息不处理（防止重启后补跟旧单）
+  min_24h_volume_usdt: 3000000 # 24h 成交额低于 300 万 U 的币不做
+  allowed_symbols: []          # 只做这些币，例如 [BTC, ETH, SOL]；空 = 不限制
+  blocked_symbols: []          # 永远不做的币
+  follow_close: true           # 跟随频道的平仓/减仓指令
+  follow_move_sl: true         # 跟随频道的提损/保本（只收紧，不放宽）
+  follow_update_tp: true       # 跟随频道后续更新的止盈位
+  fee_rate: 0.0006             # 单边手续费估算

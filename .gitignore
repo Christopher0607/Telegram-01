@@ -1,0 +1,6 @@
+.env
+deploy.env
+data/
+__pycache__/
+*.session
+*.zip

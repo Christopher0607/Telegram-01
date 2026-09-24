@@ -1,0 +1,5 @@
+telethon>=1.40,<2
+ccxt>=4.5.83,<5
+httpx>=0.27,<1
+PyYAML>=6.0
+python-dotenv>=1.0
