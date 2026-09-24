@@ -131,6 +131,12 @@ async def bot_login(client, cfg: Config, notifier: Notifier):
             await notifier.send(f"⏳ Telegram 要求等待约 {e.seconds // 60 + 1} 分钟才能再发验证码，到时我会自动重试。")
             await asyncio.sleep(e.seconds + 5)
             continue
+        except Exception as e:  # API ID/Hash、手机号填错或网络问题：告诉主人，而不是崩溃后反复重启、一声不吭
+            log.exception("发送登录验证码失败")
+            await notifier.send(f"❌ 给 {masked} 发送登录验证码失败：{str(e)[:200]}\n"
+                                f"请把这条消息发给 Claude Code。10 分钟后我会自动重试。")
+            await asyncio.sleep(600)
+            continue
         await notifier.send(f"🔐 需要登录监听频道用的 Telegram 账号 {masked}。\n"
                             f"验证码已发到这个账号里官方的「Telegram」对话。\n"
                             f"请把验证码的数字用空格隔开发给我，例如：1 2 3 4 5\n"
@@ -140,6 +146,8 @@ async def bot_login(client, cfg: Config, notifier: Notifier):
             m = await notifier.next_owner_message(1800)
             if not m:
                 break
+            if m["text"].strip().startswith("/"):
+                continue  # 比如又点了一次绑定链接（/start 口令）：口令不是验证码
             await notifier.delete(m)
             code = re.sub(r"\D", "", m["text"])
             if not code:
@@ -377,10 +385,27 @@ async def cmd_replay(cfg: Config, n: int):
         await client.disconnect()
 
 
+async def init_exchange(ex: Exchange, notifier: Notifier):
+    """加载 Bitget 市场信息。失败就在机器人里提醒一次，之后每分钟重试（不让程序崩溃后反复重启、你却收不到任何消息）。"""
+    warned = False
+    while True:
+        try:
+            await ex.init()
+            if warned:
+                await notifier.send("✅ 已连上 Bitget")
+            return
+        except Exception as e:
+            log.exception("连接 Bitget 失败")
+            if not warned:
+                warned = True
+                await notifier.send(f"⚠️ 连不上 Bitget：{str(e)[:200]}\n我会每分钟自动重试。"
+                                    f"如果一直收不到「✅ 已连上 Bitget」，请把这条消息发给 Claude Code。")
+            await asyncio.sleep(60)
+
+
 async def cmd_run(cfg: Config):
     db = DB(os.path.join(DATA_DIR, "trader.db"))
     ex = Exchange(cfg)
-    await ex.init()
     if cfg.live_trading and not ex.has_keys:
         log.error("live_trading 已打开但没填 Bitget API Key → 本次全部按模拟盘运行")
         cfg.live_trading = False
@@ -400,6 +425,7 @@ async def cmd_run(cfg: Config):
             sys.exit("❌ Telegram 还没登录，先运行：python main.py login")
         await bot_login(client, cfg, notifier)
     me = await client.get_me()
+    await init_exchange(ex, notifier)  # 放在绑定和登录之后：连不上 Bitget 时也能通过机器人告诉你
     parser = SignalParser(cfg)
     engine = Engine(cfg, db, ex, parser, notifier)
     chans = await resolve_channels(client, cfg, join=True)

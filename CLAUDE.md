@@ -76,7 +76,9 @@
 
 ## 故障排查
 
-- **创建 15 分钟后机器人仍无反应**：最常见的原因是私有仓库没给 GITHUB_READ_TOKEN、代码不在 main 分支，或者 TG_BOT_TOKEN 填错。请用户用手机浏览器打开 cloud.digitalocean.com → Droplets → tg-signal-trader → Access → Launch Droplet Console，运行 `tail -50 /var/log/tgst-setup.log`，把结果截图给你。
+- **创建 15 分钟后机器人仍无反应**：最常见的原因是私有仓库没给 GITHUB_READ_TOKEN、代码不在 main 分支，或者 TG_BOT_TOKEN 填错。请用户用手机浏览器打开 cloud.digitalocean.com → Droplets → tg-signal-trader → Access → Launch Droplet Console，运行 `tail -50 /var/log/tgst-setup.log; docker logs --tail 30 tg-signal-trader`，把结果截图给你。首次构建失败时，自动更新任务每 5 分钟会重试一次（`/var/log/tgst-update.log`）。
+- **机器人发「❌ 发送登录验证码失败」**：TG_API_ID / TG_API_HASH / TG_PHONE 填错（服务器上的变量是创建时写入的，要改只能 `destroy --yes` 后用正确的值重新 `create`；这时还没有交易记录，没有损失）。
+- **机器人发「⚠️ 连不上 Bitget」**：服务器所在地区可能访问不了 Bitget。先看错误内容；确认是地区限制的话，征得用户同意后换 `--region`（如 `sgp1` 换 `fra1`）重建。
 - **改动没生效**：确认已合并进 main；在控制台运行 `tail /var/log/tgst-update.log` 查看。
 - **/bitget 验证失败**：检查 IP 白名单、合约交易权限、passphrase。
 - **DeepSeek 报 401/402**：Key 错误或余额不足；模型名应为 `deepseek-v4-flash`。

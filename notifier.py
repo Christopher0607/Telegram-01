@@ -118,6 +118,7 @@ class Notifier:
                 for u in await self._updates(int(max(1, min(50, end - time.time())))):
                     m = self._private_msg(u)
                     if m and (m.get("from") or {}).get("id") == self.owner_id:
+                        self.offset = u["update_id"] + 1  # 同一批里后面的消息留到下次读，不丢
                         return m
             except Exception as e:
                 log.warning("等待消息异常：%s", e)
@@ -125,8 +126,8 @@ class Notifier:
         return None
 
     async def discover_owner(self, pin: str) -> int:
-        """首次部署：等用户给机器人发 /start <pin>，把他记为主人。"""
-        await self.skip_backlog()
+        """首次部署：等用户给机器人发 /start <pin>，把他记为主人。
+        不丢弃积压消息：服务器装好之前就发来的 /start <pin> 也要认（口令每次部署随机生成，旧消息里不会有）。"""
         log.info("等待主人绑定：请在 Telegram 给机器人发送 /start %s", pin)
         while not self.owner_id:
             try:
