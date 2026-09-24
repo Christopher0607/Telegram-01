@@ -17,7 +17,7 @@ import logging
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 from telethon import TelegramClient, events, utils
@@ -116,6 +116,52 @@ def describe(a: dict) -> str:
     return str(a)
 
 
+OUTCOME_CN = {"no_action": "无操作", "edit_ignored": "频道修改了已跟过的信号，不跟随", "closed": "已平仓",
+              "reduced": "已减仓", "pending cancelled": "已撤销挂单", "already closed": "交易所里已经平仓",
+              "reduce too small": "减仓量太小，未执行", "move_sl: ok": "已收紧止损",
+              "move_sl: 不是收紧": "新止损没有更紧，忽略", "update_tp: ok": "已更新止盈",
+              "update_tp: 无效": "新止盈已经过了现价，忽略"}
+
+
+def outcome_cn(outcome: str | None) -> str:
+    out = []
+    for p in (outcome or "").split(" | "):
+        if p in OUTCOME_CN:
+            out.append(OUTCOME_CN[p])
+        elif p.startswith("opened #"):
+            out.append("已开仓 " + p[len("opened "):])
+        elif p.startswith("skip: "):
+            out.append("跳过：" + p[len("skip: "):])
+        elif p.startswith("parse_error: "):
+            out.append("AI 解析失败：" + p[len("parse_error: "):][:80])
+        elif p.startswith("error: "):
+            out.append("执行出错：" + p[len("error: "):][:80])
+        elif p:
+            out.append(p.replace("close:", "平仓：").replace("move_sl:", "移动止损：").replace("update_tp:", "更新止盈："))
+    return "；".join(out) or "-"
+
+
+def ai_text(db: DB, cfg: Config, n: int) -> str:
+    """/ai：最近 n 条频道消息的原文开头、AI 识别结果、程序最后怎么处理的（新的在上面）。"""
+    rows = db.recent_messages(n)
+    if not rows:
+        return "🧠 还没有收到频道消息。"
+    tz = timezone(timedelta(hours=cfg.tz_offset))
+    lines = [f"🧠 最近 {len(rows)} 条频道消息的 AI 识别结果（新的在上面）"]
+    for r in rows:
+        ch = cfg.channel_by_username(r["channel"])
+        when = datetime.fromtimestamp(r["ts"], tz).strftime("%m-%d %H:%M")
+        head = (r["text"] or "").replace("\n", " ")[:50]
+        lines.append(f"\n{when} {(ch.title if ch and ch.title else r['channel'])}{'（修改后）' if r['edited'] else ''}：{head}")
+        parsed = json.loads(r["parsed"]) if r["parsed"] else None
+        if parsed and parsed.get("actions"):
+            lines += [f"  🤖 {describe(a)}" for a in parsed["actions"]]
+        elif parsed:
+            lines.append(f"  🤖 无指令（{parsed.get('note') or '-'}）")
+        lines.append(f"  结果：{outcome_cn(r['outcome'])}")
+    return "\n".join(lines)
+
+
 # ============================== 在机器人对话里登录 ==============================
 async def bot_login(client, cfg: Config, notifier: Notifier):
     """监听账号没登录时，通过你自己的机器人要验证码完成登录（手机上就能完成，不需要 SSH）。"""
@@ -194,6 +240,9 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
                         restart=lambda: asyncio.get_running_loop().call_later(3, os._exit, 0)) -> str | None:
     """机器人命令入口：/ip、/bitget 在这里处理，其余交给 engine。"""
     cmd = text.split()[0].lower().split("@")[0]
+    if cmd == "/ai":
+        arg = text.split()[1] if len(text.split()) > 1 else ""
+        return ai_text(engine.db, cfg, max(1, min(int(arg) if arg.isdigit() else 10, 20)))
     if cmd == "/ip":
         return (f"🌐 服务器 IP：{cfg.server_ip or '未知（请在 DigitalOcean 后台查看）'}\n"
                 f"在 Bitget 创建 API 时，IP 白名单填这个。")

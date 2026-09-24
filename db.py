@@ -71,6 +71,10 @@ class DB:
             self.conn.execute("UPDATE messages SET trade_id=? WHERE id=?", (trade_id, row_id))
         self.conn.commit()
 
+    def recent_messages(self, n: int) -> list[dict]:
+        """最近 n 条频道消息（新的在前），给 /ai 命令看 AI 识别结果用。"""
+        return [dict(r) for r in self.conn.execute("SELECT * FROM messages ORDER BY id DESC LIMIT ?", (n,))]
+
     def trade_for_message(self, chat_id: int, msg_id: int) -> int | None:
         """找到某条频道消息关联的交易（原始信号，或者曾经处理过的跟进消息）。"""
         r = self.conn.execute(
