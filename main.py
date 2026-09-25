@@ -26,12 +26,13 @@ import ccxt.async_support as ccxt
 from telethon.errors import (FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError,
                              PhoneCodeInvalidError, SessionPasswordNeededError)
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.types import MessageMediaPhoto
 
 from config import ChannelCfg, Config, DATA_DIR, save_secrets
 from db import DB
 from engine import MODE_CN, SIDE_CN, Engine, MsgCtx, fmt
 from exchange import LABELS, Exchange
-from notifier import Notifier
+from notifier import KEYBOARD, Notifier
 from signal_parser import SignalParser
 
 log = logging.getLogger("main")
@@ -81,10 +82,29 @@ async def resolve_channels(client, cfg: Config, join: bool = True) -> dict:
     return out
 
 
-async def build_ctx(ch: ChannelCfg, msg, edited: bool) -> MsgCtx | None:
+IMAGE_MIMES = ("image/jpeg", "image/png", "image/webp")
+
+
+def image_mime(msg) -> str | None:
+    """消息里有能交给 AI 看的图片就返回它的格式：照片，或者以文件形式发的图片（不含贴纸、动图、链接预览图）。"""
+    if isinstance(msg.media, MessageMediaPhoto) and msg.media.photo:
+        return "image/jpeg"
+    f = msg.file
+    if msg.document and not msg.sticker and not msg.gif and f and f.mime_type in IMAGE_MIMES and (f.size or 0) < 5_000_000:
+        return f.mime_type
+    return None
+
+
+async def build_ctx(ch: ChannelCfg, msg, edited: bool, vision: bool = True) -> MsgCtx | None:
     text = (msg.raw_text or "").strip()
-    if not text:
-        return None  # 纯图片/视频没有文字，识别不了
+    image, mime = None, image_mime(msg) if vision else None
+    if mime:
+        try:
+            image = await msg.download_media(file=bytes)
+        except Exception as e:
+            log.warning("下载图片失败（只按文字识别）：%s", e)
+    if not text and not image:
+        return None  # 视频、贴纸之类，识别不了
     reply_text = None
     if msg.reply_to_msg_id:
         try:
@@ -92,10 +112,13 @@ async def build_ctx(ch: ChannelCfg, msg, edited: bool) -> MsgCtx | None:
             reply_text = (r.raw_text or "").strip() if r else None
         except Exception:
             pass
-    date = msg.edit_date if (edited and msg.edit_date) else msg.date
-    return MsgCtx(channel=ch, title=ch.title or ch.username, chat_id=msg.chat_id, msg_id=msg.id, date=date,
-                  text=text[:3000], reply_to=msg.reply_to_msg_id, reply_text=reply_text,
-                  forwarded=msg.fwd_from is not None, edited=edited)
+    # 没有修改时间的「修改」事件（比如只是表情回应变了）按原消息处理，处理过的会自动跳过
+    edited = edited and msg.edit_date is not None
+    return MsgCtx(channel=ch, title=ch.title or ch.username, chat_id=msg.chat_id, msg_id=msg.id,
+                  date=msg.edit_date if edited else msg.date, text=text[:3000],
+                  reply_to=msg.reply_to_msg_id, reply_text=reply_text, forwarded=msg.fwd_from is not None,
+                  edited=edited, version=int(msg.edit_date.timestamp()) if edited else 0, posted=msg.date,
+                  image=image, image_mime=mime or "image/jpeg")
 
 
 def describe(a: dict) -> str:
@@ -152,9 +175,11 @@ def ai_text(db: DB, cfg: Config, n: int) -> str:
     for r in rows:
         ch = cfg.channel_by_username(r["channel"])
         when = datetime.fromtimestamp(r["ts"], tz).strftime("%m-%d %H:%M")
-        head = (r["text"] or "").replace("\n", " ")[:50]
+        head = ("🖼 " if r.get("has_image") else "") + (r["text"] or "（只有图片）").replace("\n", " ")[:50]
         lines.append(f"\n{when} {(ch.title if ch and ch.title else r['channel'])}{'（修改后）' if r['edited'] else ''}：{head}")
         parsed = json.loads(r["parsed"]) if r["parsed"] else None
+        if parsed and parsed.get("image"):
+            lines.append(f"  🖼 图片：{parsed['image']}")
         if parsed and parsed.get("actions"):
             lines += [f"  🤖 {describe(a)}" for a in parsed["actions"]]
         elif parsed:
@@ -491,7 +516,7 @@ async def cmd_replay(cfg: Config, n: int):
             print(f"\n===== {ch.title}（@{ch.username}）最近 {len(msgs)} 条 =====")
             n_open = n_ok = 0
             for m in reversed(msgs):
-                ctx = await build_ctx(ch, m, False)
+                ctx = await build_ctx(ch, m, False, cfg.llm_vision)
                 if not ctx:
                     continue
                 res = await parser.parse(ctx)
@@ -579,7 +604,7 @@ async def cmd_run(cfg: Config):
         while True:
             ch, msg, edited = await q.get()
             try:
-                ctx = await build_ctx(ch, msg, edited)
+                ctx = await build_ctx(ch, msg, edited, cfg.llm_vision)
                 if ctx:
                     await engine.handle_message(ctx)
             except Exception:
@@ -617,7 +642,8 @@ async def cmd_run(cfg: Config):
     version = f"｜版本 {engine.version}" if engine.version else ""
     await notifier.send(f"🚀 信号跟单已启动（监听账号 {me.first_name}{version}）\n"
                         f"实盘总开关：{'开' if cfg.live_trading else '关，全部模拟'}"
-                        f"｜{ex.label} API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n发 /help 查看命令")
+                        f"｜{ex.label} API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n"
+                        f"常用功能点输入框下方的按钮，全部命令发 /help", KEYBOARD)
     log.info("开始监听 %d 个频道", len(chans))
     try:
         await client.run_until_disconnected()

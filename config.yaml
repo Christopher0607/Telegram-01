@@ -15,6 +15,7 @@ exchange:
 llm:
   provider: deepseek           # deepseek 或 anthropic
   model: deepseek-v4-flash     # 用 anthropic 时可填 claude-sonnet-5
+  vision: true                 # 频道消息里的图片（喊单图、持仓截图）也交给 AI 看；false = 只看文字
 
 paper:
   equity: 1000                 # 模拟盘本金（U）

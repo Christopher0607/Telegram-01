@@ -4,7 +4,8 @@
 import copy
 
 from config import DEFAULT_RISK
-from engine import Reject, atr_pct, liq_distance, plan_entry, safe_leverage, simulate_candle, split_qty
+from engine import (Reject, atr_pct, coin_key, liq_distance, plan_entry, safe_leverage, simulate_candle,
+                    split_qty, split_symbol_candidates)
 from signal_parser import clean_symbol, extract_json, normalize, to_num
 
 R = copy.deepcopy(DEFAULT_RISK)
@@ -33,6 +34,11 @@ check("1,467 → 1467", to_num("1,467") == 1467)
 check("$NIL → NIL", clean_symbol("$NIL") == "NIL")
 check("大饼 → BTC", clean_symbol("大饼") == "BTC")
 check("HYPEUSDT → HYPE", clean_symbol("HYPEUSDT") == "HYPE")
+# 哈基咪真实出现过：「#PE PE  輕倉市價多」→ AI 认成 PE，交易所没有 PE → 拼成 PEPE 再找
+check("「#PE PE」→ 候选 PEPE", split_symbol_candidates("#PE PE  輕倉市價多", "PE") == [("PEPE", "PE PE")])
+check("「$PE PE 50X做多」→ 候选里有 PEPE", ("PEPE", "PE PE") in split_symbol_candidates("$PE PE 50X做多 進場：市價", "PE"))
+check("币名本来就对 → 没有多余候选", split_symbol_candidates("#HYPE 輕倉市價多\n96.4-96.8", "HYPE") == [])
+check("1000PEPE 和 PEPE 是同一个币", coin_key("1000PEPE") == coin_key("pepe") == "PEPE" and coin_key("1000") == "1000")
 
 # ---------- 2. AI 输出清洗：非法字段被丢弃 ----------
 n = normalize({"actions": [
@@ -45,6 +51,8 @@ n = normalize({"actions": [
 ]})
 check("AI 输出清洗", [a["type"] for a in n["actions"]] == ["open", "close"]
       and n["actions"][0]["symbol"] == "HYPE" and n["actions"][0]["take_profits"] == [99.8, 104, 113])
+check("图片描述保留下来（/ai 里显示）",
+      normalize({"actions": [], "note": "战绩", "image": "持仓卡片：LSK 多 50x"})["image"] == "持仓卡片：LSK 多 50x")
 # DeepSeek 真实出现过的输出：JSON 后面多了一个 }
 check("AI 输出末尾多余的 } 不影响解析",
       extract_json('{"actions":[{"type":"close","symbol":"G","fraction":0.3}],"note":"G 再减仓30%"}}')["actions"][0]["fraction"] == 0.3

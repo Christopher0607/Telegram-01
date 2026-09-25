@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,12 +30,14 @@ MODE_CN = {"live": "实盘", "paper": "模拟"}
 HELP = ("📖 命令\n"
         "/status  运行状态、权益、持仓\n"
         "/stats   各频道已平仓战绩（R 值）\n"
+        "/trades  最近 10 笔已平仓交易（/trades 20 看 20 笔）\n"
         "/ai      最近 10 条频道消息的 AI 识别结果（/ai 20 看 20 条）\n"
         "/pause   暂停实盘开新仓\n"
         "/resume  恢复实盘开新仓\n"
         "/closeall 立即平掉本程序开的所有实盘仓位、撤挂单，并暂停\n"
         "/ip      服务器 IP（{label} API 白名单填这个）\n"
-        "{key_cmd}（我会立刻删除你这条消息）")
+        "{key_cmd}（我会立刻删除你这条消息）\n"
+        "常用功能也可以直接点输入框下方的按钮")
 KEY_CMD = {"gate": "/gate  KEY SECRET  设置 Gate API", "bitget": "/bitget  KEY SECRET PASSPHRASE  设置 Bitget API"}
 
 
@@ -54,6 +57,10 @@ class MsgCtx:
     reply_text: str | None = None
     forwarded: bool = False
     edited: bool = False
+    version: int = 0                # 0 = 原消息；修改过的 = 修改时间（每改一次是一个新版本，都会处理）
+    posted: datetime | None = None  # 原消息发出的时间（判断修改的是不是旧消息）
+    image: bytes | None = None      # 消息里的图片（交给 AI 一起看）
+    image_mime: str = "image/jpeg"
 
 
 # ====================================================================
@@ -61,6 +68,29 @@ class MsgCtx:
 # ====================================================================
 def fmt(x) -> str:
     return "-" if x is None else f"{float(x):.8g}"
+
+
+def coin_key(sym) -> str:
+    """1000PEPE 和 PEPE 算同一个币（有的交易所把便宜的币做成 1000 倍合约）。"""
+    s = str(sym or "").upper()
+    return s[4:] if s.startswith("1000") and len(s) > 4 else s
+
+
+def split_symbol_candidates(text: str, sym: str) -> list[tuple[str, str]]:
+    """频道偶尔把币名打成中间带空格（「#PE PE」→ AI 只认出 PE）：把包含 sym 的相邻英文片段拼起来当候选。
+    返回 [(拼好的币名, 原文写法)]"""
+    sym = str(sym or "").upper()
+    out: list[tuple[str, str]] = []
+    if not sym:
+        return out
+    for m in re.finditer(r"[A-Za-z0-9]+(?:[ \t\u3000]+[A-Za-z0-9]+)+", text[:300]):
+        toks = m.group().split()
+        for i in range(len(toks)):
+            for j in range(i + 2, min(i + 4, len(toks)) + 1):
+                c = "".join(toks[i:j]).upper()
+                if sym in c and c != sym and all(c != x[0] for x in out):
+                    out.append((c, " ".join(toks[i:j])))
+    return out
 
 
 def normalize_split(split, n: int) -> list[float]:
@@ -75,6 +105,8 @@ def tighter(side: str, new: float, cur: float) -> bool:
     """new 这个止损是否比 cur 更收紧。"""
     return new > cur if side == "long" else new < cur
 
+
+EDIT_FOLLOW_SEC = 600  # 频道修改消息：原消息发出 10 分钟内的修改才重新识别（改错字常见），更旧的修改不跟
 
 DEFAULT_MMR = 0.02    # 查不到交易所档位时，按偏保守的 2% 维持保证金率算
 DEFAULT_LEV_CAP = 20  # 查不到交易所上限、且没设 max_leverage 时的杠杆上限
@@ -351,12 +383,21 @@ class Engine:
         if age > float(risk["max_signal_age_sec"]):
             log.info("忽略旧消息 %s #%s（%.0f 秒前）", ctx.title, ctx.msg_id, age)
             return
-        if self.db.message_seen(ctx.chat_id, ctx.msg_id, ctx.edited):
+        if self.db.message_seen(ctx.chat_id, ctx.msg_id, ctx.version):
             return
-        if ctx.edited and self.db.trade_for_message(ctx.chat_id, ctx.msg_id):
-            self.db.save_message(ctx, None, outcome="edit_ignored")
-            await self.notify(f"✏️ {ctx.title} 修改了一条已经跟过的信号，程序不跟随修改（防止事后改单）\n修改后：{ctx.text[:200]}")
-            return
+        if ctx.edited:
+            prev = self.db.last_message(ctx.chat_id, ctx.msg_id)
+            if prev and prev["text"] == ctx.text:
+                return  # 文字没变（只改了图片、格式之类）
+            if self.db.trade_for_message(ctx.chat_id, ctx.msg_id):
+                self.db.save_message(ctx, None, outcome="edit_ignored")
+                if not prev or prev["outcome"] != "edit_ignored":  # 同一条消息只提醒一次
+                    await self.notify(f"✏️ {ctx.title} 修改了一条已经跟过的信号，程序不跟随修改（防止事后改单）\n修改后：{ctx.text[:200]}")
+                return
+            posted = (ctx.posted or ctx.date).timestamp()
+            if time.time() - posted > EDIT_FOLLOW_SEC:
+                log.info("忽略对旧消息的修改 %s #%s（原消息 %.0f 秒前）", ctx.title, ctx.msg_id, time.time() - posted)
+                return
 
         try:
             parsed = await self.parser.parse(ctx)
@@ -380,7 +421,20 @@ class Engine:
             outcomes.append(res)
         self.db.set_message(row, outcome=" | ".join(outcomes) or "no_action")
 
+    def fix_symbol(self, act: dict, ctx) -> dict:
+        """AI 给的币名交易所里没有时，看看是不是频道把币名打成了中间带空格（「#PE PE」被认成 PE），拼起来再找。"""
+        sym = act.get("symbol")
+        if not sym or self.ex.resolve(sym)[0]:
+            return act
+        found = [(c, raw) for c, raw in split_symbol_candidates(ctx.text, sym) if self.ex.resolve(c)[0]]
+        if len(found) != 1:
+            return act
+        c, raw = found[0]
+        log.info("币名 %s → %s（原文「%s」）", sym, c, raw)
+        return dict(act, symbol=c, symbol_note=f"消息里写的是「{raw}」，按 {c} 处理")
+
     async def dispatch(self, act, ctx, mode, risk, row) -> str:
+        act = self.fix_symbol(act, ctx)
         if act["type"] == "open":
             return await self.on_open(act, ctx, mode, risk, row)
         t = self.resolve_target(act, ctx)
@@ -407,11 +461,12 @@ class Engine:
             tid = self.db.trade_for_message(ctx.chat_id, ctx.reply_to)
             t = self.db.get_trade(tid) if tid else None
             if t:
-                if t["status"] not in ("pending", "open") or (sym and sym != t["base"]):
+                if t["status"] not in ("pending", "open") or (sym and coin_key(sym) != coin_key(t["base"])):
                     return None
                 return t
         if sym:
-            cands = [t for t in self.db.active_trades() if t["chat_id"] == ctx.chat_id and t["base"] == sym]
+            cands = [t for t in self.db.active_trades()
+                     if t["chat_id"] == ctx.chat_id and coin_key(t["base"]) == coin_key(sym)]
             if len(cands) == 1:
                 return cands[0]
         return None
@@ -495,6 +550,8 @@ class Engine:
         plan["risk_usdt"] *= qty / plan["qty"]
         plan["margin"] = qty * plan["entry"] / plan["leverage"]
         plan.update(symbol=symbol, base=base, scale=scale, qty=qty, price=price)
+        if act.get("symbol_note"):
+            plan["notes"].insert(0, act["symbol_note"])
         return plan
 
     async def fallback_sl_pct(self, symbol: str, risk: dict) -> tuple[float, str]:
@@ -891,6 +948,9 @@ class Engine:
             return await self.status_text()
         if cmd == "/stats":
             return self.stats_text()
+        if cmd == "/trades":
+            arg = text.split()[1] if len(text.split()) > 1 else ""
+            return self.trades_text(max(1, min(int(arg) if arg.isdigit() else 10, 30)))
         if cmd == "/pause":
             self.set_paused("手动暂停")
             return "⏸ 已暂停实盘开新仓。模拟盘继续记录，已有持仓照常管理。/resume 恢复"
@@ -956,6 +1016,22 @@ class Engine:
                          f"总 {a['r']:+.2f}R，平均 {avg:+.2f}R，{a['pnl']:+.2f}U"
                          + (f"\n   其中程序补止损的 {a['fn']} 单：总 {a['fr']:+.2f}R" if a["fn"] else ""))
         lines.append("单数够多（建议 ≥30）且总 R 为正的频道，才值得考虑切实盘。")
+        return "\n".join(lines)
+
+    def trades_text(self, n: int) -> str:
+        """/trades：最近 n 笔已平仓交易（新的在上面）。"""
+        rows = self.db.closed_trades()[-n:][::-1]
+        if not rows:
+            return "📜 还没有已平仓的交易。"
+        tz = timezone(timedelta(hours=self.cfg.tz_offset))
+        lines = [f"📜 最近 {len(rows)} 笔已平仓交易（新的在上面）"]
+        for t in rows:
+            pnl, r = t.get("pnl"), t.get("r_mult")
+            res = "盈亏未知" if pnl is None else f"{pnl:+.2f}U" + (f"（{r:+.2f}R）" if r is not None else "")
+            icon = "⚪" if pnl is None else ("✅" if pnl > 0 else "🔴")
+            when = datetime.fromtimestamp((t.get("closed_at") or t["created_at"]) / 1000, tz).strftime("%m-%d %H:%M")
+            lines.append(f"{icon} #{t['id']} [{MODE_CN[t['mode']]}] {t['base']} {SIDE_CN[t['side']]} {res}"
+                         f"｜{t.get('exit_reason') or ''}｜{t['title']}｜{when}")
         return "\n".join(lines)
 
     # ---------------- 通知文案 ----------------

@@ -70,9 +70,13 @@ class Exchange:
 
     # ---------------- 市场信息 ----------------
     def resolve(self, base: str) -> tuple[str | None, float]:
-        """币种 → ccxt 合约代码。有些币在交易所是 1000 倍合约（如 1000PEPE），此时价格要 ×1000。"""
+        """币种 → ccxt 合约代码。有些币在交易所是 1000 倍合约（如 1000PEPE），此时价格要 ×1000；
+        反过来频道写 1000PEPE、交易所只有 PEPE 时，价格要 ÷1000。"""
         base = (base or "").upper()
-        for b, scale in ((base, 1.0), ("1000" + base, 1000.0)):
+        cands = [(base, 1.0), ("1000" + base, 1000.0)]
+        if base.startswith("1000") and len(base) > 4:
+            cands.append((base[4:], 0.001))
+        for b, scale in cands:
             sym = f"{b}/USDT:USDT"
             m = self.ex.markets.get(sym)
             if m and m.get("swap") and m.get("linear") and m.get("active") is not False:

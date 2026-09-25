@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   chat_id INTEGER, msg_id INTEGER, edited INTEGER DEFAULT 0,
   channel TEXT, ts INTEGER, reply_to INTEGER, text TEXT,
-  parsed TEXT, outcome TEXT, trade_id INTEGER,
+  parsed TEXT, outcome TEXT, trade_id INTEGER, has_image INTEGER DEFAULT 0,
   UNIQUE(chat_id, msg_id, edited)
 );
 CREATE TABLE IF NOT EXISTS trades(
@@ -43,25 +43,34 @@ class DB:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
-        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(trades)")}
-        for col in ("sl_source", "sl_order_id"):  # 旧版数据库升级
-            if col not in cols:
-                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT")
+        # 旧版数据库升级：补上新加的列
+        for table, col, typ in (("trades", "sl_source", "TEXT"), ("trades", "sl_order_id", "TEXT"),
+                                ("messages", "has_image", "INTEGER DEFAULT 0")):
+            if col not in {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.commit()
 
     # ---------------- messages ----------------
-    def message_seen(self, chat_id: int, msg_id: int, edited: bool) -> bool:
+    # messages.edited：0 = 原消息；否则是这个修改版本的修改时间（旧版数据库里是 1）
+    def message_seen(self, chat_id: int, msg_id: int, version: int) -> bool:
         r = self.conn.execute(
             "SELECT 1 FROM messages WHERE chat_id=? AND msg_id=? AND edited=?",
-            (chat_id, msg_id, int(edited))).fetchone()
+            (chat_id, msg_id, int(version))).fetchone()
         return r is not None
+
+    def last_message(self, chat_id: int, msg_id: int) -> dict | None:
+        """这条频道消息最近一次处理过的版本（原文或最近一次修改）。"""
+        r = self.conn.execute("SELECT * FROM messages WHERE chat_id=? AND msg_id=? ORDER BY id DESC LIMIT 1",
+                              (chat_id, msg_id)).fetchone()
+        return dict(r) if r else None
 
     def save_message(self, ctx, parsed: dict | None, outcome: str | None = None) -> int:
         cur = self.conn.execute(
-            "INSERT OR IGNORE INTO messages(chat_id,msg_id,edited,channel,ts,reply_to,text,parsed,outcome)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (ctx.chat_id, ctx.msg_id, int(ctx.edited), ctx.channel.username, int(ctx.date.timestamp()),
-             ctx.reply_to, ctx.text, json.dumps(parsed, ensure_ascii=False) if parsed else None, outcome))
+            "INSERT OR IGNORE INTO messages(chat_id,msg_id,edited,channel,ts,reply_to,text,parsed,outcome,has_image)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (ctx.chat_id, ctx.msg_id, int(ctx.version), ctx.channel.username, int(ctx.date.timestamp()),
+             ctx.reply_to, ctx.text, json.dumps(parsed, ensure_ascii=False) if parsed else None, outcome,
+             int(bool(ctx.image))))
         self.conn.commit()
         return cur.lastrowid
 

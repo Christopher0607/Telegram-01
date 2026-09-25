@@ -17,6 +17,21 @@ import httpx
 
 log = logging.getLogger("notifier")
 
+# 输入框下方常驻的按钮：点一下就等于发对应的命令
+BUTTON_ROWS = [["📊 状态", "📈 战绩", "📜 最近交易"],
+               ["🧠 AI识别", "⏸ 暂停开仓", "▶️ 恢复开仓"],
+               ["🛑 全部平仓", "📖 帮助"]]
+BUTTON_CMDS = {"📊 状态": "/status", "📈 战绩": "/stats", "📜 最近交易": "/trades", "🧠 AI识别": "/ai",
+               "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "📖 帮助": "/help"}
+CLOSEALL_BUTTON = "🛑 全部平仓"   # 这个按钮要再点一次「确认」才执行
+CONFIRM_TTL = 300                 # 确认按钮 5 分钟内有效
+KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
+            "resize_keyboard": True, "is_persistent": True}
+# 输入框左边「菜单」里的命令（/closeall、/gatetest 会真实下单，不放进菜单，免得误点）
+MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩"), ("trades", "最近 10 笔已平仓交易"),
+        ("ai", "最近 10 条频道消息的 AI 识别结果"), ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
+        ("ip", "服务器 IP"), ("help", "全部命令")]
+
 
 def owner_file(data_dir: str) -> str:
     return os.path.join(data_dir, "owner.json")
@@ -47,14 +62,16 @@ class Notifier:
         await self.http.aclose()
 
     # ---------------- 发送 ----------------
-    async def send(self, text: str) -> bool:
-        """发给主人。通过机器人发送成功返回 True。"""
+    async def send(self, text: str, markup: dict | None = None) -> bool:
+        """发给主人（markup = 附带的按钮）。通过机器人发送成功返回 True。"""
         text = text[:4000]
         log.info("通知: %s", text.replace("\n", " | ")[:300])
         if self.token and self.owner_id:
             try:
-                r = await self.http.post(f"{self.api}/sendMessage", json={
-                    "chat_id": self.owner_id, "text": text, "disable_web_page_preview": True})
+                payload = {"chat_id": self.owner_id, "text": text, "disable_web_page_preview": True}
+                if markup:
+                    payload["reply_markup"] = markup
+                r = await self.http.post(f"{self.api}/sendMessage", json=payload)
                 if r.status_code == 200:
                     return True
                 log.warning("机器人发消息失败 %s：%s（先给机器人发一次 /start）", r.status_code, r.text[:200])
@@ -68,6 +85,17 @@ class Notifier:
                 log.warning("发送到收藏夹失败：%s", e)
         return False
 
+    async def call(self, method: str, payload: dict) -> dict | None:
+        """调用机器人的其他接口（设置菜单、按钮回应、改消息）。失败只记日志。"""
+        try:
+            r = await self.http.post(f"{self.api}/{method}", json=payload)
+            if r.status_code != 200:
+                log.warning("机器人 %s 返回 %s：%s", method, r.status_code, r.text[:200])
+            return r.json()
+        except Exception as e:
+            log.warning("机器人 %s 失败：%s", method, e)
+            return None
+
     async def delete(self, msg: dict | None):
         """删除主人发来的消息（验证码、密码、API Key 用完就删）。"""
         if not msg or not self.token:
@@ -80,7 +108,7 @@ class Notifier:
 
     # ---------------- 接收 ----------------
     async def _updates(self, timeout: int) -> list:
-        params = {"timeout": timeout, "allowed_updates": '["message"]'}
+        params = {"timeout": timeout, "allowed_updates": '["message","callback_query"]'}
         if self.offset is not None:
             params["offset"] = self.offset
         r = await self.http.get(f"{self.api}/getUpdates", params=params)
@@ -150,19 +178,48 @@ class Notifier:
                 await asyncio.sleep(5)
         return self.owner_id
 
+    async def on_button(self, cq: dict, handler):
+        """主人点了消息下面的按钮（目前只有「确认全部平仓 / 取消」）。"""
+        await self.call("answerCallbackQuery", {"callback_query_id": cq["id"]})
+        m = cq.get("message") or {}
+        where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
+        data = cq.get("data") or ""
+        if not data.startswith("closeall:"):
+            await self.call("editMessageText", dict(where, text="已取消，什么都没做。"))
+            return
+        if time.time() - int(data.split(":")[1]) > CONFIRM_TTL:
+            await self.call("editMessageText", dict(where, text=f"⌛ 这个确认按钮已经过期，什么都没做。要平仓请重新点「{CLOSEALL_BUTTON}」。"))
+            return
+        await self.call("editMessageText", dict(where, text="🛑 已确认，正在平掉所有实盘仓位……"))
+        reply = await handler("/closeall", m)
+        if reply:
+            await self.send(reply)
+
     async def command_loop(self, handler):
-        """长轮询机器人消息；只响应主人发来的 / 命令。handler(text, msg) -> 回复文字"""
+        """长轮询机器人消息；只响应主人发来的 / 命令和按钮。handler(text, msg) -> 回复文字"""
         if not self.token or not self.owner_id:
             log.info("未配置机器人或主人，命令功能关闭")
             return
         await self.skip_backlog()
+        await self.call("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in MENU]})
         while True:
             try:
                 for u in await self._updates(50):
+                    cq = u.get("callback_query")
+                    if cq:
+                        if (cq.get("from") or {}).get("id") == self.owner_id:
+                            await self.on_button(cq, handler)
+                        continue
                     m = self._private_msg(u)
                     if not m or (m.get("from") or {}).get("id") != self.owner_id:
                         continue
                     text = m["text"].strip()
+                    if text == CLOSEALL_BUTTON:
+                        await self.send("⚠️ 确定要平掉本程序开的所有实盘仓位、撤销挂单，并暂停开新仓吗？\n（模拟盘不受影响）", {
+                            "inline_keyboard": [[{"text": "✅ 确认全部平仓", "callback_data": f"closeall:{int(time.time())}"},
+                                                 {"text": "取消", "callback_data": "cancel"}]]})
+                        continue
+                    text = BUTTON_CMDS.get(text, text)
                     if not text.startswith("/"):
                         if re.search(r"[0-9A-Za-z]{30,}", text):  # 像是忘了带命令直接发的 API 密钥：马上删掉
                             await self.delete(m)
@@ -174,8 +231,9 @@ class Notifier:
                     except Exception as e:
                         log.exception("命令处理出错")
                         reply = f"命令出错：{e}"
-                    if reply:
-                        await self.send(reply)
+                    if reply:  # /start、/help 的回复带上按钮（万一按钮被收起来了，发 /help 就能找回）
+                        cmd = text.split()[0].lower().split("@")[0]
+                        await self.send(reply, KEYBOARD if cmd in ("/start", "/help") else None)
             except Exception as e:
                 log.warning("命令轮询异常：%s", e)
                 await asyncio.sleep(5)
