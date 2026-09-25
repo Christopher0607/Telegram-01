@@ -232,6 +232,17 @@ KEY_COMMANDS = {
 }
 
 
+def key_parts(name: str, text: str) -> list[str]:
+    """从 /gate、/bitget 消息里取出 API 各项（命令后面用空格或换行隔开）。
+    Gate 的 Key、Secret 都是一长串十六进制字符：多出来的「Key:」之类的字、被截成两段的 Secret 也能认出来。"""
+    parts = text.split()[1:]
+    if name == "gate" and len(parts) != 2:
+        tokens = re.findall(r"[0-9a-fA-F]{16,}", " ".join(parts))
+        if len(tokens) >= 2:
+            return [tokens[0], "".join(tokens[1:])]
+    return parts
+
+
 async def verify_keys(name: str, values: list[str]) -> tuple[bool, str]:
     """用这组 API 查一次合约账户余额，查得到才算有效。values = [key, secret(, passphrase)]"""
     params = {"apiKey": values[0], "secret": values[1], "enableRateLimit": True, "options": {"defaultType": "swap"}}
@@ -325,7 +336,7 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
         await notifier.delete(msg)
         name, env_names = KEY_COMMANDS[cmd]
         label = LABELS[name]
-        parts = text.split()[1:]
+        parts = key_parts(name, text)
         if len(parts) != len(env_names):
             usage = " ".join(["API_KEY", "SECRET", "PASSPHRASE"][:len(env_names)])
             return f"用法：{cmd} {usage}（各项之间用空格隔开）。你刚才那条消息我已经删除。"

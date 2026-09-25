@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 
 import httpx
@@ -163,6 +164,10 @@ class Notifier:
                         continue
                     text = m["text"].strip()
                     if not text.startswith("/"):
+                        if re.search(r"[0-9A-Za-z]{30,}", text):  # 像是忘了带命令直接发的 API 密钥：马上删掉
+                            await self.delete(m)
+                            await self.send("⚠️ 这条消息看起来是 API 密钥，我已经帮你删掉了，没有保存。\n"
+                                            "设置交易所 API 要在前面加上命令，例如：/gate 你的Key 你的Secret（发 /help 查看命令）")
                         continue
                     try:
                         reply = await handler(text, m)
