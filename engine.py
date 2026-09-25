@@ -310,6 +310,7 @@ class Engine:
         self.cfg, self.db, self.ex, self.parser, self.notifier = cfg, db, ex, parser, notifier
         self.lock = asyncio.Lock()
         self._err_ts: dict[str, float] = {}
+        self.version = ""  # 启动时读 data/version.txt（服务器上当前运行的代码版本）
 
     # ---------------- 小工具 ----------------
     async def notify(self, text: str):
@@ -865,7 +866,8 @@ class Engine:
 
     async def status_text(self) -> str:
         paused = self.paused()
-        lines = [f"🤖 运行中｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"]
+        lines = [f"🤖 运行中｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"
+                 + (f"｜版本 {self.version}" if self.version else "")]
         if self.ex.has_keys:
             try:
                 eq, free = await self.ex.balance()

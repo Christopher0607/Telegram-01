@@ -521,9 +521,10 @@ async def cmd_run(cfg: Config):
     modes = "\n".join(f"• {c.title}：{MODE_CN[cfg.mode_for(c)]}" for c in chans.values())
     try:
         with open(os.path.join(DATA_DIR, "version.txt")) as f:
-            version = f"｜版本 {f.read().strip()}"
+            engine.version = f.read().strip()
     except OSError:
-        version = ""
+        pass
+    version = f"｜版本 {engine.version}" if engine.version else ""
     await notifier.send(f"🚀 信号跟单已启动（监听账号 {me.first_name}{version}）\n"
                         f"实盘总开关：{'开' if cfg.live_trading else '关，全部模拟'}"
                         f"｜Bitget API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n发 /help 查看命令")
