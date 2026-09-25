@@ -1,8 +1,11 @@
-"""Bitget USDT 永续合约接口（基于 ccxt，经典账户和统一账户 UTA 都支持）。
+"""交易所 USDT 永续合约接口（基于 ccxt）：Bitget（经典账户和统一账户 UTA）或 Gate，由 config.yaml 的 exchange.name 决定。
 
 约定：
 - 单向持仓模式（one-way），一个币种同一时间只有一个方向的仓位
-- 开仓单自带交易所止损（preset stop loss），程序挂掉也有止损保护
+- 交易所里一定有止损，程序挂掉也有保护：
+    Bitget：开仓单自带止损（preset stop loss）
+    Gate：开仓单不能带止损，持仓出现后另挂一张「平掉整个仓位」的止损触发单（place_sl），
+          平仓时由 engine 撤掉（cancel_sl）
 - 交易所里不挂止盈限价单（会冻结仓位），止盈由 engine 盯盘后用「只减仓」市价单执行
 """
 from __future__ import annotations
@@ -15,24 +18,44 @@ import ccxt.async_support as ccxt
 from ccxt.base.decimal_to_precision import TICK_SIZE
 
 log = logging.getLogger("exchange")
-PRODUCT = "USDT-FUTURES"
+PRODUCT = "USDT-FUTURES"          # Bitget 的 USDT 永续
+LABELS = {"bitget": "Bitget", "gate": "Gate"}
+GATE_MAX_LEVERAGE = 100           # ccxt 给 Gate 设杠杆最多只接受 100 倍
 
 
 class Exchange:
     def __init__(self, cfg):
         self.cfg = cfg
+        self.name = getattr(cfg, "exchange_name", "bitget")
+        if self.name not in LABELS:
+            raise ValueError(f"config.yaml 里 exchange.name 只能是 bitget 或 gate，现在是 {self.name}")
+        self.label = LABELS[self.name]
         params = {"enableRateLimit": True, "options": {"defaultType": "swap"}}
-        self.has_keys = bool(cfg.bitget_key and cfg.bitget_secret and cfg.bitget_passphrase)
-        if self.has_keys:
-            params.update(apiKey=cfg.bitget_key, secret=cfg.bitget_secret, password=cfg.bitget_passphrase)
-        self.ex = ccxt.bitget(params)
+        if self.name == "gate":
+            self.has_keys = bool(cfg.gate_key and cfg.gate_secret)
+            if self.has_keys:
+                params.update(apiKey=cfg.gate_key, secret=cfg.gate_secret)
+            self.ex = ccxt.gate(params)
+        else:
+            self.has_keys = bool(cfg.bitget_key and cfg.bitget_secret and cfg.bitget_passphrase)
+            if self.has_keys:
+                params.update(apiKey=cfg.bitget_key, secret=cfg.bitget_secret, password=cfg.bitget_passphrase)
+            self.ex = ccxt.bitget(params)
+        # Bitget 的止损跟着开仓单一起下；Gate 要在持仓出现后单独挂止损触发单
+        self.attached_sl = self.name == "bitget"
         self.uta = False
         self._tiers: dict = {}
 
     async def init(self):
         await self.ex.load_markets()
         if not self.has_keys:
-            log.info("未配置 Bitget API Key：只能跑模拟盘（行情用公开接口）")
+            log.info("未配置 %s API Key：只能跑模拟盘（行情用公开接口）", self.label)
+            return
+        if self.name == "gate":
+            try:
+                await self.ex.set_position_mode(False, None, {"settle": "usdt"})
+            except Exception as e:  # 已经是单向模式、或者有持仓/挂单时改不了
+                log.info("设置单向持仓模式：%s", str(e)[:150])
             return
         self.uta, _ = await self.ex.handle_uta_and_params({}, "init", False)
         log.info("Bitget 账户类型：%s", "统一账户 UTA" if self.uta else "经典账户")
@@ -57,10 +80,13 @@ class Exchange:
         return None, 1.0
 
     def max_leverage(self, symbol: str) -> float | None:
-        return ((self.ex.market(symbol).get("limits") or {}).get("leverage") or {}).get("max")
+        mx = ((self.ex.market(symbol).get("limits") or {}).get("leverage") or {}).get("max")
+        if self.name == "gate":
+            return min(float(mx), GATE_MAX_LEVERAGE) if mx else GATE_MAX_LEVERAGE
+        return mx
 
     async def leverage_tiers(self, symbol: str) -> list | None:
-        """Bitget 的仓位档位：每档的最高杠杆和维持保证金率（公开接口，缓存 6 小时）。"""
+        """交易所的仓位档位：每档的最高杠杆和维持保证金率（公开接口，缓存 6 小时）。"""
         hit = self._tiers.get(symbol)
         if hit and time.time() - hit[0] < 6 * 3600:
             return hit[1]
@@ -139,8 +165,9 @@ class Exchange:
 
     async def positions(self) -> dict:
         """{symbol: {side, size(币数量), entry, liq}}"""
+        params = {"settle": "usdt"} if self.name == "gate" else {"productType": PRODUCT}
         out = {}
-        for p in await self.ex.fetch_positions(None, {"productType": PRODUCT}):
+        for p in await self.ex.fetch_positions(None, params):
             c = float(p.get("contracts") or 0)
             if c <= 0:
                 continue
@@ -160,13 +187,22 @@ class Exchange:
 
     # ---------------- 下单 ----------------
     def _params(self, extra: dict | None = None) -> dict:
-        p = {} if self.uta else {"marginMode": self.cfg.margin_mode}
+        p = {} if (self.uta or self.name == "gate") else {"marginMode": self.cfg.margin_mode}
         if extra:
             p.update(extra)
         return p
 
     async def prepare(self, symbol: str, leverage: int, side: str):
         """设置保证金模式和杠杆。杠杆设置失败会抛异常（不知道实际杠杆就不开仓）。"""
+        if self.name == "gate":
+            # Gate 没有单独的「保证金模式」开关：杠杆填数字 = 逐仓；杠杆 0 + cross_leverage_limit = 全仓
+            lev = int(min(leverage, GATE_MAX_LEVERAGE))
+            p = {"cross_leverage_limit": lev} if self.cfg.margin_mode == "cross" else {}
+            try:
+                await self.ex.set_leverage(lev, symbol, p)
+                return
+            except Exception as e:
+                raise RuntimeError(f"设置杠杆失败：{e}")
         if not self.uta:
             try:
                 await self.ex.set_margin_mode(self.cfg.margin_mode, symbol)
@@ -184,17 +220,45 @@ class Exchange:
                 last = e
         raise RuntimeError(f"设置杠杆失败：{last}")
 
+    def _sl_params(self, sl: float) -> dict:
+        """Bitget：开仓单上直接带止损。Gate 不支持，止损由 place_sl 单独挂。"""
+        return self._params({"stopLoss": {"triggerPrice": sl}}) if self.attached_sl else self._params()
+
     async def open_market(self, symbol: str, side: str, qty: float, sl: float) -> str:
         o = await self.ex.create_order(symbol, "market", "buy" if side == "long" else "sell",
-                                       self._amt(symbol, qty), None,
-                                       self._params({"stopLoss": {"triggerPrice": sl}}))
+                                       self._amt(symbol, qty), None, self._sl_params(sl))
         return str(o.get("id"))
 
     async def open_limit(self, symbol: str, side: str, qty: float, price: float, sl: float) -> str:
         o = await self.ex.create_order(symbol, "limit", "buy" if side == "long" else "sell",
-                                       self._amt(symbol, qty), price,
-                                       self._params({"stopLoss": {"triggerPrice": sl}}))
+                                       self._amt(symbol, qty), price, self._sl_params(sl))
         return str(o.get("id"))
+
+    async def place_sl(self, symbol: str, side: str, sl: float) -> str:
+        """Gate：给现有持仓挂止损触发单。价格（最新成交价）触及 sl 时，以市价平掉这个币的整个仓位，
+        所以程序之后分批止盈、减仓都不用改它。返回触发单 id。"""
+        m = self.ex.market(symbol)
+        long = side == "long"
+        r = await self.ex.privateFuturesPostSettlePriceOrders({
+            "settle": "usdt",
+            "initial": {"contract": m["id"], "size": 0, "price": "0", "tif": "ioc", "close": True, "text": "t-tgst-sl"},
+            "trigger": {"strategy_type": 0, "price_type": 0, "price": self.ex.price_to_precision(symbol, sl),
+                        "rule": 2 if long else 1},   # 1: 价格 ≥ 触发价（空单止损）；2: 价格 ≤ 触发价（多单止损）
+            "order_type": "close-long-position" if long else "close-short-position",
+        })
+        oid = r.get("id") if isinstance(r, dict) else None
+        if not oid:
+            raise RuntimeError(f"交易所没有返回止损单 id：{str(r)[:150]}")
+        return str(oid)
+
+    async def cancel_sl(self, symbol: str, sl_order_id: str | None):
+        """撤掉程序挂的止损触发单（已经触发或已撤销的会报错，忽略即可）。Bitget 的止损跟着仓位走，不需要撤。"""
+        if not sl_order_id or self.attached_sl:
+            return
+        try:
+            await self.ex.privateFuturesDeleteSettlePriceOrdersOrderId({"settle": "usdt", "order_id": sl_order_id})
+        except Exception as e:
+            log.info("撤止损单 %s %s：%s", symbol, sl_order_id, str(e)[:120])
 
     async def reduce_market(self, symbol: str, side: str, qty: float):
         return await self.ex.create_order(symbol, "market", "sell" if side == "long" else "buy",
@@ -222,6 +286,11 @@ class Exchange:
                 return None, None
             p = max(hist, key=lambda x: x.get("lastUpdateTimestamp") or x.get("timestamp") or 0)
             info = p.get("info") or {}
+            if self.name == "gate":
+                # pnl = 仓位盈亏 + 资金费 + 手续费；平多的均价在 short_price，平空的在 long_price
+                pnl = info.get("pnl")
+                px = info.get("short_price") if info.get("side") == "long" else info.get("long_price")
+                return (float(pnl) if pnl not in (None, "") else None), (float(px) if px not in (None, "", "0") else None)
             net = info.get("netProfit")
             pnl = float(net) if net not in (None, "") else p.get("realizedPnl")
             return (float(pnl) if pnl is not None else None), p.get("lastPrice")

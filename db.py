@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS trades(
   realized REAL DEFAULT 0, order_id TEXT,
   created_at INTEGER, opened_at INTEGER, closed_at INTEGER, expires_at INTEGER,
   last_candle_ts INTEGER, be_moved INTEGER DEFAULT 0,
-  exit_reason TEXT, pnl REAL, r_mult REAL, sl_source TEXT
+  exit_reason TEXT, pnl REAL, r_mult REAL, sl_source TEXT, sl_order_id TEXT
 );
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -33,7 +33,7 @@ TRADE_FIELDS = {
     "mode", "channel", "title", "chat_id", "msg_id", "symbol", "base", "scale", "side", "status",
     "entry_kind", "entry_price", "qty", "remaining", "sl", "soft_sl", "tps", "leverage", "risk_usdt",
     "realized", "order_id", "created_at", "opened_at", "closed_at", "expires_at",
-    "last_candle_ts", "be_moved", "exit_reason", "pnl", "r_mult", "sl_source",
+    "last_candle_ts", "be_moved", "exit_reason", "pnl", "r_mult", "sl_source", "sl_order_id",
 }
 ACTIVE = ("pending", "open")
 
@@ -44,8 +44,9 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(trades)")}
-        if "sl_source" not in cols:  # 旧版数据库升级
-            self.conn.execute("ALTER TABLE trades ADD COLUMN sl_source TEXT")
+        for col in ("sl_source", "sl_order_id"):  # 旧版数据库升级
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} TEXT")
         self.conn.commit()
 
     # ---------------- messages ----------------

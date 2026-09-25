@@ -6,8 +6,8 @@
 3. 杠杆按止损自动开到最高：计入交易所的维持保证金率和手续费后，强平价一定在止损之外
 4. 同一个币同一时间只做一单；同时持仓数有上限
 5. 频道的移动止损只允许收紧，不允许放宽
-6. 交易所里只挂止损单（开仓单自带），止盈由程序盯盘执行：
-   Bitget 上挂着的「只减仓」止盈限价单会冻结仓位，可能导致止损/平仓失败，所以不挂
+6. 交易所里只挂止损单（Bitget 开仓单自带；Gate 开仓后另挂「平掉整个仓位」的止损触发单，挂不上就立刻平仓），
+   止盈由程序盯盘执行：交易所里挂着的「只减仓」止盈限价单会冻结仓位，可能导致止损/平仓失败，所以不挂
 """
 from __future__ import annotations
 
@@ -33,8 +33,9 @@ HELP = ("📖 命令\n"
         "/pause   暂停实盘开新仓\n"
         "/resume  恢复实盘开新仓\n"
         "/closeall 立即平掉本程序开的所有实盘仓位、撤挂单，并暂停\n"
-        "/ip      服务器 IP（Bitget API 白名单填这个）\n"
-        "/bitget  KEY SECRET PASSPHRASE  设置 Bitget API（我会立刻删除你这条消息）")
+        "/ip      服务器 IP（{label} API 白名单填这个）\n"
+        "{key_cmd}（我会立刻删除你这条消息）")
+KEY_CMD = {"gate": "/gate  KEY SECRET  设置 Gate API", "bitget": "/bitget  KEY SECRET PASSPHRASE  设置 Bitget API"}
 
 
 class Reject(Exception):
@@ -426,6 +427,8 @@ class Engine:
             return f"skip: {r}"
         t = await (self.open_live(plan, ctx) if mode == "live" else self.open_paper(plan, ctx))
         self.db.set_message(row, trade_id=t["id"])
+        if t["status"] == "closed":  # Gate 止损单挂不上、已经安全平仓（前面已经提醒过），不再发开仓消息
+            return f"opened #{t['id']} (closed: no stop loss)"
         await self.notify(self.open_text(t, plan))
         return f"opened #{t['id']}"
 
@@ -444,7 +447,7 @@ class Engine:
             raise Reject(f"{base} 在黑名单 blocked_symbols 里")
         symbol, scale = self.ex.resolve(base)
         if not symbol:
-            raise Reject(f"Bitget 没有 {base} 的 USDT 永续合约")
+            raise Reject(f"{self.ex.label} 没有 {base} 的 USDT 永续合约")
 
         active = self.db.active_trades(mode)
         for t in active:
@@ -549,6 +552,8 @@ class Engine:
             t.update(status="open", opened_at=now_ms())
             self.assign_tp_qty(t)
             t["id"] = self.db.insert_trade(t)
+            if pos and not await self.ensure_sl(t):   # Gate：马上挂交易所止损，挂不上已经平仓
+                return t
             liq = float((pos or {}).get("liq") or 0)
             if liq > 0 and ((side == "long" and liq >= t["sl"]) or (side == "short" and liq <= t["sl"])):
                 await self.notify(f"⚠️ #{t['id']} {plan['base']} 交易所显示强平价 {fmt(liq)} 在止损 {fmt(t['sl'])} 之前！"
@@ -559,6 +564,30 @@ class Engine:
             t.update(status="pending", expires_at=now_ms() + int(ttl * 60000))
             t["id"] = self.db.insert_trade(t)
         return t
+
+    async def ensure_sl(self, t: dict) -> bool:
+        """开仓单不能带止损的交易所（Gate）：给实盘持仓挂上交易所止损触发单。
+        连试 3 次都挂不上，而仓位确实存在，就立刻市价平仓，绝不让仓位在交易所里没有止损。返回是否已有止损。"""
+        if self.ex.attached_sl or t.get("sl_order_id") or t["mode"] != "live":
+            return True
+        err = None
+        for i in range(3):
+            try:
+                t["sl_order_id"] = await self.ex.place_sl(t["symbol"], t["side"], t["sl"])
+                self.db.save_trade(t)
+                return True
+            except Exception as e:
+                err = e
+                log.warning("#%s %s 挂止损单失败（第 %d 次）：%s", t.get("id"), t["base"], i + 1, e)
+                await asyncio.sleep(1 + i)
+        pos = (await self.ex.positions()).get(t["symbol"])
+        if pos and pos["side"] == t["side"]:
+            await self.notify(f"❌ #{t['id']} {t['base']} 交易所止损单挂不上（{str(err)[:150]}），为安全立即市价平仓")
+            if t["status"] == "pending":  # 限价单部分成交：先撤掉没成交的部分，再平掉已成交的仓位
+                await self.ex.cancel(t["symbol"], t["order_id"])
+                t.update(status="open", opened_at=t.get("opened_at") or now_ms(), qty=pos["size"], remaining=pos["size"])
+            await self.on_close(t, 1.0, "止损单挂不上，安全平仓")
+        return False
 
     def assign_tp_qty(self, t: dict):
         """把当前剩余仓位按比例分配给还没触发的止盈位（实盘按交易所最小步长/最小下单量取整）。"""
@@ -579,12 +608,20 @@ class Engine:
         full = frac >= 0.95
         m = MODE_CN[t["mode"]]
         if t["status"] == "pending":
+            p = None
             if t["mode"] == "live":
                 await self.ex.cancel(t["symbol"], t["order_id"])
-            t.update(status="cancelled", closed_at=now_ms(), exit_reason=f"{reason}（挂单未成交，已撤）")
+                p = (await self.ex.positions()).get(t["symbol"])
+            if not (p and p["side"] == t["side"]):
+                await self.ex.cancel_sl(t["symbol"], t.get("sl_order_id"))
+                t.update(status="cancelled", closed_at=now_ms(), exit_reason=f"{reason}（挂单未成交，已撤）")
+                self.db.save_trade(t)
+                await self.notify(f"🚫 #{t['id']} [{m}] {t['base']} 限价单已撤销（{reason}）")
+                return "pending cancelled"
+            # 挂单已经部分成交：没成交的部分已撤，已成交的按持仓继续处理（下面照常平仓/减仓）
+            t.update(status="open", opened_at=t.get("opened_at") or now_ms(), qty=p["size"], remaining=p["size"])
+            self.assign_tp_qty(t)
             self.db.save_trade(t)
-            await self.notify(f"🚫 #{t['id']} [{m}] {t['base']} 限价单已撤销（{reason}）")
-            return "pending cancelled"
 
         if t["mode"] == "paper":
             price = await self.ex.last_price(t["symbol"])
@@ -663,6 +700,8 @@ class Engine:
 
     # ---------------- 实盘收尾 ----------------
     async def finalize_live(self, t, reason: str):
+        # 仓位已经没了：撤掉程序挂的止损触发单（Gate），免得它以后误平同一个币的新仓位
+        await self.ex.cancel_sl(t["symbol"], t.get("sl_order_id"))
         await asyncio.sleep(1.5)  # 等交易所生成历史仓位记录
         pnl, exit_px = await self.ex.closed_pnl(t["symbol"], int(t.get("opened_at") or t["created_at"]) - 60000)
         t.update(status="closed", closed_at=now_ms(), exit_reason=reason, remaining=0.0, pnl=pnl,
@@ -702,8 +741,9 @@ class Engine:
                     await self.on_close(t, 1.0, sl_reason(t, t["soft_sl"]))
                 else:
                     await self.check_live_tps(t, p)
-        # 每 30 秒：和交易所核对持仓/挂单
-        if tick % 6:
+        # 每 30 秒：和交易所核对持仓/挂单。开仓单不带止损的交易所（Gate）有挂单时每 5 秒核对，成交后尽快挂上止损
+        fast = not self.ex.attached_sl and any(t["status"] == "pending" for t in trades)
+        if tick % 6 and not fast:
             return
         pos = await self.ex.positions()
         for t in self.db.active_trades("live"):
@@ -750,6 +790,8 @@ class Engine:
         if not p or p["side"] != t["side"]:
             await self.finalize_live(t, "交易所止盈/止损成交")
             return
+        if not await self.ensure_sl(t):  # 有持仓却没有交易所止损（比如开仓时没查到持仓）：补挂，挂不上已平仓
+            return
         if abs(p["size"] - t["remaining"]) > t["remaining"] * 0.001:
             if p["size"] < t["remaining"]:
                 await self.notify(f"ℹ️ #{t['id']} {t['base']} 交易所仓位被减少到 {fmt(p['size'])}（可能是在 App 里手动操作），已同步")
@@ -765,6 +807,8 @@ class Engine:
             st = {"status": "open"}  # 查不到就按「还在挂」处理，超时后照样撤单
         p = pos.get(t["symbol"])
         has_pos = bool(p and p["side"] == t["side"] and p["size"] > 0)
+        if has_pos and not await self.ensure_sl(t):  # 限价单（哪怕只部分）成交了：马上挂交易所止损，挂不上已平仓
+            return
         if st["status"] == "open":
             if now_ms() <= (t.get("expires_at") or 0):
                 return
@@ -772,6 +816,7 @@ class Engine:
             p = (await self.ex.positions()).get(t["symbol"])
             has_pos = bool(p and p["side"] == t["side"] and p["size"] > 0)
             if not has_pos:
+                await self.ex.cancel_sl(t["symbol"], t.get("sl_order_id"))
                 t.update(status="cancelled", closed_at=now_ms(), exit_reason="限价单超时未成交")
                 self.db.save_trade(t)
                 await self.notify(f"⌛ #{t['id']} [实盘] {t['base']} 限价单 {fmt(t['entry_price'])} 超时未成交，已撤单")
@@ -781,6 +826,7 @@ class Engine:
                 t.update(status="open", opened_at=now_ms())
                 await self.finalize_live(t, "限价成交后已被止损/平仓")
             else:
+                await self.ex.cancel_sl(t["symbol"], t.get("sl_order_id"))
                 t.update(status="cancelled", closed_at=now_ms(), exit_reason=f"挂单状态 {st['status']}")
                 self.db.save_trade(t)
                 await self.notify(f"🚫 #{t['id']} [实盘] {t['base']} 限价单已失效（{st['status']}）")
@@ -840,7 +886,7 @@ class Engine:
     async def handle_command(self, text: str) -> str:
         cmd = text.split()[0].lower().split("@")[0]
         if cmd in ("/start", "/help"):
-            return HELP
+            return HELP.format(label=self.ex.label, key_cmd=KEY_CMD.get(self.ex.name, ""))
         if cmd == "/status":
             return await self.status_text()
         if cmd == "/stats":

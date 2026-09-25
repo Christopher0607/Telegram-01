@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
@@ -29,7 +30,7 @@ from telethon.tl.functions.channels import JoinChannelRequest
 from config import ChannelCfg, Config, DATA_DIR, save_secrets
 from db import DB
 from engine import MODE_CN, SIDE_CN, Engine, MsgCtx, fmt
-from exchange import Exchange
+from exchange import LABELS, Exchange
 from notifier import Notifier
 from signal_parser import SignalParser
 
@@ -224,9 +225,19 @@ async def bot_login(client, cfg: Config, notifier: Notifier):
                 await notifier.send("❌ 二步验证密码不对，请再发一次。")
 
 
-async def verify_bitget(key: str, secret: str, passphrase: str) -> tuple[bool, str]:
-    ex = ccxt.bitget({"apiKey": key, "secret": secret, "password": passphrase, "enableRateLimit": True,
-                      "options": {"defaultType": "swap"}})
+# 设置交易所 API 的命令 → (交易所, 依次要填的项 = 保存到 data/secrets.env 的变量名)
+KEY_COMMANDS = {
+    "/gate": ("gate", ["GATE_API_KEY", "GATE_API_SECRET"]),
+    "/bitget": ("bitget", ["BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE"]),
+}
+
+
+async def verify_keys(name: str, values: list[str]) -> tuple[bool, str]:
+    """用这组 API 查一次合约账户余额，查得到才算有效。values = [key, secret(, passphrase)]"""
+    params = {"apiKey": values[0], "secret": values[1], "enableRateLimit": True, "options": {"defaultType": "swap"}}
+    if len(values) > 2:
+        params["password"] = values[2]
+    ex = getattr(ccxt, name)(params)
     try:
         b = await ex.fetch_balance({"type": "swap"})
         return True, f"合约账户权益 {float((b.get('USDT') or {}).get('total') or 0):.2f}U"
@@ -236,29 +247,97 @@ async def verify_bitget(key: str, secret: str, passphrase: str) -> tuple[bool, s
         await ex.close()
 
 
+async def gate_selftest(ex: Exchange) -> str:
+    """/gatetest：用 1 张 BTC 合约（约 8U 仓位、逐仓 5 倍，手续费约 0.01U）在真实账户上实测 Gate 的下单流程：
+    开仓 → 挂止损单、查到、撤掉 → 挂一张马上满足条件的止损单，确认它真的把整个仓位平掉。结束时一定清理干净。"""
+    s = "BTC/USDT:USDT"
+    lines = ["🧪 Gate 实盘接口测试（1 张 BTC 合约）"]
+    if (await ex.positions()).get(s):
+        return "账户里已经有 BTC 仓位，为了不干扰它，测试没有进行。"
+
+    async def sl_status(sid):
+        o = await ex.ex.privateFuturesGetSettlePriceOrdersOrderId({"settle": "usdt", "order_id": sid})
+        return o.get("status"), (o.get("trigger") or {}).get("price"), (o.get("trigger") or {}).get("rule")
+
+    since, sids = int(time.time() * 1000) - 60000, []
+    try:
+        await ex.prepare(s, 5, "long")
+        lines.append("✅ 设置逐仓 5 倍杠杆")
+        await ex.open_market(s, "long", ex._contract_size(s), 0)
+        p = await ex.wait_position(s)
+        if not p:
+            lines.append("❌ 市价开仓后没查到持仓")
+            return "\n".join(lines)
+        lines.append(f"✅ 市价开多 {p['size']:g} BTC @{p['entry']:g}")
+        sids.append(await ex.place_sl(s, "long", p["entry"] * 0.95))
+        st = await sl_status(sids[-1])
+        lines.append(f"{'✅' if st[0] == 'open' else '❌'} 挂止损单（-5%）：状态 {st[0]}，触发价 {st[1]}，规则 {st[2]}（2 = 价格≤触发价）")
+        await ex.cancel_sl(s, sids[-1])
+        st = await sl_status(sids[-1])
+        lines.append(f"{'✅' if st[0] != 'open' else '❌'} 撤销止损单：状态 {st[0]}")
+        px = await ex.last_price(s)
+        try:  # 触发价高于现价的多单止损 = 条件已经满足，应该马上触发
+            sids.append(await ex.place_sl(s, "long", px * 1.002))
+            wait = 15
+        except Exception as e:  # 交易所不接受已满足条件的止损，就挂一张贴着现价的，等价格自然波动触发
+            lines.append(f"ℹ️ 交易所不接受已越过现价的止损（{str(e)[:80]}），改挂一张贴着现价的等它触发")
+            sids.append(await ex.place_sl(s, "long", px * 0.9997))
+            wait = 120
+        closed = False
+        for _ in range(wait):
+            await asyncio.sleep(1)
+            if not (await ex.positions()).get(s):
+                closed = True
+                break
+        lines.append("✅ 止损单触发后，整个仓位被平掉" if closed else f"⚠️ {wait} 秒内止损没有触发（价格没碰到），这一项没测出结果")
+    except Exception as e:
+        lines.append(f"❌ 出错：{str(e)[:200]}")
+    finally:  # 不管上面成不成功：平掉测试仓位、撤掉测试挂的止损单
+        pos = (await ex.positions()).get(s)
+        if pos:
+            await ex.reduce_market(s, pos["side"], pos["size"])
+            lines.append("（收尾：已市价平掉测试仓位）")
+        for sid in sids:
+            await ex.cancel_sl(s, sid)
+    await asyncio.sleep(2)
+    pnl, _ = await ex.closed_pnl(s, since)
+    lines.append(f"测试花费（含手续费）：{pnl:+.4f}U" if pnl is not None else "测试盈亏：暂时查询不到")
+    return "\n".join(lines)
+
+
 async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, engine: Engine,
                         restart=lambda: asyncio.get_running_loop().call_later(3, os._exit, 0)) -> str | None:
-    """机器人命令入口：/ip、/bitget 在这里处理，其余交给 engine。"""
+    """机器人命令入口：/ai、/ip、/gate、/bitget 在这里处理，其余交给 engine。"""
     cmd = text.split()[0].lower().split("@")[0]
     if cmd == "/ai":
         arg = text.split()[1] if len(text.split()) > 1 else ""
         return ai_text(engine.db, cfg, max(1, min(int(arg) if arg.isdigit() else 10, 20)))
     if cmd == "/ip":
         return (f"🌐 服务器 IP：{cfg.server_ip or '未知（请在 DigitalOcean 后台查看）'}\n"
-                f"在 Bitget 创建 API 时，IP 白名单填这个。")
-    if cmd == "/bitget":
+                f"在 {engine.ex.label} 创建 API 时，IP 白名单填这个。")
+    if cmd == "/gatetest":
+        if engine.ex.name != "gate" or not engine.ex.has_keys:
+            return "这个测试只在交易所是 Gate、并且已经用 /gate 设置好 API 时才能用。"
+        await notifier.send("🧪 开始测试，大约 30 秒～2 分钟……")
+        async with engine.lock:
+            return await gate_selftest(engine.ex)
+    if cmd in KEY_COMMANDS:
         await notifier.delete(msg)
-        parts = text.split()
-        if len(parts) != 4:
-            return "用法：/bitget API_KEY SECRET PASSPHRASE（三项之间用空格隔开）。你刚才那条消息我已经删除。"
-        ok, info = await verify_bitget(*parts[1:])
+        name, env_names = KEY_COMMANDS[cmd]
+        label = LABELS[name]
+        parts = text.split()[1:]
+        if len(parts) != len(env_names):
+            usage = " ".join(["API_KEY", "SECRET", "PASSPHRASE"][:len(env_names)])
+            return f"用法：{cmd} {usage}（各项之间用空格隔开）。你刚才那条消息我已经删除。"
+        ok, info = await verify_keys(name, parts)
         if not ok:
-            return (f"❌ 这组 Bitget API 验证失败：{info}\n请检查：IP 白名单是否填了 {cfg.server_ip or '服务器 IP'}、"
-                    f"是否勾了合约交易、passphrase 是否正确。你的消息已删除，没有保存。")
-        save_secrets({"BITGET_API_KEY": parts[1], "BITGET_API_SECRET": parts[2], "BITGET_API_PASSPHRASE": parts[3]})
+            return (f"❌ 这组 {label} API 验证失败：{info}\n请检查：IP 白名单是否填了 {cfg.server_ip or '服务器 IP'}、"
+                    f"是否勾了合约交易{'、passphrase 是否正确' if name == 'bitget' else ''}。你的消息已删除，没有保存。")
+        save_secrets(dict(zip(env_names, parts)))
         restart()  # 3 秒后退出，Docker 自动重启并读取新密钥
-        return (f"✅ Bitget API 验证通过（{info}），已保存，3 秒后自动重启生效。你的消息已删除。\n"
-                f"现在仍然是模拟盘；要开实盘，请告诉 Claude Code。")
+        note = "" if name == engine.ex.name else f"\n注意：现在用的交易所是 {engine.ex.label}，这组 {label} API 暂时用不上。"
+        return (f"✅ {label} API 验证通过（{info}），已保存，3 秒后自动重启生效。你的消息已删除。"
+                + ("" if cfg.live_trading else "\n现在仍然是模拟盘；要开实盘，请告诉 Claude Code。") + note)
     return await engine.handle_command(text)
 
 
@@ -332,7 +411,7 @@ async def cmd_check(cfg: Config):
     ex = Exchange(cfg)
     try:
         await ex.init()
-        print(f"✅ 行情接口正常（{len(ex.ex.markets)} 个市场）")
+        print(f"✅ {ex.label} 行情接口正常（{len(ex.ex.markets)} 个市场）")
         for b in ("BTC", "HYPE", "NIL"):
             s, scale = ex.resolve(b)
             print(f"   {b} → {s or '没有这个合约'}" + (f"（价格×{scale:g}）" if scale != 1 else ""))
@@ -344,7 +423,7 @@ async def cmd_check(cfg: Config):
             if ex.uta and cfg.margin_mode == "isolated":
                 print("   ⚠️ 统一账户程序无法切换逐仓，请在 Bitget App 里把合约设为逐仓")
         else:
-            print("ℹ️ 没填 Bitget API Key：只能跑模拟盘")
+            print(f"ℹ️ 没填 {ex.label} API Key：只能跑模拟盘")
     except Exception as e:
         print(f"❌ 交易所出错：{e}")
     finally:
@@ -423,7 +502,7 @@ async def cmd_replay(cfg: Config, n: int):
                             else:
                                 problems.append("没止损")
                         if a.get("symbol") and not ex.resolve(a["symbol"])[0]:
-                            problems.append("Bitget 无此合约")
+                            problems.append(f"{ex.label} 无此合约")
                         n_ok += not problems
                         flag = f"  ✓会跟{sl_note}" if not problems else f"  ✗会跳过：{'、'.join(problems)}"
                     print(f"   → {describe(a)}{flag}")
@@ -435,20 +514,20 @@ async def cmd_replay(cfg: Config, n: int):
 
 
 async def init_exchange(ex: Exchange, notifier: Notifier):
-    """加载 Bitget 市场信息。失败就在机器人里提醒一次，之后每分钟重试（不让程序崩溃后反复重启、你却收不到任何消息）。"""
+    """加载交易所市场信息。失败就在机器人里提醒一次，之后每分钟重试（不让程序崩溃后反复重启、你却收不到任何消息）。"""
     warned = False
     while True:
         try:
             await ex.init()
             if warned:
-                await notifier.send("✅ 已连上 Bitget")
+                await notifier.send(f"✅ 已连上 {ex.label}")
             return
         except Exception as e:
-            log.exception("连接 Bitget 失败")
+            log.exception("连接 %s 失败", ex.label)
             if not warned:
                 warned = True
-                await notifier.send(f"⚠️ 连不上 Bitget：{str(e)[:200]}\n我会每分钟自动重试。"
-                                    f"如果一直收不到「✅ 已连上 Bitget」，请把这条消息发给 Claude Code。")
+                await notifier.send(f"⚠️ 连不上 {ex.label}：{str(e)[:200]}\n我会每分钟自动重试。"
+                                    f"如果一直收不到「✅ 已连上 {ex.label}」，请把这条消息发给 Claude Code。")
             await asyncio.sleep(60)
 
 
@@ -456,7 +535,7 @@ async def cmd_run(cfg: Config):
     db = DB(os.path.join(DATA_DIR, "trader.db"))
     ex = Exchange(cfg)
     if cfg.live_trading and not ex.has_keys:
-        log.error("live_trading 已打开但没填 Bitget API Key → 本次全部按模拟盘运行")
+        log.error("live_trading 已打开但没填 %s API Key → 本次全部按模拟盘运行", ex.label)
         cfg.live_trading = False
     client = make_client(cfg)
     await client.connect()
@@ -474,7 +553,7 @@ async def cmd_run(cfg: Config):
             sys.exit("❌ Telegram 还没登录，先运行：python main.py login")
         await bot_login(client, cfg, notifier)
     me = await client.get_me()
-    await init_exchange(ex, notifier)  # 放在绑定和登录之后：连不上 Bitget 时也能通过机器人告诉你
+    await init_exchange(ex, notifier)  # 放在绑定和登录之后：连不上交易所时也能通过机器人告诉你
     parser = SignalParser(cfg)
     engine = Engine(cfg, db, ex, parser, notifier)
     chans = await resolve_channels(client, cfg, join=True)
@@ -527,7 +606,7 @@ async def cmd_run(cfg: Config):
     version = f"｜版本 {engine.version}" if engine.version else ""
     await notifier.send(f"🚀 信号跟单已启动（监听账号 {me.first_name}{version}）\n"
                         f"实盘总开关：{'开' if cfg.live_trading else '关，全部模拟'}"
-                        f"｜Bitget API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n发 /help 查看命令")
+                        f"｜{ex.label} API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n发 /help 查看命令")
     log.info("开始监听 %d 个频道", len(chans))
     try:
         await client.run_until_disconnected()

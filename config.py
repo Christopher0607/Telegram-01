@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
-# 通过机器人 /bitget 命令设置的密钥保存在这里（优先级高于 .env）
+# 通过机器人 /gate、/bitget 命令设置的密钥保存在这里（优先级高于 .env）
 SECRETS_PATH = os.path.join(DATA_DIR, "secrets.env")
 
 # 所有风控参数的默认值（config.yaml 里写了就以 config.yaml 为准）
@@ -104,6 +104,7 @@ class Config:
 
         self.live_trading = bool(raw.get("live_trading", False))
         ex = raw.get("exchange") or {}
+        self.exchange_name = str(ex.get("name", "bitget")).lower()   # bitget 或 gate
         self.margin_mode = str(ex.get("margin_mode", "isolated")).lower()
         llm = raw.get("llm") or {}
         self.llm_provider = str(llm.get("provider", "deepseek")).lower()
@@ -138,6 +139,8 @@ class Config:
         self.bitget_key = os.getenv("BITGET_API_KEY", "")
         self.bitget_secret = os.getenv("BITGET_API_SECRET", "")
         self.bitget_passphrase = os.getenv("BITGET_API_PASSPHRASE", "")
+        self.gate_key = os.getenv("GATE_API_KEY", "")
+        self.gate_secret = os.getenv("GATE_API_SECRET", "")
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
 
