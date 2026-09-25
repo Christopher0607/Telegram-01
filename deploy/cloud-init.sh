@@ -24,7 +24,7 @@ if [ ! -f /swapfile ]; then
 fi
 
 retry apt-get update -y
-retry apt-get install -y git curl ca-certificates cron
+retry apt-get install -y git curl ca-certificates
 if ! command -v docker >/dev/null 2>&1; then
   retry curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
   retry sh /tmp/get-docker.sh
@@ -56,6 +56,27 @@ fi
 
 echo "== 安装自动更新（每 5 分钟检查一次 GitHub）"
 chmod +x deploy/update.sh
-echo '*/5 * * * * root /opt/tg-signal-trader/deploy/update.sh >> /var/log/tgst-update.log 2>&1' > /etc/cron.d/tgst-update
-chmod 644 /etc/cron.d/tgst-update
+# 用 systemd 定时器，不用 cron：没配 SSH 密钥时 DigitalOcean 会把 root 密码设成「首次登录必须修改」，
+# 改之前 cron 会被 PAM 拒绝执行 root 的任务（PAM ERROR: Authentication token is no longer valid），自动更新就一直不跑
+cat > /etc/systemd/system/tgst-update.service <<'UNIT'
+[Unit]
+Description=tg-signal-trader: pull GitHub main and redeploy when it changed
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/opt/tg-signal-trader/deploy/update.sh
+StandardOutput=append:/var/log/tgst-update.log
+StandardError=append:/var/log/tgst-update.log
+UNIT
+cat > /etc/systemd/system/tgst-update.timer <<'UNIT'
+[Unit]
+Description=tg-signal-trader: check GitHub every 5 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now tgst-update.timer
 echo "== $(date '+%F %T') 初始化完成"

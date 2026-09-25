@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cron 每 5 分钟调用：GitHub 上的部署分支有新提交 → 拉取、重建、重启（config.yaml 的修改也靠它生效）
+# systemd 定时器（tgst-update.timer；早期建的服务器是 cron）每 5 分钟调用：GitHub 上的部署分支有新提交 → 拉取、重建、重启（config.yaml 的修改也靠它生效）
 # 上一次构建没成功（包括首次开机时）也会在这里自动重试
 set -euo pipefail
 exec 9>/tmp/tgst-update.lock

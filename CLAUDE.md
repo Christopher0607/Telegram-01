@@ -80,6 +80,6 @@
 - **机器人发「❌ 发送登录验证码失败」**：TG_API_ID / TG_API_HASH / TG_PHONE 填错（服务器上的变量是创建时写入的，要改只能 `destroy --yes` 后用正确的值重新 `create`；这时还没有交易记录，没有损失）。
 - **机器人发「⚠️ 连不上 Bitget」**：服务器所在地区可能访问不了 Bitget。先看错误内容；确认是地区限制的话，征得用户同意后换 `--region`（如 `sgp1` 换 `fra1`）重建。
 - **机器人突然完全没反应**：先用 `getMe` 检查 Token。返回 401 说明机器人被删或 Token 被重置。Token 是建服务器时写入的，只能让用户新建机器人（名字按第 2 步的要求），征得同意后 `destroy --yes` 再 `create`；已登录的话，登录状态和交易记录会一起清空。
-- **改动没生效**：确认已合并进 main；在控制台运行 `tail /var/log/tgst-update.log` 查看。
+- **改动没生效**：确认已合并进 main；在控制台运行 `tail /var/log/tgst-update.log` 查看。**首次部署时的真实原因**：建服务器没配 SSH 密钥，DigitalOcean 把 root 密码（发到用户邮箱）设成「首次登录必须修改」，改之前 cron 会被 PAM 拒绝执行 root 任务，自动更新一次都不会跑，重启也没用。现在的开机脚本改用 systemd 定时器 `tgst-update.timer`，不受影响；2026-09-25 之前建的服务器，需要用户打开控制台，用邮件里的密码登录并设一次新密码。控制台提示 `Current password` 就是这个原因。
 - **/bitget 验证失败**：检查 IP 白名单、合约交易权限、passphrase。
 - **DeepSeek 报 401/402**：Key 错误或余额不足；模型名应为 `deepseek-v4-flash`。
