@@ -329,12 +329,15 @@ async def bot_login(client, cfg: Config, notifier: Notifier):
 # 设置交易所 API 的命令 → (交易所, 依次要填的项 = 保存到 data/secrets.env 的变量名)
 KEY_COMMANDS = {
     "/gate": ("gate", ["GATE_API_KEY", "GATE_API_SECRET"]),
+    "/weex": ("weex", ["WEEX_API_KEY", "WEEX_API_SECRET", "WEEX_API_PASSPHRASE"]),
     "/bitget": ("bitget", ["BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE"]),
 }
+# 真实账户下单测试（开实盘/换交易所之前做一次）：命令 → 交易所
+TEST_COMMANDS = {"/gatetest": "gate", "/weextest": "weex"}
 
 
 def key_parts(name: str, text: str) -> list[str]:
-    """从 /gate、/bitget 消息里取出 API 各项（命令后面用空格或换行隔开）。
+    """从 /gate、/weex、/bitget 消息里取出 API 各项（命令后面用空格或换行隔开）。
     Gate 的 Key、Secret 都是一长串十六进制字符：多出来的「Key:」之类的字、被截成两段的 Secret 也能认出来。"""
     parts = text.split()[1:]
     if name == "gate" and len(parts) != 2:
@@ -359,34 +362,32 @@ async def verify_keys(name: str, values: list[str]) -> tuple[bool, str]:
         await ex.close()
 
 
-async def gate_selftest(ex: Exchange) -> str:
-    """/gatetest：用 1 张 BTC 合约（约 8U 仓位、逐仓 5 倍，手续费约 0.01U）在真实账户上实测 Gate 的下单流程：
-    开仓 → 挂止损单、查到、撤掉 → 挂一张马上满足条件的止损单，确认它真的把整个仓位平掉。结束时一定清理干净。"""
+async def exchange_selftest(ex: Exchange) -> str:
+    """/gatetest、/weextest：用最小数量的 BTC（约 8U 仓位、逐仓 5 倍，手续费约 0.01U）在真实账户上实测下单流程：
+    开仓 → 挂止损单、查到、撤掉 → 挂一张马上满足条件的止损单，确认它真的把整个仓位平掉 → 查到这次的盈亏。
+    结束时一定清理干净。"""
     s = "BTC/USDT:USDT"
-    lines = ["🧪 Gate 实盘接口测试（1 张 BTC 合约）"]
+    qty = ex.min_qty(s)
+    lines = [f"🧪 {ex.label} 实盘接口测试（{qty:g} BTC）"]
     if (await ex.positions()).get(s):
         return "账户里已经有 BTC 仓位，为了不干扰它，测试没有进行。"
-
-    async def sl_status(sid):
-        o = await ex.ex.privateFuturesGetSettlePriceOrdersOrderId({"settle": "usdt", "order_id": sid})
-        return o.get("status"), (o.get("trigger") or {}).get("price"), (o.get("trigger") or {}).get("rule")
-
     since, sids = int(time.time() * 1000) - 60000, []
     try:
         await ex.prepare(s, 5, "long")
         lines.append("✅ 设置逐仓 5 倍杠杆")
-        await ex.open_market(s, "long", ex._contract_size(s), 0)
+        await ex.open_market(s, "long", qty, 0)
         p = await ex.wait_position(s)
         if not p:
             lines.append("❌ 市价开仓后没查到持仓")
             return "\n".join(lines)
         lines.append(f"✅ 市价开多 {p['size']:g} BTC @{p['entry']:g}")
         sids.append(await ex.place_sl(s, "long", p["entry"] * 0.95))
-        st = await sl_status(sids[-1])
-        lines.append(f"{'✅' if st[0] == 'open' else '❌'} 挂止损单（-5%）：状态 {st[0]}，触发价 {st[1]}，规则 {st[2]}（2 = 价格≤触发价）")
+        st = await ex.sl_info(s, sids[-1])
+        lines.append(f"{'✅' if st['open'] else '❌'} 挂止损单（-5%）：状态 {st['status']}，触发价 {st['trigger']}，{st['detail']}")
         await ex.cancel_sl(s, sids[-1])
-        st = await sl_status(sids[-1])
-        lines.append(f"{'✅' if st[0] != 'open' else '❌'} 撤销止损单：状态 {st[0]}")
+        await asyncio.sleep(1)
+        st = await ex.sl_info(s, sids[-1])
+        lines.append(f"{'✅' if not st['open'] else '❌'} 撤销止损单：{st['status']}")
         px = await ex.last_price(s)
         try:  # 触发价高于现价的多单止损 = 条件已经满足，应该马上触发
             sids.append(await ex.place_sl(s, "long", px * 1.002))
@@ -454,7 +455,7 @@ async def join_command(text: str, cfg: Config, client, restart) -> str:
 
 async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, engine: Engine,
                         client=None, restart=restart_soon) -> str | None:
-    """机器人命令入口：/ai、/ip、/join、/gate、/bitget 在这里处理，其余交给 engine。"""
+    """机器人命令入口：/ai、/ip、/join、/gate、/weex、/bitget、/gatetest、/weextest 在这里处理，其余交给 engine。"""
     cmd = text.split()[0].lower().split("@")[0]
     if cmd == "/join":
         return await join_command(text, cfg, client, restart)
@@ -463,13 +464,24 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
         return ai_text(engine.db, cfg, max(1, min(int(arg) if arg.isdigit() else 10, 20)))
     if cmd == "/ip":
         return (f"🌐 服务器 IP：{cfg.server_ip or '未知（请在 DigitalOcean 后台查看）'}\n"
-                f"在 {engine.ex.label} 创建 API 时，IP 白名单填这个。")
-    if cmd == "/gatetest":
-        if engine.ex.name != "gate" or not engine.ex.has_keys:
-            return "这个测试只在交易所是 Gate、并且已经用 /gate 设置好 API 时才能用。"
-        await notifier.send("🧪 开始测试，大约 30 秒～2 分钟……")
-        async with engine.lock:
-            return await gate_selftest(engine.ex)
+                f"在交易所创建 API 时，IP 白名单填这个。")
+    if cmd in TEST_COMMANDS:
+        # 测试的交易所不是现在用的那个也能测（换交易所之前先测）：临时连一个
+        name = TEST_COMMANDS[cmd]
+        temp = engine.ex.name != name
+        ex = Exchange(cfg, name) if temp else engine.ex
+        try:
+            if not ex.has_keys:
+                return f"还没设置 {LABELS[name]} API：先发 /{name} 设置，再发 {cmd}。"
+            await notifier.send("🧪 开始测试，大约 30 秒～2 分钟……")
+            if temp:  # 另一个交易所：和程序正在用的账户互不影响，不用暂停盯盘
+                await ex.init()
+                return await exchange_selftest(ex)
+            async with engine.lock:
+                return await exchange_selftest(ex)
+        finally:
+            if temp:
+                await ex.close()
     if cmd in KEY_COMMANDS:
         await notifier.delete(msg)
         name, env_names = KEY_COMMANDS[cmd]
@@ -484,7 +496,10 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
                     f"是否勾了合约交易{'、passphrase 是否正确' if name == 'bitget' else ''}。你的消息已删除，没有保存。")
         save_secrets(dict(zip(env_names, parts)))
         restart()  # 3 秒后退出，Docker 自动重启并读取新密钥
-        note = "" if name == engine.ex.name else f"\n注意：现在用的交易所是 {engine.ex.label}，这组 {label} API 暂时用不上。"
+        test = next((c for c, n in TEST_COMMANDS.items() if n == name), None)
+        note = "" if name == engine.ex.name else (
+            f"\n现在用的交易所还是 {engine.ex.label}。" + (f"重启后发 {test} 在 {label} 真实账户上测试下单和止损，"
+                                                            f"把结果截图发给 Claude Code，再切换交易所。" if test else ""))
         return (f"✅ {label} API 验证通过（{info}），已保存，3 秒后自动重启生效。你的消息已删除。"
                 + ("" if cfg.live_trading else "\n现在仍然是模拟盘；要开实盘，请告诉 Claude Code。") + note)
     return await engine.handle_command(text)
@@ -717,6 +732,7 @@ async def cmd_run(cfg: Config):
     await init_exchange(ex, notifier)  # 放在绑定和登录之后：连不上交易所时也能通过机器人告诉你
     parser = SignalParser(cfg)
     engine = Engine(cfg, db, ex, parser, notifier)
+    await engine.adopt_exchange()  # 换了交易所：旧交易所的实盘单提醒主人处理
     chans = await resolve_channels(client, cfg, join=True)
     if not chans:
         sys.exit("❌ 没有可监听的频道，检查 config.yaml")

@@ -35,11 +35,14 @@ HELP = ("📖 命令\n"
         "/pause   暂停实盘开新仓\n"
         "/resume  恢复实盘开新仓\n"
         "/closeall 立即平掉本程序开的所有实盘仓位、撤挂单，并暂停\n"
-        "/ip      服务器 IP（{label} API 白名单填这个）\n"
+        "/ip      服务器 IP（交易所 API 白名单填这个）\n"
         "/join 邀请链接  跟一个私人群/频道（会员群），链接只保存在服务器上\n"
-        "{key_cmd}（我会立刻删除你这条消息）\n"
+        "{key_cmd}\n"
+        "（设置 API 的消息我会立刻删除）\n"
+        "/gatetest /weextest  在真实账户上测试下单和止损（约 0.01U）\n"
         "常用功能也可以直接点输入框下方的按钮")
-KEY_CMD = {"gate": "/gate  KEY SECRET  设置 Gate API", "bitget": "/bitget  KEY SECRET PASSPHRASE  设置 Bitget API"}
+KEY_CMD = {"gate": "/gate  KEY SECRET  设置 Gate API", "weex": "/weex  KEY SECRET PASSPHRASE  设置 WEEX API",
+           "bitget": "/bitget  KEY SECRET PASSPHRASE  设置 Bitget API"}
 
 
 class Reject(Exception):
@@ -579,7 +582,7 @@ class Engine:
                     for x in plan["tps"]],
             "leverage": plan["leverage"], "risk_usdt": plan["risk_usdt"], "realized": 0.0,
             "created_at": now, "last_candle_ts": now // 60000 * 60000, "be_moved": 0,
-            "sl_source": plan.get("sl_source", "signal"),
+            "sl_source": plan.get("sl_source", "signal"), "exchange": self.ex.name,
         }
 
     async def open_paper(self, plan, ctx) -> dict:
@@ -768,6 +771,33 @@ class Engine:
         await self.notify(self.close_text(t, exit_px))
 
     # ---------------- 监控循环 ----------------
+    async def adopt_exchange(self):
+        """启动时核对交易所（config.yaml 换了交易所之后很重要）：
+        - 以前没记交易所的旧单子：算作当前交易所的（加这个字段时交易所没有变）
+        - 还挂在旧交易所的实盘单：程序连不上旧交易所了，提醒主人去旧交易所 App 处理，不再算作持仓
+        - 新交易所没有这个合约的模拟单：作废（否则每次核对都会报错）"""
+        from exchange import LABELS
+        self.db.conn.execute("UPDATE trades SET exchange=? WHERE exchange IS NULL", (self.ex.name,))
+        self.db.conn.commit()
+        voided = 0
+        for t in self.db.active_trades():
+            old = t.get("exchange") or self.ex.name
+            if t["mode"] == "live" and old != self.ex.name:
+                name, was = LABELS.get(old, old), t["status"]
+                t.update(status="cancelled", closed_at=now_ms(), exit_reason=f"换成 {self.ex.label} 时还在 {name}，程序不再管理")
+                self.db.save_trade(t)
+                await self.notify(
+                    f"⚠️ 实盘单 #{t['id']} {t['base']} {SIDE_CN[t['side']]}（{t['title']}）还在 {name} 里"
+                    f"{'持仓' if was == 'open' else '挂单'}。程序现在连的是 {self.ex.label}，管不了它了：\n"
+                    + (f"{name} 里的止损单还在，但止盈不会再执行，请打开 {name} App 自己平掉。" if was == "open"
+                       else f"请打开 {name} App 把这张限价单撤掉。"))
+            elif t["mode"] == "paper" and not self.ex.has_symbol(t["symbol"]):
+                t.update(status="cancelled", closed_at=now_ms(), exit_reason=f"{self.ex.label} 没有 {t['symbol']} 这个合约，模拟单作废")
+                self.db.save_trade(t)
+                voided += 1
+        if voided:
+            await self.notify(f"ℹ️ {voided} 笔模拟单的币在 {self.ex.label} 的合约代码不一样，已作废（不影响实盘，也不计入战绩）")
+
     async def monitor_forever(self):
         tick = 0
         while True:
@@ -944,7 +974,7 @@ class Engine:
     async def handle_command(self, text: str) -> str:
         cmd = text.split()[0].lower().split("@")[0]
         if cmd in ("/start", "/help"):
-            return HELP.format(label=self.ex.label, key_cmd=KEY_CMD.get(self.ex.name, ""))
+            return HELP.format(key_cmd="\n".join(v for k, v in KEY_CMD.items() if k != "bitget" or k == self.ex.name))
         if cmd == "/status":
             return await self.status_text()
         if cmd == "/stats":
@@ -973,7 +1003,7 @@ class Engine:
 
     async def status_text(self) -> str:
         paused = self.paused()
-        lines = [f"🤖 运行中｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"
+        lines = [f"🤖 运行中｜交易所：{self.ex.label}｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"
                  + (f"｜版本 {self.version}" if self.version else "")]
         if self.ex.has_keys:
             try:

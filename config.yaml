@@ -10,7 +10,7 @@
 live_trading: true
 
 exchange:
-  name: gate                   # gate 或 bitget（实盘下单、模拟盘行情都用这个交易所）
+  name: gate                   # gate、weex 或 bitget（实盘下单、模拟盘行情都用这个交易所）
   margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓
 
 llm:

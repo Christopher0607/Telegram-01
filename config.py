@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
-# 通过机器人 /gate、/bitget 命令设置的密钥保存在这里（优先级高于 .env）
+# 通过机器人 /gate、/weex、/bitget 命令设置的密钥保存在这里（优先级高于 .env）
 SECRETS_PATH = os.path.join(DATA_DIR, "secrets.env")
 # 通过机器人 /join 命令设置的私人群邀请链接保存在这里（仓库是公开的，链接不能写进 config.yaml）
 PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
@@ -130,7 +130,7 @@ class Config:
 
         self.live_trading = bool(raw.get("live_trading", False))
         ex = raw.get("exchange") or {}
-        self.exchange_name = str(ex.get("name", "bitget")).lower()   # bitget 或 gate
+        self.exchange_name = str(ex.get("name", "bitget")).lower()   # bitget、gate 或 weex
         self.margin_mode = str(ex.get("margin_mode", "isolated")).lower()
         llm = raw.get("llm") or {}
         self.llm_provider = str(llm.get("provider", "deepseek")).lower()
@@ -170,6 +170,9 @@ class Config:
         self.bitget_passphrase = os.getenv("BITGET_API_PASSPHRASE", "")
         self.gate_key = os.getenv("GATE_API_KEY", "")
         self.gate_secret = os.getenv("GATE_API_SECRET", "")
+        self.weex_key = os.getenv("WEEX_API_KEY", "")
+        self.weex_secret = os.getenv("WEEX_API_SECRET", "")
+        self.weex_passphrase = os.getenv("WEEX_API_PASSPHRASE", "")
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
 
