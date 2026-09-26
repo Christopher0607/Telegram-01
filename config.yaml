@@ -6,7 +6,8 @@
 # 实盘总开关。false = 所有频道只跑模拟盘，不会动你的钱。
 # 模拟跑 1~2 周，用 /stats 确认某个频道总 R 为正以后，
 # 再把那个频道的 mode 改成 live，并把这里改成 true。
-live_trading: false
+# 2026-09-26：用户确认 4 个频道全部实盘（Gate，本金约 80U，每单 10U），/gatetest 已全部通过。
+live_trading: true
 
 exchange:
   name: gate                   # gate 或 bitget（实盘下单、模拟盘行情都用这个交易所）
@@ -25,14 +26,14 @@ daily_report_hour: 22          # 每天几点推送日报（持仓 + 各频道�
 
 channels:
   - username: IvanCryptotalk   # UMIE_加密貨幣：部分带止损；止盈/提损/平仓常用「回复」发出
-    mode: paper                # paper 模拟 / live 实盘 / off 不监听
+    mode: live                 # paper 模拟 / live 实盘 / off 不监听
     risk_multiplier: 1.0       # 这个频道的仓位倍数（0.5 = 半仓）
   - username: zxcccckhf        # 財財加密貨幣頻道：格式最规整（进场/止盈/止损齐全）
-    mode: paper
+    mode: live
   - username: chun77chun       # 哈基咪區塊貨幣中心：市价单 + 止盈 + 止损
-    mode: paper
+    mode: live
   - username: yuyanjia66       # 預言家：多数喊单不带止损，由程序补止损
-    mode: paper
+    mode: live
     # overrides:               # 任何风控参数都能按频道单独设置，例如这个频道的无止损单不跟：
     #   fallback_sl_mode: off
 
