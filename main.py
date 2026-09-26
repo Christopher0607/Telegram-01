@@ -393,18 +393,24 @@ async def exchange_selftest(ex: Exchange) -> tuple[str, bool]:
         px = await ex.last_price(s)
         try:  # 触发价高于现价的多单止损 = 条件已经满足，应该马上触发
             sids.append(await ex.place_sl(s, "long", px * 1.002))
-            wait = 15
-        except Exception as e:  # 交易所不接受已满足条件的止损，就挂一张贴着现价的，等价格自然波动触发
-            lines.append(f"ℹ️ 交易所不接受已越过现价的止损（{str(e)[:80]}），改挂一张贴着现价的等它触发")
-            sids.append(await ex.place_sl(s, "long", px * 0.9997))
-            wait = 120
+            rounds = 1
+        except Exception as e:  # 交易所不接受已满足条件的止损：挂一张贴着现价（低 0.01%）的，等价格自然波动触发
+            lines.append(f"ℹ️ 交易所不接受已越过现价的止损（{str(e)[:80]}），改挂贴着现价的等它触发")
+            sids.append(await ex.place_sl(s, "long", px * 0.9999))
+            rounds = 6
         closed = False
-        for _ in range(wait):
-            await asyncio.sleep(1)
-            if not (await ex.positions()).get(s):
-                closed = True
+        for r in range(rounds):  # 每轮 30 秒；价格一直没碰到，就按最新价重挂一张更贴近的（最多 3 分钟）
+            for _ in range(15):
+                await asyncio.sleep(2)
+                if not (await ex.positions()).get(s):
+                    closed = True
+                    break
+            if closed or r == rounds - 1:
                 break
-        lines.append("✅ 止损单触发后，整个仓位被平掉" if closed else f"⚠️ {wait} 秒内止损没有触发（价格没碰到），这一项没测出结果")
+            await ex.cancel_sl(s, sids[-1])
+            sids.append(await ex.place_sl(s, "long", (await ex.last_price(s)) * 0.9999))
+        lines.append("✅ 止损单触发后，整个仓位被平掉" if closed
+                     else f"⚠️ {rounds * 30} 秒内止损没有触发（价格一直没碰到），这一项没测出结果，请再测一次")
         ok = placed and cancelled and closed
     except Exception as e:
         lines.append(f"❌ 出错：{str(e)[:200]}")

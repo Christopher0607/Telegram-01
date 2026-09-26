@@ -317,23 +317,21 @@ class Exchange:
         return str(oid)
 
     async def _weex_place_sl(self, symbol: str, long: bool, sl: float) -> str:
-        """WEEX 止损单：quantity 填 "0" = 管整个仓位（文档说「填 0 或不填」，实际不填会报「quantity 不能为空」）。
-        不填 executePrice = 触发后市价平。万一 WEEX 连 0 也不接受，就按现在的仓位数量挂，返回 "q:单号:数量"，
-        仓位数量变了（分批止盈、限价单陆续成交）engine 会按新数量重挂（fit_sl），保证整个仓位都有止损。"""
-        req = {"symbol": self.ex.market(symbol)["id"], "planType": "STOP_LOSS",
-               "triggerPrice": self.ex.price_to_precision(symbol, sl), "positionSide": "LONG" if long else "SHORT",
-               "triggerPriceType": "CONTRACT_PRICE"}
-        try:
-            return await self._weex_tpsl(dict(req, quantity="0"))
-        except Exception as e:
-            if "quantity" not in str(e).lower():
-                raise
-            log.warning("WEEX 不接受整仓止损（%s），改按仓位数量挂", str(e)[:150])
+        """WEEX 止损单：按现在的仓位数量挂（触发后市价平），返回 "q:单号:数量"。
+        仓位数量变了（分批止盈、限价单陆续成交、手动减仓）engine 会按新数量重挂（fit_sl），保证整个仓位都有止损。
+        注意：文档说 quantity「填 0 或不填 = 整个仓位」，实测不填会报错，填 0 会挂出一张数量为 0、
+        不平整个仓位的止损单（触发了也平不掉任何东西），所以绝不能填 0。"""
         size = ((await self.positions()).get(symbol) or {}).get("size")
         if not size:
-            raise RuntimeError("没查到持仓，没法按仓位数量挂止损")
+            raise RuntimeError("没查到持仓，没法挂止损")
         q = self.ex.amount_to_precision(symbol, size)
-        return f"q:{await self._weex_tpsl(dict(req, quantity=q))}:{q}"
+        if float(q) <= 0:
+            raise RuntimeError(f"止损数量 {q} 不对")
+        oid = await self._weex_tpsl({
+            "symbol": self.ex.market(symbol)["id"], "planType": "STOP_LOSS", "quantity": q,
+            "triggerPrice": self.ex.price_to_precision(symbol, sl), "positionSide": "LONG" if long else "SHORT",
+            "triggerPriceType": "CONTRACT_PRICE"})
+        return f"q:{oid}:{q}"
 
     async def _weex_tpsl(self, req: dict) -> str:
         r = await self.ex.contractPrivatePostCapiV3PlaceTpSlOrder(dict(req, clientAlgoId=f"tgst-sl-{uuid.uuid4().hex[:16]}"))
@@ -363,7 +361,9 @@ class Exchange:
             if not o:
                 return {"open": False, "covers": False, "status": "已不在挂单列表（已触发或已撤销）", "trigger": None, "detail": ""}
             st, full = str(o.get("algoStatus")), bool(o.get("closePosition"))
-            sized = str(sl_order_id).startswith("q:")
+            want = str(sl_order_id).rsplit(":", 1)[1] if str(sl_order_id).startswith("q:") else None
+            listed = float(o.get("quantity") or 0)
+            sized = want is not None and listed > 0 and abs(listed - float(want)) <= float(want) * 1e-6
             detail = "平掉整个仓位：是" if full else (f"按仓位数量 {o.get('quantity')} 挂（仓位变了程序会重挂）" if sized
                                                    else f"平掉整个仓位：否（数量 {o.get('quantity')}）")
             return {"open": st in WEEX_OPEN_SL, "covers": full or sized, "status": st, "trigger": o.get("triggerPrice"),
