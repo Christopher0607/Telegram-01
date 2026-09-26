@@ -427,6 +427,75 @@ async def exchange_selftest(ex: Exchange) -> tuple[str, bool]:
     return "\n".join(lines), ok
 
 
+MODE_CONFIRM_TTL = 300  # 「确认切到实盘」按钮 5 分钟内有效
+
+
+def risk_text(cfg: Config, ch: ChannelCfg, equity: float | None = None) -> str:
+    """切实盘时提醒的「每单打到止损约亏多少」（按这个频道的风控设置）。"""
+    r = cfg.risk_for(ch)
+    fixed = float(r.get("risk_per_trade_usdt") or 0) * ch.risk_multiplier
+    if fixed > 0:
+        return f" {fixed:g}U"
+    pct = float(r["risk_per_trade_pct"]) * ch.risk_multiplier
+    return f"总权益的 {pct:g}%" + (f"（按现在权益 {equity:.0f}U 算约 {equity * pct / 100:.1f}U）" if equity else "")
+
+
+def mode_panel(cfg: Config, engine: Engine, head: str = "") -> tuple[str, dict]:
+    """⚙️ 实盘/模拟：每个频道现在是实盘还是模拟，每个频道一个切换按钮。"""
+    lines = [head, ""] if head else []
+    lines.append("⚙️ 每个频道的跟单方式（点下面的按钮切换）")
+    rows = []
+    for c in cfg.channels:
+        if c.mode == "off":
+            continue
+        name = c.title or c.username
+        live = cfg.channel_mode(c) == "live"
+        note = "（实际还是模拟，原因见下）" if live and cfg.mode_for(c) != "live" else ""
+        lines.append(f"• {name}：{'🔴 实盘' if live else '⚪ 模拟'}{note}")
+        rows.append([{"text": f"{name} → 改{'模拟' if live else '实盘'}",
+                      "callback_data": f"mode:{c.username}:{'paper' if live else 'live'}"}])
+    if not cfg.live_trading:
+        lines.append("⚠️ 实盘总开关是关的，所有频道实际都按模拟跑。要打开请告诉 Claude Code。")
+    elif not engine.ex.has_keys:
+        lines.append(f"⚠️ 还没设置 {engine.ex.label} API，实盘下不了单。")
+    elif engine.live_block():
+        lines.append(f"⚠️ {engine.live_block()}")
+    lines.append("切到实盘要再确认一次；切回模拟马上生效，已经开着的实盘单照常管到平仓。")
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+async def mode_callback(data: str, cfg: Config, engine: Engine) -> tuple[str, dict]:
+    """点了实盘/模拟面板上的按钮。data：mode:panel / mode:频道:paper|live / modeok:频道:时间"""
+    parts = data.split(":")
+    if parts[:2] == ["mode", "panel"]:
+        return mode_panel(cfg, engine)
+    ch = cfg.channel_by_username(parts[1]) if len(parts) == 3 else None
+    if not ch or ch.mode == "off":
+        return mode_panel(cfg, engine, "找不到这个频道，按钮可能过期了。")
+    name = ch.title or ch.username
+    if parts[0] == "mode" and parts[2] == "paper":
+        cfg.set_channel_mode(ch, "paper")
+        log.info("主人把 %s 切到模拟", name)
+        return mode_panel(cfg, engine, f"✅ {name} 已切到模拟盘（已经开着的实盘单照常管到平仓）")
+    if parts[0] == "mode" and parts[2] == "live":
+        equity = None
+        if engine.ex.has_keys:
+            try:
+                equity = (await engine.ex.balance())[0]
+            except Exception:
+                pass
+        return (f"⚠️ 确定把「{name}」切到实盘吗？\n实盘会真实下单，每单打到止损约亏{risk_text(cfg, ch, equity)}。",
+                {"inline_keyboard": [[{"text": "✅ 确认切到实盘", "callback_data": f"modeok:{ch.username}:{int(time.time())}"},
+                                      {"text": "取消", "callback_data": "mode:panel"}]]})
+    if parts[0] == "modeok" and parts[2].isdigit():
+        if time.time() - int(parts[2]) > MODE_CONFIRM_TTL:
+            return mode_panel(cfg, engine, "⌛ 确认按钮已经过期，没有切换。")
+        cfg.set_channel_mode(ch, "live")
+        log.info("主人把 %s 切到实盘", name)
+        return mode_panel(cfg, engine, f"✅ {name} 已切到实盘，下一个信号开始真实下单")
+    return mode_panel(cfg, engine)
+
+
 def restart_soon():
     """3 秒后退出，Docker 自动重启并读取新设置。"""
     asyncio.get_running_loop().call_later(3, os._exit, 0)
@@ -463,9 +532,13 @@ async def join_command(text: str, cfg: Config, client, restart) -> str:
 
 
 async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, engine: Engine,
-                        client=None, restart=restart_soon) -> str | None:
+                        client=None, restart=restart_soon) -> str | tuple[str, dict] | None:
     """机器人命令入口：/ai、/ip、/join、/gate、/weex、/bitget、/gatetest、/weextest 在这里处理，其余交给 engine。"""
     cmd = text.split()[0].lower().split("@")[0]
+    if cmd == "/mode":
+        return mode_panel(cfg, engine)
+    if cmd == "/cb":  # 消息下面的按钮（实盘/模拟面板）
+        return await mode_callback(text.split(maxsplit=1)[1] if len(text.split()) > 1 else "", cfg, engine)
     if cmd == "/join":
         return await join_command(text, cfg, client, restart)
     if cmd == "/ai":

@@ -20,16 +20,17 @@ log = logging.getLogger("notifier")
 # 输入框下方常驻的按钮：点一下就等于发对应的命令
 BUTTON_ROWS = [["📊 状态", "📈 战绩", "📜 最近交易"],
                ["🧠 AI识别", "⏸ 暂停开仓", "▶️ 恢复开仓"],
-               ["🛑 全部平仓", "📖 帮助"]]
+               ["⚙️ 实盘/模拟", "🛑 全部平仓", "📖 帮助"]]
 BUTTON_CMDS = {"📊 状态": "/status", "📈 战绩": "/stats", "📜 最近交易": "/trades", "🧠 AI识别": "/ai",
-               "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "📖 帮助": "/help"}
+               "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "⚙️ 实盘/模拟": "/mode", "📖 帮助": "/help"}
 CLOSEALL_BUTTON = "🛑 全部平仓"   # 这个按钮要再点一次「确认」才执行
 CONFIRM_TTL = 300                 # 确认按钮 5 分钟内有效
 KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
             "resize_keyboard": True, "is_persistent": True}
 # 输入框左边「菜单」里的命令（/closeall、/gatetest 会真实下单，不放进菜单，免得误点）
 MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩"), ("trades", "最近 10 笔已平仓交易"),
-        ("ai", "最近 10 条频道消息的 AI 识别结果"), ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
+        ("ai", "最近 10 条频道消息的 AI 识别结果"), ("mode", "每个频道切换实盘/模拟"),
+        ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
         ("ip", "服务器 IP"), ("help", "全部命令")]
 
 
@@ -179,11 +180,16 @@ class Notifier:
         return self.owner_id
 
     async def on_button(self, cq: dict, handler):
-        """主人点了消息下面的按钮（目前只有「确认全部平仓 / 取消」）。"""
+        """主人点了消息下面的按钮：「确认全部平仓 / 取消」，或者实盘/模拟面板上的按钮。"""
         await self.call("answerCallbackQuery", {"callback_query_id": cq["id"]})
         m = cq.get("message") or {}
         where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
         data = cq.get("data") or ""
+        if data.startswith(("mode:", "modeok:")):  # 实盘/模拟面板：在原消息上更新
+            reply = await handler(f"/cb {data}", m)
+            text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
+            await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))
+            return
         if not data.startswith("closeall:"):
             await self.call("editMessageText", dict(where, text="已取消，什么都没做。"))
             return
@@ -233,7 +239,9 @@ class Notifier:
                     except Exception as e:
                         log.exception("命令处理出错")
                         reply = f"命令出错：{e}"
-                    if reply:  # /start、/help 的回复带上按钮（万一按钮被收起来了，发 /help 就能找回）
+                    if isinstance(reply, tuple):  # (文字, 消息下面的按钮)
+                        await self.send(*reply)
+                    elif reply:  # /start、/help 的回复带上按钮（万一按钮被收起来了，发 /help 就能找回）
                         cmd = text.split()[0].lower().split("@")[0]
                         await self.send(reply, KEYBOARD if cmd in ("/start", "/help") else None)
             except Exception as e:

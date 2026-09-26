@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
 import yaml
@@ -15,6 +16,8 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
 SECRETS_PATH = os.path.join(DATA_DIR, "secrets.env")
 # 通过机器人 /join 命令设置的私人群邀请链接保存在这里（仓库是公开的，链接不能写进 config.yaml）
 PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
+# 主人在机器人里（⚙️ 实盘/模拟）切换的频道模式：{频道: {"mode": live/paper, "base": 切换时 config.yaml 里的 mode}}
+MODES_PATH = os.path.join(DATA_DIR, "modes.json")
 
 # 所有风控参数的默认值（config.yaml 里写了就以 config.yaml 为准）
 DEFAULT_RISK = {
@@ -74,6 +77,15 @@ def _saved_owner() -> int:
             return int(json.load(f).get("id") or 0)
     except Exception:
         return 0
+
+
+def _load_json(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def load_private_groups() -> dict:
@@ -176,17 +188,37 @@ class Config:
         self.weex_passphrase = os.getenv("WEEX_API_PASSPHRASE", "")
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+        self.mode_overrides = _load_json(MODES_PATH)
 
     def risk_for(self, ch: ChannelCfg) -> dict:
         r = copy.deepcopy(self.risk)
         r.update(ch.overrides or {})
         return r
 
+    def channel_mode(self, ch: ChannelCfg) -> str:
+        """频道设置的模式：主人在机器人里切换过就用切换后的；之后 config.yaml 又改了这个频道，就以 config.yaml 为准
+        （谁最后改算谁的）。"""
+        o = self.mode_overrides.get(ch.username) or {}
+        if o.get("mode") in ("live", "paper") and o.get("base") == ch.mode:
+            return o["mode"]
+        return ch.mode
+
+    def set_channel_mode(self, ch: ChannelCfg, mode: str):
+        """机器人里切换实盘/模拟：保存到 data/modes.json，重启后照样有效。"""
+        if mode == ch.mode:
+            self.mode_overrides.pop(ch.username, None)  # 和 config.yaml 一样了，不用再记
+        else:
+            self.mode_overrides[ch.username] = {"mode": mode, "base": ch.mode, "at": int(time.time())}
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(MODES_PATH, "w", encoding="utf-8") as f:
+            json.dump(self.mode_overrides, f, ensure_ascii=False)
+
     def mode_for(self, ch: ChannelCfg) -> str:
         """实际生效的模式：只有总开关 live_trading 打开且频道设为 live 才真实下单。"""
-        if ch.mode == "off":
+        m = self.channel_mode(ch)
+        if m == "off":
             return "off"
-        if ch.mode == "live" and self.live_trading:
+        if m == "live" and self.live_trading:
             return "live"
         return "paper"
 
