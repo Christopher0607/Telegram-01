@@ -23,12 +23,15 @@ from logging.handlers import RotatingFileHandler
 
 from telethon import TelegramClient, events, utils
 import ccxt.async_support as ccxt
-from telethon.errors import (FloodWaitError, PasswordHashInvalidError, PhoneCodeExpiredError,
-                             PhoneCodeInvalidError, SessionPasswordNeededError)
+from telethon.errors import (FloodWaitError, InviteHashExpiredError, InviteHashInvalidError, InviteRequestSentError,
+                             PasswordHashInvalidError, PhoneCodeExpiredError, PhoneCodeInvalidError,
+                             SessionPasswordNeededError)
 from telethon.tl.functions.channels import JoinChannelRequest
-from telethon.tl.types import MessageMediaPhoto
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import (ChannelParticipantAdmin, ChannelParticipantCreator, ChannelParticipantsAdmins, Chat,
+                               ChatInviteAlready, ChatParticipantAdmin, ChatParticipantCreator, MessageMediaPhoto)
 
-from config import ChannelCfg, Config, DATA_DIR, save_secrets
+from config import ChannelCfg, Config, DATA_DIR, load_private_groups, save_private_group, save_secrets
 from db import DB
 from engine import MODE_CN, SIDE_CN, Engine, MsgCtx, fmt
 from exchange import LABELS, Exchange
@@ -60,24 +63,97 @@ def make_client(cfg: Config) -> TelegramClient:
     return TelegramClient(os.path.join(DATA_DIR, "telegram"), cfg.tg_api_id, cfg.tg_api_hash)
 
 
+def invite_hash(text: str) -> str | None:
+    """从私人邀请链接里取出邀请码：t.me/+xxxx、t.me/joinchat/xxxx、tg://join?invite=xxxx"""
+    m = re.search(r"(?:t\.me|telegram\.me|telegram\.dog)/(?:\+|joinchat/)([\w-]+)|invite=([\w-]+)", text or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+async def open_invite(client, h: str, join: bool):
+    """邀请码 → 群/频道。监听账号还没进群、并且 join=True 时，用邀请链接加入。"""
+    res = await client(CheckChatInviteRequest(h))
+    if isinstance(res, ChatInviteAlready):
+        return res.chat
+    if not join:
+        raise ValueError("监听账号还不在这个群里")
+    return (await client(ImportChatInviteRequest(h))).chats[0]
+
+
+async def find_private(client, info: dict | None, join: bool):
+    """私人群：先按 /join 时记下的 id 找（群主换了邀请链接也不影响），找不到再用邀请链接。"""
+    if not info:
+        raise ValueError("还没设置邀请链接（给机器人发 /join 邀请链接）")
+    try:
+        return await client.get_entity(info["id"])
+    except Exception:
+        pass
+    try:
+        return await open_invite(client, info["hash"], join)
+    except Exception as e:
+        err = e
+    await client.get_dialogs()  # 刷新本地记录，再按 id 找一次
+    try:
+        return await client.get_entity(info["id"])
+    except Exception:
+        raise err
+
+
+def is_group(ent) -> bool:
+    """群组：成员也能发言。频道只有管理员能发。"""
+    return isinstance(ent, Chat) or bool(getattr(ent, "megagroup", False) or getattr(ent, "gigagroup", False))
+
+
+ADMIN_TYPES = (ChannelParticipantAdmin, ChannelParticipantCreator, ChatParticipantAdmin, ChatParticipantCreator)
+ADMIN_REFRESH_SEC = 6 * 3600
+
+
+async def fetch_admins(client, ent) -> set[int]:
+    """群主和管理员的 id（普通小群会返回全部成员，按身份筛出来）。"""
+    ids = set()
+    async for u in client.iter_participants(ent, filter=ChannelParticipantsAdmins()):
+        if isinstance(getattr(u, "participant", None), ADMIN_TYPES):
+            ids.add(u.id)
+    return ids
+
+
+async def from_admin(client, ch: ChannelCfg, msg) -> bool:
+    """群组里只跟群主/管理员发的消息：普通成员随口一句「BTC 市價多」不能让程序下单。频道只有管理员能发，不用查。"""
+    if not ch.is_group:
+        return True
+    sid = msg.sender_id
+    if sid is None or sid == msg.chat_id:  # 匿名管理员（以群的身份发言）
+        return True
+    if ch.admin_ids is None or time.time() - ch.admins_at > ADMIN_REFRESH_SEC:
+        try:
+            ch.admin_ids, ch.admins_at = await fetch_admins(client, ch.entity), time.time()
+        except Exception as e:  # 查不到：沿用上次的名单，10 分钟后再试
+            log.warning("更新「%s」的管理员名单失败：%s", ch.title, e)
+            ch.admin_ids, ch.admins_at = ch.admin_ids or set(), time.time() - ADMIN_REFRESH_SEC + 600
+    return sid in ch.admin_ids
+
+
 async def resolve_channels(client, cfg: Config, join: bool = True) -> dict:
-    """username → 频道实体；没加入的频道自动加入（收实时消息必须先加入）。返回 {peer_id: ChannelCfg}"""
+    """config 里的频道/群 → Telegram 实体；没加入的公开频道自动加入（收实时消息必须先加入）。
+    私人群用 /join 保存在服务器上的邀请链接。返回 {peer_id: ChannelCfg}"""
     out = {}
+    saved = load_private_groups()
     for ch in cfg.channels:
         if ch.mode == "off":
             continue
         try:
-            ent = await client.get_entity(ch.username)
+            ent = await (find_private(client, saved.get(ch.username), join) if ch.private
+                         else client.get_entity(ch.username))
         except Exception as e:
-            log.error("找不到频道 @%s：%s", ch.username, e)
+            log.error("找不到频道/群 %s：%s", ch.username, e)
             continue
-        if join and getattr(ent, "left", False):
+        if not ch.private and join and getattr(ent, "left", False):
             try:
                 await client(JoinChannelRequest(ent))
                 log.info("已加入频道 %s", getattr(ent, "title", ch.username))
             except Exception as e:
                 log.warning("加入频道 @%s 失败：%s", ch.username, e)
         ch.title = getattr(ent, "title", "") or ch.username
+        ch.entity, ch.is_group = ent, is_group(ent)
         out[utils.get_peer_id(ent)] = ch
     return out
 
@@ -341,10 +417,47 @@ async def gate_selftest(ex: Exchange) -> str:
     return "\n".join(lines)
 
 
+def restart_soon():
+    """3 秒后退出，Docker 自动重启并读取新设置。"""
+    asyncio.get_running_loop().call_later(3, os._exit, 0)
+
+
+async def join_command(text: str, cfg: Config, client, restart) -> str:
+    """/join 邀请链接：跟一个私人群/频道（会员群）。链接只保存在服务器上：GitHub 仓库是公开的，不能写进 config.yaml。"""
+    h = invite_hash(text)
+    if not h:
+        return "用法：/join 邀请链接（t.me/+ 开头的私人群链接）。公开频道请告诉 Claude Code 加到 config.yaml。"
+    slots = [c for c in cfg.channels if c.private]
+    if not slots:
+        return "config.yaml 里还没有私人群的位置，请告诉 Claude Code 加一个。"
+    words = text.split()[1:]
+    slot = next((c for c in slots if c.username in words), None) or (slots[0] if len(slots) == 1 else None)
+    if not slot:
+        return f"有好几个私人群位置，请写明是哪个：/join 名字 邀请链接（名字：{'、'.join(c.username for c in slots)}）"
+    try:
+        ent = await open_invite(client, h, join=True)
+    except InviteRequestSentError:
+        return "📨 这个群要管理员批准才能进，已经用监听账号提交了入群申请。批准以后再发一次 /join 邀请链接。"
+    except (InviteHashExpiredError, InviteHashInvalidError):
+        return "❌ 这个邀请链接已经失效，请向群主要一个新的。"
+    except FloodWaitError as e:
+        return f"⏳ Telegram 要求等 {e.seconds // 60 + 1} 分钟再试。"
+    except Exception as e:
+        return f"❌ 进群失败：{str(e)[:200]}"
+    title = getattr(ent, "title", "") or slot.username
+    save_private_group(slot.username, {"hash": h, "id": utils.get_peer_id(ent), "title": title})
+    restart()
+    kind = "群组，只跟群主/管理员发的消息" if is_group(ent) else "频道"
+    return (f"✅ 已连上「{title}」（{kind}）。邀请链接只保存在服务器上。\n"
+            f"3 秒后自动重启开始监听，现在是{MODE_CN.get(cfg.mode_for(slot), '关闭')}。")
+
+
 async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, engine: Engine,
-                        restart=lambda: asyncio.get_running_loop().call_later(3, os._exit, 0)) -> str | None:
-    """机器人命令入口：/ai、/ip、/gate、/bitget 在这里处理，其余交给 engine。"""
+                        client=None, restart=restart_soon) -> str | None:
+    """机器人命令入口：/ai、/ip、/join、/gate、/bitget 在这里处理，其余交给 engine。"""
     cmd = text.split()[0].lower().split("@")[0]
+    if cmd == "/join":
+        return await join_command(text, cfg, client, restart)
     if cmd == "/ai":
         arg = text.split()[1] if len(text.split()) > 1 else ""
         return ai_text(engine.db, cfg, max(1, min(int(arg) if arg.isdigit() else 10, 20)))
@@ -488,7 +601,7 @@ async def cmd_check(cfg: Config):
         chans = await resolve_channels(client, cfg, join=False)
         for ch in cfg.channels:
             ok = any(c is ch for c in chans.values())
-            print(f"   {'✅' if ok else '❌'} @{ch.username} {ch.title}｜模式：{cfg.mode_for(ch)}")
+            print(f"   {'✅' if ok else '❌'} {ch.username if ch.private else '@' + ch.username} {ch.title}｜模式：{cfg.mode_for(ch)}")
         print("\n== 4. 通知机器人 ==")
         if not cfg.tg_bot_token:
             print("ℹ️ 没填 TG_BOT_TOKEN：通知会发到监听账号的「收藏夹」，命令功能不可用")
@@ -512,10 +625,12 @@ async def cmd_replay(cfg: Config, n: int):
     try:
         chans = await resolve_channels(client, cfg, join=False)
         for ch in chans.values():
-            msgs = [m async for m in client.iter_messages(ch.username, limit=n)]
-            print(f"\n===== {ch.title}（@{ch.username}）最近 {len(msgs)} 条 =====")
+            msgs = [m async for m in client.iter_messages(ch.entity, limit=n)]
+            print(f"\n===== {ch.title}（{ch.username}）最近 {len(msgs)} 条 =====")
             n_open = n_ok = 0
             for m in reversed(msgs):
+                if not await from_admin(client, ch, m):
+                    continue
                 ctx = await build_ctx(ch, m, False, cfg.llm_vision)
                 if not ctx:
                     continue
@@ -547,6 +662,16 @@ async def cmd_replay(cfg: Config, n: int):
         await parser.close()
         await ex.close()
         await client.disconnect()
+
+
+def sources_text(cfg: Config, chans: dict) -> str:
+    """启动消息里的频道列表：每个频道/群是实盘还是模拟；没连上的也列出来，免得以为在跟。"""
+    lines = [f"• {c.title}{'（群组：只跟群主/管理员）' if c.is_group else ''}：{MODE_CN[cfg.mode_for(c)]}"
+             for c in chans.values()]
+    for c in cfg.channels:
+        if c.mode != "off" and not any(c is x for x in chans.values()):
+            lines.append(f"• {c.username}：❌ 没连上" + ("（给我发 /join 邀请链接）" if c.private else "（请告诉 Claude Code）"))
+    return "\n".join(lines)
 
 
 async def init_exchange(ex: Exchange, notifier: Notifier):
@@ -595,6 +720,14 @@ async def cmd_run(cfg: Config):
     chans = await resolve_channels(client, cfg, join=True)
     if not chans:
         sys.exit("❌ 没有可监听的频道，检查 config.yaml")
+    for ch in chans.values():
+        if ch.is_group:  # 群组：先拿到管理员名单，拿不到要让主人知道（否则群里的喊单会全部被忽略）
+            try:
+                ch.admin_ids, ch.admins_at = await fetch_admins(client, ch.entity), time.time()
+            except Exception as e:
+                ch.admin_ids, ch.admins_at = set(), time.time() - ADMIN_REFRESH_SEC + 600
+                await notifier.send(f"⚠️ 查不到「{ch.title}」的群主/管理员名单：{str(e)[:150]}\n"
+                                    f"为了安全，这个群里只跟匿名管理员的消息，10 分钟后自动重试。请把这条消息发给 Claude Code。")
 
     # 每个频道一个队列：同一频道的消息严格按顺序处理，不同频道互不阻塞
     queues: dict[int, asyncio.Queue] = {}
@@ -604,6 +737,8 @@ async def cmd_run(cfg: Config):
         while True:
             ch, msg, edited = await q.get()
             try:
+                if not await from_admin(client, ch, msg):
+                    continue  # 群里普通成员的发言
                 ctx = await build_ctx(ch, msg, edited, cfg.llm_vision)
                 if ctx:
                     await engine.handle_message(ctx)
@@ -628,12 +763,12 @@ async def cmd_run(cfg: Config):
     client.add_event_handler(on_new, events.NewMessage(chats=list(chans)))
     client.add_event_handler(on_edit, events.MessageEdited(chats=list(chans)))
     async def on_command(text: str, msg: dict) -> str | None:
-        return await admin_command(text, msg, cfg, notifier, engine)
+        return await admin_command(text, msg, cfg, notifier, engine, client)
 
     tasks.append(asyncio.create_task(engine.monitor_forever()))
     tasks.append(asyncio.create_task(notifier.command_loop(on_command)))
 
-    modes = "\n".join(f"• {c.title}：{MODE_CN[cfg.mode_for(c)]}" for c in chans.values())
+    modes = sources_text(cfg, chans)
     try:
         with open(os.path.join(DATA_DIR, "version.txt")) as f:
             engine.version = f.read().strip()

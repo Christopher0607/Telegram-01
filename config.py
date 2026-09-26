@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import os
 from dataclasses import dataclass, field
 
@@ -12,6 +13,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE_DIR, "data"))
 # 通过机器人 /gate、/bitget 命令设置的密钥保存在这里（优先级高于 .env）
 SECRETS_PATH = os.path.join(DATA_DIR, "secrets.env")
+# 通过机器人 /join 命令设置的私人群邀请链接保存在这里（仓库是公开的，链接不能写进 config.yaml）
+PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
 
 # 所有风控参数的默认值（config.yaml 里写了就以 config.yaml 为准）
 DEFAULT_RISK = {
@@ -50,21 +53,44 @@ DEFAULT_RISK = {
 
 @dataclass
 class ChannelCfg:
-    username: str
+    username: str                     # 公开频道的用户名；私人群是 config.yaml 里给它起的名字（private: 名字）
     mode: str = "paper"               # paper 模拟 / live 实盘 / off 关闭
     risk_multiplier: float = 1.0
     overrides: dict = field(default_factory=dict)
-    title: str = ""                   # 运行时自动填入频道名
+    private: bool = False             # 私人群/频道：邀请链接用机器人 /join 保存在服务器上
+    # ---- 以下运行时自动填入 ----
+    title: str = ""                   # 频道/群的名字
+    entity: object = None             # Telegram 里的频道/群
+    is_group: bool = False            # 群组（成员也能发言）→ 只跟群主/管理员发的消息
+    admin_ids: set | None = None      # 群主和管理员的 id
+    admins_at: float = 0.0            # 上次更新管理员名单的时间
 
 
 def _saved_owner() -> int:
     """首次部署时通过 /start <PIN> 绑定的主人 id（data/owner.json）。"""
     try:
-        import json
         with open(os.path.join(DATA_DIR, "owner.json")) as f:
             return int(json.load(f).get("id") or 0)
     except Exception:
         return 0
+
+
+def load_private_groups() -> dict:
+    """/join 保存的私人群：{config.yaml 里的名字: {"hash": 邀请码, "id": 群 id, "title": 群名}}"""
+    try:
+        with open(PRIVATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_private_group(name: str, info: dict):
+    data = load_private_groups()
+    data[name] = info
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PRIVATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.chmod(PRIVATE_PATH, 0o600)
 
 
 def save_secrets(values: dict):
@@ -122,11 +148,13 @@ class Config:
         for c in raw.get("channels") or []:
             if isinstance(c, str):
                 c = {"username": c}
+            private = "private" in c   # 私人群：只写个名字，邀请链接用机器人 /join 设置
             self.channels.append(ChannelCfg(
-                username=_clean_username(c["username"]),
+                username=str(c["private"]).strip() if private else _clean_username(c["username"]),
                 mode=str(c.get("mode", "paper")).lower(),
                 risk_multiplier=float(c.get("risk_multiplier", 1.0)),
                 overrides=dict(c.get("overrides") or {}),
+                private=private,
             ))
 
         # ---- 密钥（.env）----

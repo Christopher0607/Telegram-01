@@ -36,6 +36,7 @@ HELP = ("📖 命令\n"
         "/resume  恢复实盘开新仓\n"
         "/closeall 立即平掉本程序开的所有实盘仓位、撤挂单，并暂停\n"
         "/ip      服务器 IP（{label} API 白名单填这个）\n"
+        "/join 邀请链接  跟一个私人群/频道（会员群），链接只保存在服务器上\n"
         "{key_cmd}（我会立刻删除你这条消息）\n"
         "常用功能也可以直接点输入框下方的按钮")
 KEY_CMD = {"gate": "/gate  KEY SECRET  设置 Gate API", "bitget": "/bitget  KEY SECRET PASSPHRASE  设置 Bitget API"}

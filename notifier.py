@@ -220,6 +220,8 @@ class Notifier:
                                                  {"text": "取消", "callback_data": "cancel"}]]})
                         continue
                     text = BUTTON_CMDS.get(text, text)
+                    if not text.startswith("/") and re.search(r"(?:t\.me|telegram\.me)/(?:\+|joinchat/)", text):
+                        text = "/join " + text  # 直接发来私人群的邀请链接：当作 /join
                     if not text.startswith("/"):
                         if re.search(r"[0-9A-Za-z]{30,}", text):  # 像是忘了带命令直接发的 API 密钥：马上删掉
                             await self.delete(m)
