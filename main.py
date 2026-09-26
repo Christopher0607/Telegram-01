@@ -31,6 +31,7 @@ from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInv
 from telethon.tl.types import (ChannelParticipantAdmin, ChannelParticipantCreator, ChannelParticipantsAdmins, Chat,
                                ChatInviteAlready, ChatParticipantAdmin, ChatParticipantCreator, MessageMediaPhoto)
 
+import backtest
 from config import ChannelCfg, Config, DATA_DIR, load_private_groups, save_private_group, save_secrets
 from db import DB
 from engine import MODE_CN, SIDE_CN, Engine, MsgCtx, fmt
@@ -496,6 +497,47 @@ async def mode_callback(data: str, cfg: Config, engine: Engine) -> tuple[str, di
     return mode_panel(cfg, engine)
 
 
+_background: set = set()   # 后台任务（回测）的引用，免得被回收
+
+
+def find_channel(cfg: Config, word: str) -> ChannelCfg | None:
+    """按用户名或频道名（包含就算）找频道，例如「UMIE」「vip」「IvanCryptotalk」。"""
+    w = word.strip().lower()
+    for c in cfg.channels:
+        if c.mode != "off" and w and (c.username.lower() == w or (c.title and w in c.title.lower())):
+            return c
+    return None
+
+
+def start_backtest(cfg: Config, ch: ChannelCfg, days: int, notifier: Notifier, client) -> str:
+    """在后台跑回测（不影响实盘），进度和结果直接发给主人。"""
+    name = ch.title or ch.username
+    if ch.entity is None or client is None:
+        return f"「{name}」还没连上，回测不了。"
+    task = asyncio.create_task(backtest.run(client, cfg, ch, days, lambda m: from_admin(client, ch, m),
+                                            build_ctx, SignalParser, notifier.send))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return (f"⏳ 开始回测「{name}」最近 {days} 天：拉历史消息 → AI 识别 → 用历史行情一单单模拟。\n"
+            f"大约 5～15 分钟，进度和结果会发给你，期间实盘照常跑。")
+
+
+def backtest_command(text: str, cfg: Config, notifier: Notifier, client) -> str | tuple[str, dict]:
+    """/backtest [频道] [天数]：不写频道就给按钮选。"""
+    words = text.split()[1:]
+    days = next((max(1, min(int(w), 60)) for w in words if w.isdigit()), 30)
+    names = [w for w in words if not w.isdigit()]
+    if not names:
+        rows = [[{"text": f"📊 {c.title or c.username}（最近 {days} 天）", "callback_data": f"bt:{c.username}:{days}"}]
+                for c in cfg.channels if c.mode != "off" and c.entity is not None]
+        return (f"📊 回测：选一个频道，按你现在的规则模拟它最近 {days} 天的喊单（也可以发 /backtest 频道名 天数）",
+                {"inline_keyboard": rows})
+    ch = find_channel(cfg, " ".join(names))
+    if not ch:
+        return f"没找到「{' '.join(names)}」，发 /backtest 从按钮里选。"
+    return start_backtest(cfg, ch, days, notifier, client)
+
+
 def restart_soon():
     """3 秒后退出，Docker 自动重启并读取新设置。"""
     asyncio.get_running_loop().call_later(3, os._exit, 0)
@@ -537,8 +579,15 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
     cmd = text.split()[0].lower().split("@")[0]
     if cmd == "/mode":
         return mode_panel(cfg, engine)
-    if cmd == "/cb":  # 消息下面的按钮（实盘/模拟面板）
-        return await mode_callback(text.split(maxsplit=1)[1] if len(text.split()) > 1 else "", cfg, engine)
+    if cmd == "/cb":  # 消息下面的按钮：实盘/模拟面板、回测
+        data = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
+        if data.startswith("bt:"):
+            parts = data.split(":")
+            ch = cfg.channel_by_username(parts[1]) if len(parts) == 3 and parts[2].isdigit() else None
+            return start_backtest(cfg, ch, int(parts[2]), notifier, client) if ch else "找不到这个频道，按钮可能过期了。"
+        return await mode_callback(data, cfg, engine)
+    if cmd == "/backtest":
+        return backtest_command(text, cfg, notifier, client)
     if cmd == "/join":
         return await join_command(text, cfg, client, restart)
     if cmd == "/ai":

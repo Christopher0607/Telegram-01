@@ -30,6 +30,7 @@ KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
 # 输入框左边「菜单」里的命令（/closeall、/gatetest 会真实下单，不放进菜单，免得误点）
 MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩"), ("trades", "最近 10 笔已平仓交易"),
         ("ai", "最近 10 条频道消息的 AI 识别结果"), ("mode", "每个频道切换实盘/模拟"),
+        ("backtest", "回测某个频道最近 30 天的成绩"),
         ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
         ("ip", "服务器 IP"), ("help", "全部命令")]
 
@@ -185,7 +186,7 @@ class Notifier:
         m = cq.get("message") or {}
         where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
         data = cq.get("data") or ""
-        if data.startswith(("mode:", "modeok:")):  # 实盘/模拟面板：在原消息上更新
+        if data.startswith(("mode:", "modeok:", "bt:")):  # 实盘/模拟面板、回测：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))
