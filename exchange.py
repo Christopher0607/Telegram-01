@@ -27,6 +27,12 @@ WEEX_API = "https://api-contract.weex.com/capi/v3"
 WEEX_OPEN_SL = ("NEW", "PENDING", "UNTRIGGERED")   # WEEX 止损单还挂着（没触发、没撤销）的状态
 
 
+def sl_ref(sl_order_id) -> str:
+    """止损单号。按仓位数量挂的止损单（WEEX 后备做法）记成 "q:单号:数量"，这里取出单号。"""
+    s = str(sl_order_id or "")
+    return s.split(":")[1] if s.startswith("q:") else s
+
+
 class Exchange:
     def __init__(self, cfg, name: str | None = None):
         """name 不填就用 config.yaml 的 exchange.name（/weextest 这类测试可以临时指定别的交易所）。"""
@@ -297,15 +303,7 @@ class Exchange:
         m = self.ex.market(symbol)
         long = side == "long"
         if self.name == "weex":
-            # 不填 quantity = 给整个仓位设止损；不填 executePrice = 触发后市价平
-            r = await self.ex.contractPrivatePostCapiV3PlaceTpSlOrder({
-                "symbol": m["id"], "clientAlgoId": f"tgst-sl-{uuid.uuid4().hex[:16]}", "planType": "STOP_LOSS",
-                "triggerPrice": self.ex.price_to_precision(symbol, sl), "positionSide": "LONG" if long else "SHORT",
-                "triggerPriceType": "CONTRACT_PRICE"})
-            res = (r[0] if isinstance(r, list) and r else r) or {}
-            if not res.get("success") or not res.get("orderId"):
-                raise RuntimeError(f"WEEX 没接受止损单：{res.get('errorCode')} {res.get('errorMessage') or str(r)[:150]}")
-            return str(res["orderId"])
+            return await self._weex_place_sl(symbol, long, sl)
         r = await self.ex.privateFuturesPostSettlePriceOrders({
             "settle": "usdt",
             "initial": {"contract": m["id"], "size": 0, "price": "0", "tif": "ioc", "close": True, "text": "t-tgst-sl"},
@@ -318,31 +316,61 @@ class Exchange:
             raise RuntimeError(f"交易所没有返回止损单 id：{str(r)[:150]}")
         return str(oid)
 
+    async def _weex_place_sl(self, symbol: str, long: bool, sl: float) -> str:
+        """WEEX 止损单：quantity 填 "0" = 管整个仓位（文档说「填 0 或不填」，实际不填会报「quantity 不能为空」）。
+        不填 executePrice = 触发后市价平。万一 WEEX 连 0 也不接受，就按现在的仓位数量挂，返回 "q:单号:数量"，
+        仓位数量变了（分批止盈、限价单陆续成交）engine 会按新数量重挂（fit_sl），保证整个仓位都有止损。"""
+        req = {"symbol": self.ex.market(symbol)["id"], "planType": "STOP_LOSS",
+               "triggerPrice": self.ex.price_to_precision(symbol, sl), "positionSide": "LONG" if long else "SHORT",
+               "triggerPriceType": "CONTRACT_PRICE"}
+        try:
+            return await self._weex_tpsl(dict(req, quantity="0"))
+        except Exception as e:
+            if "quantity" not in str(e).lower():
+                raise
+            log.warning("WEEX 不接受整仓止损（%s），改按仓位数量挂", str(e)[:150])
+        size = ((await self.positions()).get(symbol) or {}).get("size")
+        if not size:
+            raise RuntimeError("没查到持仓，没法按仓位数量挂止损")
+        q = self.ex.amount_to_precision(symbol, size)
+        return f"q:{await self._weex_tpsl(dict(req, quantity=q))}:{q}"
+
+    async def _weex_tpsl(self, req: dict) -> str:
+        r = await self.ex.contractPrivatePostCapiV3PlaceTpSlOrder(dict(req, clientAlgoId=f"tgst-sl-{uuid.uuid4().hex[:16]}"))
+        res = (r[0] if isinstance(r, list) and r else r) or {}
+        if not res.get("success") or not res.get("orderId"):
+            raise RuntimeError(f"WEEX 没接受止损单：{res.get('errorCode')} {res.get('errorMessage') or str(r)[:150]}")
+        return str(res["orderId"])
+
     async def cancel_sl(self, symbol: str, sl_order_id: str | None):
         """撤掉程序挂的止损触发单（已经触发或已撤销的会报错，忽略即可）。Bitget 的止损跟着仓位走，不需要撤。"""
         if not sl_order_id or self.attached_sl:
             return
         try:
             if self.name == "weex":
-                await self.ex.contractPrivateDeleteCapiV3AlgoOrder({"orderId": sl_order_id})
+                await self.ex.contractPrivateDeleteCapiV3AlgoOrder({"orderId": sl_ref(sl_order_id)})
             else:
                 await self.ex.privateFuturesDeleteSettlePriceOrdersOrderId({"settle": "usdt", "order_id": sl_order_id})
         except Exception as e:
             log.info("撤止损单 %s %s：%s", symbol, sl_order_id, str(e)[:120])
 
     async def sl_info(self, symbol: str, sl_order_id: str) -> dict:
-        """止损触发单现在的状态（实盘接口测试用）：{"open": 还挂着吗, "status", "trigger": 触发价, "detail": 说明}"""
+        """止损触发单现在的状态（实盘接口测试用）：
+        {"open": 还挂着吗, "covers": 能平掉整个仓位吗, "status", "trigger": 触发价, "detail": 说明}"""
         if self.name == "weex":
             orders = await self.ex.contractPrivateGetCapiV3OpenAlgoOrders({"symbol": self.ex.market(symbol)["id"]})
-            o = next((x for x in orders or [] if str(x.get("algoId")) == str(sl_order_id)), None)
+            o = next((x for x in orders or [] if str(x.get("algoId")) == sl_ref(sl_order_id)), None)
             if not o:
-                return {"open": False, "status": "已不在挂单列表（已触发或已撤销）", "trigger": None, "detail": ""}
-            st = str(o.get("algoStatus"))
-            return {"open": st in WEEX_OPEN_SL, "status": st, "trigger": o.get("triggerPrice"),
-                    "detail": f"{o.get('orderType')}，平掉整个仓位：{'是' if o.get('closePosition') else '否'}"}
+                return {"open": False, "covers": False, "status": "已不在挂单列表（已触发或已撤销）", "trigger": None, "detail": ""}
+            st, full = str(o.get("algoStatus")), bool(o.get("closePosition"))
+            sized = str(sl_order_id).startswith("q:")
+            detail = "平掉整个仓位：是" if full else (f"按仓位数量 {o.get('quantity')} 挂（仓位变了程序会重挂）" if sized
+                                                   else f"平掉整个仓位：否（数量 {o.get('quantity')}）")
+            return {"open": st in WEEX_OPEN_SL, "covers": full or sized, "status": st, "trigger": o.get("triggerPrice"),
+                    "detail": f"{o.get('orderType')}，{detail}"}
         o = await self.ex.privateFuturesGetSettlePriceOrdersOrderId({"settle": "usdt", "order_id": sl_order_id})
         trig = o.get("trigger") or {}
-        return {"open": o.get("status") == "open", "status": o.get("status"), "trigger": trig.get("price"),
+        return {"open": o.get("status") == "open", "covers": True, "status": o.get("status"), "trigger": trig.get("price"),
                 "detail": f"规则 {trig.get('rule')}（2 = 价格≤触发价，1 = 价格≥触发价）"}
 
     async def reduce_market(self, symbol: str, side: str, qty: float):

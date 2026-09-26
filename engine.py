@@ -24,6 +24,8 @@ from db import now_ms
 log = logging.getLogger("engine")
 
 CONF_RANK = {"low": 0, "medium": 1, "high": 2}
+# 有真实账户下单测试的交易所：测试全部通过（记在数据库里）之后才会真实下单
+SELFTEST = {"gate": "/gatetest", "weex": "/weextest"}
 SIDE_CN = {"long": "多", "short": "空"}
 MODE_CN = {"live": "实盘", "paper": "模拟"}
 
@@ -72,6 +74,17 @@ class MsgCtx:
 # ====================================================================
 def fmt(x) -> str:
     return "-" if x is None else f"{float(x):.8g}"
+
+
+def sized_sl_qty(sl_order_id) -> float | None:
+    """按仓位数量挂的止损单（WEEX 不接受整仓止损时的后备做法，单号记成 "q:单号:数量"）→ 数量；整仓止损 → None。"""
+    s = str(sl_order_id or "")
+    if not s.startswith("q:"):
+        return None
+    try:
+        return float(s.rsplit(":", 1)[1])
+    except ValueError:
+        return None
 
 
 def coin_key(sym) -> str:
@@ -369,6 +382,13 @@ class Engine:
     def paused(self) -> str | None:
         return self.db.kv_get("paused")
 
+    def live_block(self) -> str | None:
+        """换了交易所：要等这个交易所的真实账户下单测试（/gatetest、/weextest）全部通过，才真实下单。"""
+        cmd = SELFTEST.get(self.ex.name)
+        if cmd and not self.db.kv_get(f"selftest_ok:{self.ex.name}"):
+            return f"{self.ex.label} 还没通过 {cmd} 测试（全部通过后自动开始实盘）"
+        return None
+
     def set_paused(self, reason: str | None):
         self.db.kv_set("paused", reason)
 
@@ -517,7 +537,7 @@ class Engine:
 
         free = None
         if mode == "live":
-            p = self.paused()
+            p = self.paused() or self.live_block()
             if p:
                 raise Reject(f"实盘开新仓已暂停：{p}")
             if symbol in await self.ex.positions():
@@ -650,6 +670,23 @@ class Engine:
             await self.on_close(t, 1.0, "止损单挂不上，安全平仓")
         return False
 
+    async def fit_sl(self, t: dict, size: float):
+        """止损单是按仓位数量挂的（WEEX 后备做法）：仓位数量变了（分批止盈、限价单陆续成交）就按新数量重挂。
+        先挂新的再撤旧的，任何时候整个仓位都有止损。整仓止损（正常情况）不用管。"""
+        q = sized_sl_qty(t.get("sl_order_id"))
+        if q is None or size <= 0 or abs(q - size) <= max(q, size) * 1e-6:
+            return
+        old = t["sl_order_id"]
+        try:
+            t["sl_order_id"] = await self.ex.place_sl(t["symbol"], t["side"], t["sl"])
+        except Exception as e:
+            log.warning("#%s 按新数量重挂止损失败：%s", t["id"], e)
+            await self.notify_error(f"fitsl{t['id']}", f"⚠️ #{t['id']} {t['base']} 按新仓位数量重挂止损失败：{str(e)[:120]}"
+                                                       f"（原来的止损单还在，30 秒后自动重试）")
+            return
+        self.db.save_trade(t)
+        await self.ex.cancel_sl(t["symbol"], old)
+
     def assign_tp_qty(self, t: dict):
         """把当前剩余仓位按比例分配给还没触发的止盈位（实盘按交易所最小步长/最小下单量取整）。"""
         items = [x for x in t["tps"] if not x.get("filled")]
@@ -722,6 +759,7 @@ class Engine:
         t["remaining"] = max(size - q, 0.0)
         self.assign_tp_qty(t)
         self.db.save_trade(t)
+        await self.fit_sl(t, t["remaining"])
         price = await self.ex.last_price(t["symbol"])
         await self.notify(f"✂️ #{t['id']} [实盘] {t['base']} {reason} {frac * 100:.0f}% @≈{fmt(price)}，剩余 {fmt(t['remaining'])}")
         return "reduced"
@@ -779,6 +817,9 @@ class Engine:
         from exchange import LABELS
         self.db.conn.execute("UPDATE trades SET exchange=? WHERE exchange IS NULL", (self.ex.name,))
         self.db.conn.commit()
+        if self.ex.name == "gate" and self.db.kv_get("selftest_ok:gate") is None and self.db.conn.execute(
+                "SELECT 1 FROM trades WHERE mode='live' AND exchange='gate' LIMIT 1").fetchone():
+            self.db.kv_set("selftest_ok:gate", "passed-before-check")  # 加这项检查之前，Gate 已经用 /gatetest 验证过
         voided = 0
         for t in self.db.active_trades():
             old = t.get("exchange") or self.ex.name
@@ -865,6 +906,7 @@ class Engine:
                     x["filled"] = False
                     raise
                 t["remaining"] = max(t["remaining"] - q, 0.0)
+                await self.fit_sl(t, t["remaining"])
             msg = f"🎯 #{t['id']} [实盘] {t['base']} 止盈{i + 1} {fmt(x['price'])} 触发，平掉 {fmt(q)}，剩余 {fmt(t['remaining'])}"
             if self.risk_of(t)["breakeven_after_tp1"] and not t["be_moved"] \
                     and tighter(t["side"], t["entry_price"], t["soft_sl"]):
@@ -880,6 +922,7 @@ class Engine:
             return
         if not await self.ensure_sl(t):  # 有持仓却没有交易所止损（比如开仓时没查到持仓）：补挂，挂不上已平仓
             return
+        await self.fit_sl(t, p["size"])
         if abs(p["size"] - t["remaining"]) > t["remaining"] * 0.001:
             if p["size"] < t["remaining"]:
                 await self.notify(f"ℹ️ #{t['id']} {t['base']} 交易所仓位被减少到 {fmt(p['size'])}（可能是在 App 里手动操作），已同步")
@@ -897,6 +940,8 @@ class Engine:
         has_pos = bool(p and p["side"] == t["side"] and p["size"] > 0)
         if has_pos and not await self.ensure_sl(t):  # 限价单（哪怕只部分）成交了：马上挂交易所止损，挂不上已平仓
             return
+        if has_pos:
+            await self.fit_sl(t, p["size"])  # 限价单陆续成交、仓位变大：按数量挂的止损要跟着变
         if st["status"] == "open":
             if now_ms() <= (t.get("expires_at") or 0):
                 return
@@ -1002,7 +1047,7 @@ class Engine:
         return "未知命令，发 /help 查看"
 
     async def status_text(self) -> str:
-        paused = self.paused()
+        paused = self.paused() or (self.live_block() if self.cfg.live_trading else None)
         lines = [f"🤖 运行中｜交易所：{self.ex.label}｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"
                  + (f"｜版本 {self.version}" if self.version else "")]
         if self.ex.has_keys:

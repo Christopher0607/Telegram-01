@@ -6,11 +6,12 @@
 # 实盘总开关。false = 所有频道只跑模拟盘，不会动你的钱。
 # 模拟跑 1~2 周，用 /stats 确认某个频道总 R 为正以后，
 # 再把那个频道的 mode 改成 live，并把这里改成 true。
-# 2026-09-26：/gatetest 已通过。实盘只跟 UMIE；会员群先模拟验证；其他 3 个频道回到模拟继续记录。
+# 2026-09-26：实盘只跟 UMIE；会员群先模拟验证；其他 3 个频道回到模拟继续记录。
+# 同日换到 WEEX：/weextest 全部通过之前程序不会在 WEEX 真实下单（代码里有检查）。
 live_trading: true
 
 exchange:
-  name: gate                   # gate、weex 或 bitget（实盘下单、模拟盘行情都用这个交易所）
+  name: weex                   # gate、weex 或 bitget（实盘下单、模拟盘行情都用这个交易所）
   margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓
 
 llm:

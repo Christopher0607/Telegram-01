@@ -362,16 +362,16 @@ async def verify_keys(name: str, values: list[str]) -> tuple[bool, str]:
         await ex.close()
 
 
-async def exchange_selftest(ex: Exchange) -> str:
+async def exchange_selftest(ex: Exchange) -> tuple[str, bool]:
     """/gatetest、/weextest：用最小数量的 BTC（约 8U 仓位、逐仓 5 倍，手续费约 0.01U）在真实账户上实测下单流程：
     开仓 → 挂止损单、查到、撤掉 → 挂一张马上满足条件的止损单，确认它真的把整个仓位平掉 → 查到这次的盈亏。
-    结束时一定清理干净。"""
+    结束时一定清理干净。返回 (结果文字, 是否每一步都通过)。"""
     s = "BTC/USDT:USDT"
     qty = ex.min_qty(s)
     lines = [f"🧪 {ex.label} 实盘接口测试（{qty:g} BTC）"]
     if (await ex.positions()).get(s):
-        return "账户里已经有 BTC 仓位，为了不干扰它，测试没有进行。"
-    since, sids = int(time.time() * 1000) - 60000, []
+        return "账户里已经有 BTC 仓位，为了不干扰它，测试没有进行。", False
+    since, sids, ok = int(time.time() * 1000) - 60000, [], False
     try:
         await ex.prepare(s, 5, "long")
         lines.append("✅ 设置逐仓 5 倍杠杆")
@@ -379,15 +379,17 @@ async def exchange_selftest(ex: Exchange) -> str:
         p = await ex.wait_position(s)
         if not p:
             lines.append("❌ 市价开仓后没查到持仓")
-            return "\n".join(lines)
+            return "\n".join(lines), False
         lines.append(f"✅ 市价开多 {p['size']:g} BTC @{p['entry']:g}")
         sids.append(await ex.place_sl(s, "long", p["entry"] * 0.95))
         st = await ex.sl_info(s, sids[-1])
-        lines.append(f"{'✅' if st['open'] else '❌'} 挂止损单（-5%）：状态 {st['status']}，触发价 {st['trigger']}，{st['detail']}")
+        placed = st["open"] and st["covers"]
+        lines.append(f"{'✅' if placed else '❌'} 挂止损单（-5%）：状态 {st['status']}，触发价 {st['trigger']}，{st['detail']}")
         await ex.cancel_sl(s, sids[-1])
         await asyncio.sleep(1)
         st = await ex.sl_info(s, sids[-1])
-        lines.append(f"{'✅' if not st['open'] else '❌'} 撤销止损单：{st['status']}")
+        cancelled = not st["open"]
+        lines.append(f"{'✅' if cancelled else '❌'} 撤销止损单：{st['status']}")
         px = await ex.last_price(s)
         try:  # 触发价高于现价的多单止损 = 条件已经满足，应该马上触发
             sids.append(await ex.place_sl(s, "long", px * 1.002))
@@ -403,6 +405,7 @@ async def exchange_selftest(ex: Exchange) -> str:
                 closed = True
                 break
         lines.append("✅ 止损单触发后，整个仓位被平掉" if closed else f"⚠️ {wait} 秒内止损没有触发（价格没碰到），这一项没测出结果")
+        ok = placed and cancelled and closed
     except Exception as e:
         lines.append(f"❌ 出错：{str(e)[:200]}")
     finally:  # 不管上面成不成功：平掉测试仓位、撤掉测试挂的止损单
@@ -415,7 +418,7 @@ async def exchange_selftest(ex: Exchange) -> str:
     await asyncio.sleep(2)
     pnl, _ = await ex.closed_pnl(s, since)
     lines.append(f"测试花费（含手续费）：{pnl:+.4f}U" if pnl is not None else "测试盈亏：暂时查询不到")
-    return "\n".join(lines)
+    return "\n".join(lines), ok
 
 
 def restart_soon():
@@ -476,9 +479,17 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
             await notifier.send("🧪 开始测试，大约 30 秒～2 分钟……")
             if temp:  # 另一个交易所：和程序正在用的账户互不影响，不用暂停盯盘
                 await ex.init()
-                return await exchange_selftest(ex)
-            async with engine.lock:
-                return await exchange_selftest(ex)
+                text, passed = await exchange_selftest(ex)
+            else:
+                async with engine.lock:
+                    text, passed = await exchange_selftest(ex)
+            label = LABELS[name]
+            if passed:  # 记下来：这个交易所的下单流程验证过了，可以真实下单
+                engine.db.kv_set(f"selftest_ok:{name}", int(time.time()))
+                return text + (f"\n✅ 全部通过：{label} 可以实盘下单了" if not temp else f"\n✅ 全部通过：换成 {label} 后就能实盘下单")
+            if "❌" in text:  # 真出错了（不是价格没碰到这种）：在重新测通过之前不在这个交易所真实下单
+                engine.db.kv_set(f"selftest_ok:{name}", None)
+            return text + f"\n这次没有全部通过，{label} 暂时不会真实下单。请把这条消息截图发给 Claude Code。"
         finally:
             if temp:
                 await ex.close()
@@ -785,6 +796,9 @@ async def cmd_run(cfg: Config):
     tasks.append(asyncio.create_task(notifier.command_loop(on_command)))
 
     modes = sources_text(cfg, chans)
+    block = engine.live_block() if cfg.live_trading else None
+    if block:
+        modes += f"\n⚠️ 实盘暂不下单：{block}"
     try:
         with open(os.path.join(DATA_DIR, "version.txt")) as f:
             engine.version = f.read().strip()
