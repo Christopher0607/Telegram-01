@@ -5,7 +5,7 @@ import copy
 
 from config import DEFAULT_RISK
 from engine import (Reject, atr_pct, coin_key, liq_distance, plan_entry, safe_leverage, simulate_candle,
-                    split_qty, split_symbol_candidates)
+                    split_qty, split_symbol_candidates, tp_plan)
 from signal_parser import clean_symbol, extract_json, normalize, to_num
 
 R = copy.deepcopy(DEFAULT_RISK)
@@ -116,6 +116,24 @@ check("进场价离现价太远 → 视为识别错误",
 # 財財 #FET 進場 0.2035 止盈 0.2089-0.217 止損 0.1967，现价追到 0.2044 → 盈亏比不足 1
 check("FET：追高后盈亏比 < 1 → 跳过",
       rejects(lambda: plan_entry("long", 0.2035, 0.2035, 0.1967, [0.2089, 0.217], 0.2044, R, 1000)))
+
+# ---------- 3b. 按止盈个数分批（用户的规则）+ 每单亏权益的 10% ----------
+RP = dict(R, tp_plans={1: [1], 2: [0, 1], 3: [0.3, 0.3, 0.4]}, risk_per_trade_usdt=0, risk_per_trade_pct=10)
+check("3 个止盈：30% / 30% / 剩下全平", tp_plan(RP, 3) == [0.3, 0.3, 0.4])
+check("2 个止盈：tp1 不减仓（只把止损移到成本），tp2 全平", tp_plan(RP, 2) == [0.0, 1.0])
+check("5 个止盈：只用前 3 个，tp3 清仓", tp_plan(RP, 5) == [0.3, 0.3, 0.4] and tp_plan(RP, 1) == [1.0])
+p = plan_entry("long", 96.4, 96.8, 93.7, [99.8, 104, 113, 120], 96.6, RP, 80)
+check(f"4 个止盈 → 只挂前 3 个：{[x['price'] for x in p['tps']]}，每单亏权益 80U 的 10% = {p['risk_usdt']:.1f}U",
+      [x["price"] for x in p["tps"]] == [99.8, 104, 113] and [x["frac"] for x in p["tps"]] == [0.3, 0.3, 0.4]
+      and abs(p["risk_usdt"] - 8.0) < 1e-9)
+p = plan_entry("long", 96.4, 96.8, 93.7, [99.8, 104], 96.6, RP, 80)
+t = {"side": "long", "status": "open", "entry_price": 96.6, "qty": p["qty"], "remaining": p["qty"], "sl": 93.7, "soft_sl": 93.7,
+     "risk_usdt": p["risk_usdt"], "realized": 0.0, "be_moved": 0,
+     "tps": [dict(x, qty=p["qty"] * x["frac"], filled=False) for x in p["tps"]]}
+simulate_candle(t, 1, high=100.0, low=96.5, fee_rate=R["fee_rate"], be_after_tp1=True)
+check("2 个止盈：到 tp1 不减仓，止损移到成本价", t["remaining"] == p["qty"] and t["soft_sl"] == 96.6 and t["tps"][0]["filled"])
+simulate_candle(t, 2, high=104.2, low=99.0, fee_rate=R["fee_rate"], be_after_tp1=True)
+check(f"2 个止盈：到 tp2 全部平掉，{t['r_mult']:+.2f}R", t["status"] == "closed" and t["r_mult"] > 2)
 
 # ---------- 4. 止盈拆单：太小的份额并入前一份 ----------
 qs = split_qty(0.003, [0.5, 0.3, 0.2], [84438, 86076, 90171], step=0.001, ok_fn=lambda q, px: q * px >= 5)

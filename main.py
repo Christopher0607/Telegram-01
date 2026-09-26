@@ -242,12 +242,12 @@ def outcome_cn(outcome: str | None) -> str:
 
 
 def ai_text(db: DB, cfg: Config, n: int) -> str:
-    """/ai：最近 n 条频道消息的原文开头、AI 识别结果、程序最后怎么处理的（新的在上面）。"""
-    rows = db.recent_messages(n)
+    """/ai：最近 n 条频道消息的原文开头、AI 识别结果、程序最后怎么处理的（按时间顺序，最新的在最下面）。"""
+    rows = db.recent_messages(n)[::-1]
     if not rows:
         return "🧠 还没有收到频道消息。"
     tz = timezone(timedelta(hours=cfg.tz_offset))
-    lines = [f"🧠 最近 {len(rows)} 条频道消息的 AI 识别结果（新的在上面）"]
+    lines = [f"🧠 最近 {len(rows)} 条频道消息的 AI 识别结果（按时间顺序，最新的在最下面）"]
     for r in rows:
         ch = cfg.channel_by_username(r["channel"])
         when = datetime.fromtimestamp(r["ts"], tz).strftime("%m-%d %H:%M")

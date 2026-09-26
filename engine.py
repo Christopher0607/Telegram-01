@@ -111,11 +111,30 @@ def split_symbol_candidates(text: str, sym: str) -> list[tuple[str, str]]:
 
 
 def normalize_split(split, n: int) -> list[float]:
-    s = [float(x) for x in (split or []) if float(x) > 0][:n]
+    """把比例补齐到 n 个并归一。0 = 这一档不减仓（比如只把止损移到成本）。"""
+    s = [max(float(x), 0.0) for x in (split or [])][:n]
     while len(s) < n:
         s.append(s[-1] if s else 1.0)
-    tot = sum(s) or 1.0
+    tot = sum(s)
+    if tot <= 0:
+        return [0.0] * (n - 1) + [1.0] if n else []
     return [x / tot for x in s]
+
+
+def tp_plan(risk: dict, n: int) -> list[float]:
+    """信号给了 n 个止盈位时，每个止盈位平掉开仓数量的几成（最后一个止盈位永远全平）。
+    config 的 tp_plans 按止盈个数配置，例如 {2: [0, 1], 3: [0.3, 0.3, 0.4]}：
+    止盈个数比配置里最多的一档还多 → 只用前几个止盈位（3 个的方案：tp3 清仓，tp4 以后不管）。
+    返回的比例个数 = 实际使用的止盈位个数。没有对应方案时用 tp_split。"""
+    if n <= 0:
+        return []
+    plans = {int(k): v for k, v in (risk.get("tp_plans") or {}).items()}
+    if n in plans:
+        return normalize_split(plans[n], n)
+    if plans and n > max(plans):
+        top = max(plans)
+        return normalize_split(plans[top], top)
+    return normalize_split(risk["tp_split"], n)
 
 
 def tighter(side: str, new: float, cur: float) -> bool:
@@ -212,7 +231,8 @@ def plan_entry(side, lo, hi, sl, tps, price, risk, equity, free=None, multiplier
         r = float(risk["fallback_tp_r"])
         tps = [entry + r * dist if long else entry - r * dist]
         notes.append(f"信号没给止盈，按 {r:g} 倍风险设止盈")
-    fracs = normalize_split(risk["tp_split"], len(tps)) if tps else []
+    fracs = tp_plan(risk, len(tps))
+    tps = tps[:len(fracs)]
     rr = None
     if tps:
         rr = sum(f * abs(t - entry) for f, t in zip(fracs, tps)) / dist
@@ -340,7 +360,7 @@ def simulate_candle(t: dict, ts: int, high: float, low: float, fee_rate: float, 
         q = t["remaining"] if i == len(tps) - 1 else min(tp.get("qty") or 0.0, t["remaining"])
         exit_part(t, tp["price"], q, fee_rate)
         tp["filled"] = True
-        ev.append(f"止盈{i + 1} 成交 @{fmt(tp['price'])}")
+        ev.append(f"止盈{i + 1} 成交 @{fmt(tp['price'])}" if q > 0 else f"止盈{i + 1} 到了 @{fmt(tp['price'])}（这一档不减仓）")
         if be_after_tp1 and not t.get("be_moved") and t["remaining"] > 0 \
                 and tighter(t["side"], t["entry_price"], t["soft_sl"]):
             t["soft_sl"], t["be_moved"] = t["entry_price"], 1
@@ -788,7 +808,9 @@ class Engine:
         if not new:
             await self.notify(f"ℹ️ #{t['id']} {t['base']} 频道给的新止盈位已经过了现价，忽略")
             return "update_tp: 无效"
-        items = [{"price": p, "frac": f} for p, f in zip(new, normalize_split(risk["tp_split"], len(new)))]
+        fr = tp_plan(risk, len(new))
+        new = new[:len(fr)]
+        items = [{"price": p, "frac": f} for p, f in zip(new, fr)]
         filled = [x for x in t["tps"] if x.get("filled")] if t["status"] == "open" else []
         t["tps"] = filled + [dict(x, qty=None, order_id=None, filled=False) for x in items]
         if t["status"] == "open":
@@ -907,7 +929,8 @@ class Engine:
                     raise
                 t["remaining"] = max(t["remaining"] - q, 0.0)
                 await self.fit_sl(t, t["remaining"])
-            msg = f"🎯 #{t['id']} [实盘] {t['base']} 止盈{i + 1} {fmt(x['price'])} 触发，平掉 {fmt(q)}，剩余 {fmt(t['remaining'])}"
+            msg = (f"🎯 #{t['id']} [实盘] {t['base']} 止盈{i + 1} {fmt(x['price'])} 触发，平掉 {fmt(q)}，剩余 {fmt(t['remaining'])}" if q > 0
+                   else f"🎯 #{t['id']} [实盘] {t['base']} 止盈{i + 1} {fmt(x['price'])} 到了（按设置这一档不减仓），仓位 {fmt(t['remaining'])}")
             if self.risk_of(t)["breakeven_after_tp1"] and not t["be_moved"] \
                     and tighter(t["side"], t["entry_price"], t["soft_sl"]):
                 t["soft_sl"], t["be_moved"] = t["entry_price"], 1
