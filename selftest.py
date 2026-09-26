@@ -122,11 +122,11 @@ RP = dict(R, tp_plans={1: [1], 2: [0, 1], 3: [0.3, 0.3, 0.4]}, risk_per_trade_us
 check("3 个止盈：30% / 30% / 剩下全平", tp_plan(RP, 3) == [0.3, 0.3, 0.4])
 check("2 个止盈：tp1 不减仓（只把止损移到成本），tp2 全平", tp_plan(RP, 2) == [0.0, 1.0])
 check("5 个止盈：只用前 3 个，tp3 清仓", tp_plan(RP, 5) == [0.3, 0.3, 0.4] and tp_plan(RP, 1) == [1.0])
-p = plan_entry("long", 96.4, 96.8, 93.7, [99.8, 104, 113, 120], 96.6, RP, 80)
-check(f"4 个止盈 → 只挂前 3 个：{[x['price'] for x in p['tps']]}，每单亏权益 80U 的 10% = {p['risk_usdt']:.1f}U",
+p = plan_entry("long", 96.4, 96.8, 93.7, [99.8, 104, 113, 120], 96.6, RP, 500)
+check(f"4 个止盈 → 只挂前 3 个：{[x['price'] for x in p['tps']]}，每单亏权益 500U 的 10% = {p['risk_usdt']:.1f}U",
       [x["price"] for x in p["tps"]] == [99.8, 104, 113] and [x["frac"] for x in p["tps"]] == [0.3, 0.3, 0.4]
-      and abs(p["risk_usdt"] - 8.0) < 1e-9)
-p = plan_entry("long", 96.4, 96.8, 93.7, [99.8, 104], 96.6, RP, 80)
+      and abs(p["risk_usdt"] - 50.0) < 1e-9)
+p = plan_entry("long", 96.4, 96.8, 93.7, [99.8, 104], 96.6, RP, 500)
 t = {"side": "long", "status": "open", "entry_price": 96.6, "qty": p["qty"], "remaining": p["qty"], "sl": 93.7, "soft_sl": 93.7,
      "risk_usdt": p["risk_usdt"], "realized": 0.0, "be_moved": 0,
      "tps": [dict(x, qty=p["qty"] * x["frac"], filled=False) for x in p["tps"]]}
