@@ -573,10 +573,15 @@ def mode_panel(cfg: Config, engine: Engine, head: str = "") -> tuple[str, dict]:
             continue
         name = c.title or c.username
         live = cfg.channel_mode(c) == "live"
-        note = "（实际还是模拟，原因见下）" if live and cfg.mode_for(c) != "live" else ""
+        real = cfg.mode_label(c)
+        note = f"（实际是{real}，原因见下）" if live and real != "实盘" else "（已停止）" if not live and real != "模拟" else ""
         lines.append(f"• {name}：{'🔴 实盘' if live else '⚪ 模拟'}{note}")
         rows.append([{"text": f"{name} → 改{'模拟' if live else '实盘'}",
                       "callback_data": f"mode:{c.username}:{'paper' if live else 'live'}"}])
+    lines.append("🧪 模拟盘：" + ("开着（模拟频道照常记录战绩）" if cfg.paper_enabled
+                                 else "已停止（模拟频道的信号不跟、不提醒，实盘照常）"))
+    rows.append([{"text": "🧪 停止模拟盘" if cfg.paper_enabled else "🧪 恢复模拟盘",
+                  "callback_data": "paper:off" if cfg.paper_enabled else "paper:on"}])
     if not cfg.live_trading:
         lines.append("⚠️ 实盘总开关是关的，所有频道实际都按模拟跑。要打开请告诉 Claude Code。")
     elif not engine.ex.has_keys:
@@ -616,6 +621,31 @@ async def mode_callback(data: str, cfg: Config, engine: Engine) -> tuple[str, di
         cfg.set_channel_mode(ch, "live")
         log.info("主人把 %s 切到实盘", name)
         return mode_panel(cfg, engine, f"✅ {name} 已切到实盘，下一个信号开始真实下单")
+    return mode_panel(cfg, engine)
+
+
+async def paper_callback(data: str, cfg: Config, engine: Engine) -> tuple[str, dict]:
+    """停止 / 恢复模拟盘。data：paper:off / paper:on / paperok:off:时间（还有模拟单开着时，确认停止）"""
+    parts = data.split(":")
+    if parts[:2] == ["paper", "on"]:
+        cfg.set_paper(True)
+        log.info("主人恢复了模拟盘")
+        return mode_panel(cfg, engine, "✅ 模拟盘已恢复：模拟频道的信号照常跟、记录战绩")
+    if parts[:2] == ["paper", "off"] or parts[:2] == ["paperok", "off"]:
+        if parts[0] == "paperok" and (len(parts) < 3 or not parts[2].isdigit() or time.time() - int(parts[2]) > MODE_CONFIRM_TTL):
+            return mode_panel(cfg, engine, "⌛ 确认按钮已经过期，模拟盘没有停止。")
+        n = len(engine.db.active_trades("paper"))
+        if n and parts[0] == "paper":
+            return (f"⚠️ 确定停止模拟盘吗？\n现在还开着 {n} 笔模拟单（持仓 / 挂单），停止后会作废、不计入战绩。\n"
+                    f"停止后模拟频道的信号不跟、不提醒；实盘不受影响，以后随时可以恢复。",
+                    {"inline_keyboard": [[{"text": "✅ 确认停止", "callback_data": f"paperok:off:{int(time.time())}"},
+                                          {"text": "取消", "callback_data": "mode:panel"}]]})
+        async with engine.lock:   # 和盯盘互斥：别在撮合模拟单的时候把它作废
+            cfg.set_paper(False)
+            voided = engine.void_paper()
+        log.info("主人停止了模拟盘，作废 %d 笔模拟单", voided)
+        return mode_panel(cfg, engine, "✅ 模拟盘已停止：模拟频道的信号不跟、不提醒，实盘照常"
+                                       + (f"；{voided} 笔还开着的模拟单已作废（不计入战绩）" if voided else ""))
     return mode_panel(cfg, engine)
 
 
@@ -883,7 +913,7 @@ async def join_command(text: str, cfg: Config, client, restart) -> str:
     restart()
     kind = "群组，只跟群主/管理员发的消息" if is_group(ent) else "频道"
     return (f"✅ 已连上「{title}」（{kind}）。邀请链接只保存在服务器上。\n"
-            f"3 秒后自动重启开始监听，现在是{MODE_CN.get(cfg.mode_for(slot), '关闭')}。")
+            f"3 秒后自动重启开始监听，现在是{cfg.mode_label(slot)}。")
 
 
 async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, engine: Engine,
@@ -892,12 +922,21 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
     cmd = text.split()[0].lower().split("@")[0]
     if cmd == "/mode":
         return mode_panel(cfg, engine)
+    if cmd == "/paper":   # /paper off 停止模拟盘，/paper on 恢复
+        arg = text.split()[1].lower() if len(text.split()) > 1 else ""
+        if arg in ("off", "stop", "停", "停止", "关", "关闭"):
+            return await paper_callback("paper:off", cfg, engine)
+        if arg in ("on", "start", "开", "开启", "恢复"):
+            return await paper_callback("paper:on", cfg, engine)
+        return mode_panel(cfg, engine)
     if cmd in ("/risk", "/maxpos", "/maxloss"):
         return await risk_command(text, cfg, engine)
     if cmd == "/cb":  # 消息下面的按钮：实盘/模拟面板、每单风险面板、回测
         data = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
         if data.startswith(("risk:", "riskok:")):
             return await risk_callback(data, cfg, engine)
+        if data.startswith(("paper:", "paperok:")):
+            return await paper_callback(data, cfg, engine)
         if data.startswith("bt:"):
             parts = data.split(":")
             ch = cfg.channel_by_username(parts[1]) if len(parts) == 3 and parts[2].isdigit() else None
@@ -1147,7 +1186,7 @@ async def cmd_replay(cfg: Config, n: int):
 
 def sources_text(cfg: Config, chans: dict) -> str:
     """启动消息里的频道列表：每个频道/群是实盘还是模拟；没连上的也列出来，免得以为在跟。"""
-    lines = [f"• {c.title}{'（群组：只跟群主/管理员）' if c.is_group else ''}：{MODE_CN[cfg.mode_for(c)]}"
+    lines = [f"• {c.title}{'（群组：只跟群主/管理员）' if c.is_group else ''}：{cfg.mode_label(c)}"
              for c in chans.values()]
     for c in cfg.channels:
         if c.mode != "off" and not any(c is x for x in chans.values()):

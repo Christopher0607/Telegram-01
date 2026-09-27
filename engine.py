@@ -37,7 +37,8 @@ HELP = ("📖 命令\n"
         "/stats   各频道已平仓战绩（R 值）\n"
         "/trades  最近 10 笔已平仓交易（/trades 20 看 20 笔）\n"
         "/ai      最近 10 条频道消息的 AI 识别结果（/ai 20 看 20 条）\n"
-        "/mode    每个频道切换实盘/模拟（也可以点「⚙️ 实盘/模拟」按钮）\n"
+        "/mode    每个频道切换实盘/模拟、停止/恢复模拟盘（也可以点「⚙️ 实盘/模拟」按钮）\n"
+        "/paper off / on  停止 / 恢复模拟盘（停止后模拟频道的信号不跟、不提醒，实盘照常）\n"
         "/risk    风控设置（也可以点「💰 风控设置」按钮）：/risk 5% 每单亏总权益的 5%，/risk 10u 每单固定亏 10U\n"
         "/maxpos 10  同时最多几单（持仓+挂单）\n"
         "/maxloss 6  每天最多亏几单，到了当天不再开新仓（0 = 不限）\n"
@@ -1441,60 +1442,90 @@ class Engine:
         if self.cfg.maker_orders:
             lines.append("📝 下单方式：开仓先挂单、止盈挂在交易所（maker 手续费），止损市价" if not mb
                          else f"📝 下单方式：市价（挂单还没启用：{mb}）")
-        lines.append(f"🧪 模拟权益 {self.paper_equity():.2f}U")
-        lines.append("📡 " + "、".join(f"{c.title or c.username}={MODE_CN.get(self.cfg.mode_for(c), '关闭')}"
-                                      for c in self.cfg.channels))
-        act = self.db.active_trades()
-        lines.append(f"📂 持仓/挂单 {len(act)} 笔：" if act else "📂 当前没有持仓/挂单")
-        for t in act:
-            st = (f"持仓 {fmt(t['remaining'])}" if t["status"] == "open"
-                  else "挂单开仓中" if t.get("entry_kind") == "maker" else "挂单中")
-            sl = fmt(t["soft_sl"]) + ("" if t["soft_sl"] == t["sl"] else f"（原 {fmt(t['sl'])}）")
-            lines.append(f"#{t['id']} [{MODE_CN[t['mode']]}] {t['base']} {SIDE_CN[t['side']]} {st} @{fmt(t['entry_price'])} 止损 {sl}｜{t['title']}")
+        lines.append(f"🧪 模拟盘：{'开着' if self.cfg.paper_enabled else '已停止（模拟频道不跟、不提醒）'}｜模拟权益 {self.paper_equity():.2f}U")
+        groups: dict = {}
+        for c in self.cfg.channels:
+            if c.mode != "off":
+                groups.setdefault(self.cfg.mode_label(c), []).append(c.title or c.username)
+        lines.append("📡 " + "｜".join(f"{k}：{'、'.join(v)}" for k, v in groups.items()))
+        for mode, head in (("live", "🔴 实盘"), ("paper", "🧪 模拟")):
+            act = self.db.active_trades(mode)
+            if not act and mode == "paper" and not self.cfg.paper_enabled:
+                continue
+            lines.append(f"{head}持仓/挂单 {len(act)} 笔：" if act else f"{head}：没有持仓/挂单")
+            for t in act:
+                st = (f"持仓 {fmt(t['remaining'])}" if t["status"] == "open"
+                      else "挂单开仓中" if t.get("entry_kind") == "maker" else "挂单中")
+                sl = fmt(t["soft_sl"]) + ("" if t["soft_sl"] == t["sl"] else f"（原 {fmt(t['sl'])}）")
+                lines.append(f"  #{t['id']} {t['base']} {SIDE_CN[t['side']]} {st} @{fmt(t['entry_price'])} 止损 {sl}｜{t['title']}")
         return "\n".join(lines)
 
     def stats_text(self) -> str:
+        """📈 战绩：实盘、模拟分开列，各自有每个频道和合计。"""
         rows = self.db.closed_trades()
         if not rows:
-            return "📊 还没有已平仓的交易，模拟盘跑一段时间再看。"
-        agg: dict = {}
-        for t in rows:
-            a = agg.setdefault((t["title"] or t["channel"], t["mode"]),
-                               {"n": 0, "win": 0, "r": 0.0, "rn": 0, "pnl": 0.0, "fn": 0, "fr": 0.0})
-            if t.get("sl_source") == "fallback":
-                a["fn"] += 1
-                a["fr"] += t.get("r_mult") or 0.0
-            pnl = t.get("pnl") or 0.0
-            a["n"] += 1
-            a["pnl"] += pnl
-            a["win"] += pnl > 0
-            if t.get("r_mult") is not None:
-                a["r"] += t["r_mult"]
-                a["rn"] += 1
+            return "📊 还没有已平仓的交易。"
         lines = ["📊 已平仓战绩（R = 盈亏 ÷ 计划止损金额，已扣手续费）"]
-        for (title, mode), a in sorted(agg.items(), key=lambda kv: -kv[1]["r"]):
-            avg = a["r"] / a["rn"] if a["rn"] else 0.0
-            lines.append(f"• {title} [{MODE_CN[mode]}]：{a['n']} 单，胜率 {a['win'] / a['n'] * 100:.0f}%，"
-                         f"总 {a['r']:+.2f}R，平均 {avg:+.2f}R，{a['pnl']:+.2f}U"
-                         + (f"\n   其中程序补止损的 {a['fn']} 单：总 {a['fr']:+.2f}R" if a["fn"] else ""))
-        lines.append("单数够多（建议 ≥30）且总 R 为正的频道，才值得考虑切实盘。")
+        for mode, head in (("live", "🔴 实盘"), ("paper", "🧪 模拟")):
+            part = [t for t in rows if t["mode"] == mode]
+            lines.append(f"\n━━ {head} ━━")
+            if not part:
+                lines.append(f"还没有已平仓的{MODE_CN[mode]}单")
+                continue
+            agg: dict = {}
+            for t in part:
+                a = agg.setdefault(t["title"] or t["channel"], {"n": 0, "win": 0, "r": 0.0, "rn": 0, "pnl": 0.0, "fn": 0, "fr": 0.0})
+                if t.get("sl_source") == "fallback":
+                    a["fn"] += 1
+                    a["fr"] += t.get("r_mult") or 0.0
+                pnl = t.get("pnl") or 0.0
+                a["n"] += 1
+                a["pnl"] += pnl
+                a["win"] += pnl > 0
+                if t.get("r_mult") is not None:
+                    a["r"] += t["r_mult"]
+                    a["rn"] += 1
+            for title, a in sorted(agg.items(), key=lambda kv: -kv[1]["r"]):
+                avg = a["r"] / a["rn"] if a["rn"] else 0.0
+                lines.append(f"• {title}：{a['n']} 单，胜率 {a['win'] / a['n'] * 100:.0f}%，"
+                             f"总 {a['r']:+.2f}R，平均 {avg:+.2f}R，{a['pnl']:+.2f}U"
+                             + (f"\n   其中程序补止损的 {a['fn']} 单：总 {a['fr']:+.2f}R" if a["fn"] else ""))
+            n, win = sum(a["n"] for a in agg.values()), sum(a["win"] for a in agg.values())
+            if len(agg) > 1:
+                lines.append(f"合计：{n} 单，胜率 {win / n * 100:.0f}%，总 {sum(a['r'] for a in agg.values()):+.2f}R，"
+                             f"{sum(a['pnl'] for a in agg.values()):+.2f}U")
+        lines.append("\n模拟单数够多（建议 ≥30）且总 R 为正的频道，才值得考虑切实盘。")
         return "\n".join(lines)
 
     def trades_text(self, n: int) -> str:
-        """/trades：最近 n 笔已平仓交易（新的在上面）。"""
-        rows = self.db.closed_trades()[-n:][::-1]
+        """/trades：实盘、模拟分开，各列最近 n 笔已平仓交易（新的在上面）。"""
+        rows = self.db.closed_trades()
         if not rows:
             return "📜 还没有已平仓的交易。"
         tz = timezone(timedelta(hours=self.cfg.tz_offset))
-        lines = [f"📜 最近 {len(rows)} 笔已平仓交易（新的在上面）"]
-        for t in rows:
-            pnl, r = t.get("pnl"), t.get("r_mult")
-            res = "盈亏未知" if pnl is None else f"{pnl:+.2f}U" + (f"（{r:+.2f}R）" if r is not None else "")
-            icon = "⚪" if pnl is None else ("✅" if pnl > 0 else "🔴")
-            when = datetime.fromtimestamp((t.get("closed_at") or t["created_at"]) / 1000, tz).strftime("%m-%d %H:%M")
-            lines.append(f"{icon} #{t['id']} [{MODE_CN[t['mode']]}] {t['base']} {SIDE_CN[t['side']]} {res}"
-                         f"｜{t.get('exit_reason') or ''}｜{t['title']}｜{when}")
+        lines = ["📜 最近已平仓的交易（新的在上面）"]
+        for mode, head in (("live", "🔴 实盘"), ("paper", "🧪 模拟")):
+            part = [t for t in rows if t["mode"] == mode][-n:][::-1]
+            lines.append(f"\n━━ {head}（最近 {len(part)} 笔）━━" if part else f"\n━━ {head} ━━")
+            if not part:
+                lines.append(f"还没有已平仓的{MODE_CN[mode]}单")
+            for t in part:
+                pnl, r = t.get("pnl"), t.get("r_mult")
+                res = "盈亏未知" if pnl is None else f"{pnl:+.2f}U" + (f"（{r:+.2f}R）" if r is not None else "")
+                icon = "⚪" if pnl is None else ("✅" if pnl > 0 else "🔴")
+                when = datetime.fromtimestamp((t.get("closed_at") or t["created_at"]) / 1000, tz).strftime("%m-%d %H:%M")
+                lines.append(f"{icon} #{t['id']} {t['base']} {SIDE_CN[t['side']]} {res}"
+                             f"｜{t.get('exit_reason') or ''}｜{t['title']}｜{when}")
         return "\n".join(lines)
+
+    def void_paper(self) -> int:
+        """停止模拟盘：还开着的模拟单（持仓、挂单）全部作废，不计入战绩。返回作废了几笔。"""
+        n = 0
+        for t in self.db.active_trades("paper"):
+            t.update(status="cancelled", closed_at=now_ms(), exit_reason="模拟盘已停止，作废")
+            self.db.save_trade(t)
+            n += 1
+        return n
 
     # ---------------- 通知文案 ----------------
     def open_text(self, t, plan) -> str:

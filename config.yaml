@@ -23,6 +23,7 @@ llm:
 
 paper:
   equity: 1000                 # 模拟盘本金（U）
+  enabled: true                # 模拟盘开关（默认值）：机器人「⚙️ 实盘/模拟」里可以停止/恢复，谁最后改算谁的；停止后模拟频道的信号不跟、不提醒
 
 timezone_offset_hours: 8       # 时区：北京时间
 daily_report_hour: 22          # 每天几点推送日报（持仓 + 各频道战绩）；-1 = 不推送

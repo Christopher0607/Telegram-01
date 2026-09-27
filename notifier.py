@@ -190,7 +190,7 @@ class Notifier:
         m = cq.get("message") or {}
         where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
         data = cq.get("data") or ""
-        if data.startswith(("mode:", "modeok:", "bt:", "risk:", "riskok:")):  # 实盘/模拟、每单风险面板、回测：在原消息上更新
+        if data.startswith(("mode:", "modeok:", "bt:", "risk:", "riskok:", "paper:", "paperok:")):  # 面板上的按钮：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))

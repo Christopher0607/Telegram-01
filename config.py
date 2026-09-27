@@ -19,6 +19,7 @@ PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
 # 主人在机器人里（⚙️ 实盘/模拟）切换的频道模式：{频道: {"mode": live/paper, "base": 切换时 config.yaml 里的 mode}}
 MODES_PATH = os.path.join(DATA_DIR, "modes.json")
 RISK_PATH = os.path.join(DATA_DIR, "risk.json")   # 主人在机器人里调的风控设置（/risk）
+PAPER_PATH = os.path.join(DATA_DIR, "paper.json")  # 主人在机器人里停止/恢复模拟盘
 RISK_KEYS = ("risk_per_trade_pct", "risk_per_trade_usdt")    # 每单风险（这两项一起改）
 LIMIT_KEYS = ("max_open_positions", "max_daily_losses")      # 同时最多几单、每天最多亏几单（机器人里也能改）
 
@@ -159,6 +160,11 @@ class Config:
         self.llm_vision = bool(llm.get("vision", True))   # 频道消息里的图片也交给 AI 看
         paper = raw.get("paper") or {}
         self.paper_equity = float(paper.get("equity", 1000))
+        # 模拟盘开关：config.yaml 的 paper.enabled 是默认值，机器人里停止/恢复过（data/paper.json）就按机器人的
+        self.paper_yaml = bool(paper.get("enabled", True))
+        o = _load_json(PAPER_PATH)
+        self.paper_enabled = o["enabled"] if isinstance(o.get("enabled"), bool) and o.get("base") == self.paper_yaml \
+            else self.paper_yaml
         self.tz_offset = float(raw.get("timezone_offset_hours", 8))
         self.report_hour = int(raw.get("daily_report_hour", 22))
 
@@ -271,13 +277,32 @@ class Config:
             json.dump(self.mode_overrides, f, ensure_ascii=False)
 
     def mode_for(self, ch: ChannelCfg) -> str:
-        """实际生效的模式：只有总开关 live_trading 打开且频道设为 live 才真实下单。"""
+        """实际生效的模式：只有总开关 live_trading 打开且频道设为 live 才真实下单；
+        其余按模拟跑——模拟盘被停止时就不跟（off）。"""
         m = self.channel_mode(ch)
         if m == "off":
             return "off"
         if m == "live" and self.live_trading:
             return "live"
-        return "paper"
+        return "paper" if self.paper_enabled else "off"
+
+    def mode_label(self, ch: ChannelCfg) -> str:
+        """实际生效的方式，给人看的：实盘 / 模拟 / 模拟（已停止）/ 关闭。"""
+        m = self.mode_for(ch)
+        if m == "live":
+            return "实盘"
+        if m == "paper":
+            return "模拟"
+        return "模拟（已停止）" if self.channel_mode(ch) != "off" else "关闭"
+
+    def set_paper(self, on: bool):
+        """机器人里停止/恢复模拟盘：保存到 data/paper.json，重启后照样有效。"""
+        self.paper_enabled = bool(on)
+        o = {} if self.paper_enabled == self.paper_yaml else {"enabled": self.paper_enabled, "base": self.paper_yaml,
+                                                               "at": int(time.time())}
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(PAPER_PATH, "w", encoding="utf-8") as f:
+            json.dump(o, f, ensure_ascii=False)
 
     def channel_by_username(self, username: str) -> ChannelCfg | None:
         for c in self.channels:

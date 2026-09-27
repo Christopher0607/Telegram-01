@@ -225,6 +225,7 @@ async def simulate(job_path: str, out_path: str):
 
     cfg = Config()
     cfg.live_trading = False   # 全部按模拟盘跑
+    cfg.paper_enabled = True   # 主人停了模拟盘也照样回测（回测本来就是模拟）
     for k in ("gate_key", "gate_secret", "weex_key", "weex_secret", "weex_passphrase",
               "bitget_key", "bitget_secret", "bitget_passphrase"):
         setattr(cfg, k, "")    # 回测进程不拿交易所密钥：只用公开行情，绝不可能真实下单
