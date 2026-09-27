@@ -133,6 +133,13 @@ class DB:
         r = self.conn.execute("SELECT * FROM trades WHERE id=?", (tid,)).fetchone()
         return self._row(r) if r else None
 
+    def count_losses(self, mode: str, since_ms: int) -> int:
+        """since_ms 以后平仓、亏了超过 0.1R 的单子数（保本出场、只亏手续费的不算）。"""
+        r = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE mode=? AND status='closed' AND closed_at>=? AND r_mult < -0.1",
+            (mode, since_ms)).fetchone()
+        return int(r["n"] or 0)
+
     def active_trades(self, mode: str | None = None) -> list[dict]:
         q = "SELECT * FROM trades WHERE status IN ('pending','open')"
         args: tuple = ()

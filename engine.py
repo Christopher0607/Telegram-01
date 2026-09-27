@@ -38,7 +38,9 @@ HELP = ("📖 命令\n"
         "/trades  最近 10 笔已平仓交易（/trades 20 看 20 笔）\n"
         "/ai      最近 10 条频道消息的 AI 识别结果（/ai 20 看 20 条）\n"
         "/mode    每个频道切换实盘/模拟（也可以点「⚙️ 实盘/模拟」按钮）\n"
-        "/risk    每单风险（一单打到止损亏多少）：/risk 5% 按总权益比例，/risk 10u 固定金额（也可以点「💰 每单风险」按钮）\n"
+        "/risk    风控设置（也可以点「💰 风控设置」按钮）：/risk 5% 每单亏总权益的 5%，/risk 10u 每单固定亏 10U\n"
+        "/maxpos 10  同时最多几单（持仓+挂单）\n"
+        "/maxloss 6  每天最多亏几单，到了当天不再开新仓（0 = 不限）\n"
         "/backtest 频道名  回测它最近 30 天按现在规则的成绩（不写频道名就给按钮选）\n"
         "/pause   暂停实盘开新仓\n"
         "/resume  恢复实盘开新仓\n"
@@ -421,6 +423,34 @@ class Engine:
     def set_paused(self, reason: str | None):
         self.db.kv_set("paused", reason)
 
+    # ---------------- 每天最多亏几单 ----------------
+    def day_start_ms(self) -> int:
+        """今天 0 点（按 config 的 timezone_offset_hours，默认北京时间）。"""
+        d = datetime.fromtimestamp(now_ms() / 1000, timezone(timedelta(hours=self.cfg.tz_offset)))
+        return int(d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+    def losses_today(self, mode: str) -> int:
+        """今天（0 点以后）平仓的亏损单数：亏了超过 0.1R 才算，保本出场不算。"""
+        return self.db.count_losses(mode, self.day_start_ms())
+
+    def daily_block(self, mode: str, risk: dict | None = None) -> str | None:
+        """今天的亏损单数到了每日上限（max_daily_losses）：当天不再开新仓，第二天 0 点恢复。没到返回 None。"""
+        lim = int((risk or self.cfg.risk).get("max_daily_losses") or 0)
+        if lim <= 0:
+            return None
+        n = self.losses_today(mode)
+        return f"今天{MODE_CN[mode]}已经亏损 {n} 单（每天最多亏 {lim} 单），明天 0 点自动恢复" if n >= lim else None
+
+    async def after_close(self, t: dict):
+        """平仓后：这一单亏了，而且正好让今天的亏损单数到了每日上限 → 提醒一次。"""
+        if t.get("r_mult") is None or t["r_mult"] >= -0.1:
+            return
+        lim = int(self.cfg.risk.get("max_daily_losses") or 0)
+        if lim > 0 and self.losses_today(t["mode"]) == lim:
+            m = MODE_CN[t["mode"]]
+            await self.notify(f"⛔ 今天{m}已经亏损 {lim} 单，到了每天最多亏的单数：今天不再开新的{m}仓（已有持仓照常管理），"
+                              f"明天 0 点自动恢复。\n要继续开仓，可以点「💰 风控设置」把每天最多亏的单数调高。")
+
     # ---------------- 挂单（maker）和手续费 ----------------
     def maker_block(self) -> str | None:
         """实盘为什么还不能用挂单开仓/止盈（None = 可以用）。"""
@@ -587,6 +617,9 @@ class Engine:
                 raise Reject(f"{base} 已有{MODE_CN[mode]}持仓/挂单 #{t['id']}（来自 {t['title']}）")
         if len(active) >= int(risk["max_open_positions"]):
             raise Reject(f"{MODE_CN[mode]}持仓+挂单已达上限 {risk['max_open_positions']} 单")
+        block = self.daily_block(mode, risk)
+        if block:
+            raise Reject(f"{block}（今天不再开新仓）")
 
         free = None
         if mode == "live":
@@ -918,6 +951,7 @@ class Engine:
                 finish(t, now_ms(), reason)
                 self.db.save_trade(t)
                 await self.notify(self.close_text(t, price))
+                await self.after_close(t)
                 return "closed"
             self.assign_tp_qty(t)
             self.db.save_trade(t)
@@ -1014,6 +1048,7 @@ class Engine:
                  r_mult=(pnl / t["risk_usdt"]) if (pnl is not None and t.get("risk_usdt")) else None)
         self.db.save_trade(t)
         await self.notify(self.close_text(t, exit_px))
+        await self.after_close(t)
 
     # ---------------- 监控循环 ----------------
     async def adopt_exchange(self):
@@ -1333,6 +1368,7 @@ class Engine:
                 continue
             if t["status"] == "closed":
                 await self.notify(self.close_text(t, None, events))
+                await self.after_close(t)
             else:
                 await self.notify(f"📈 #{t['id']} [模拟] {t['base']} {SIDE_CN[t['side']]}：" + "；".join(events))
 
@@ -1379,7 +1415,7 @@ class Engine:
         return "未知命令，发 /help 查看"
 
     async def status_text(self) -> str:
-        paused = self.paused() or (self.live_block() if self.cfg.live_trading else None)
+        paused = self.paused() or ((self.live_block() or self.daily_block("live")) if self.cfg.live_trading else None)
         lines = [f"🤖 运行中｜交易所：{self.ex.label}｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"
                  + (f"｜版本 {self.version}" if self.version else "")]
         eq = None
@@ -1392,7 +1428,11 @@ class Engine:
         pct, usdt = float(self.cfg.risk["risk_per_trade_pct"]), float(self.cfg.risk.get("risk_per_trade_usdt") or 0)
         lines.append("🎯 每单风险：" + (f"固定 {usdt:g}U" if usdt > 0 else
                                       f"总权益的 {pct:g}%" + (f"（实盘约 {eq * pct / 100:.1f}U）" if eq else ""))
-                     + "（打到止损亏多少，点「💰 每单风险」可以改）")
+                     + "（打到止损亏多少）")
+        mp, ml = int(self.cfg.risk["max_open_positions"]), int(self.cfg.risk.get("max_daily_losses") or 0)
+        lines.append(f"🛡 同时最多 {mp} 单｜每天最多亏 " + (f"{ml} 单（今天实盘已亏 {self.losses_today('live')} 单、"
+                                                    f"模拟 {self.losses_today('paper')} 单）" if ml else "不限")
+                     + "；点「💰 风控设置」可以改")
         mb = self.maker_block()
         if self.cfg.maker_orders:
             lines.append("📝 下单方式：开仓先挂单、止盈挂在交易所（maker 手续费），止损市价" if not mb

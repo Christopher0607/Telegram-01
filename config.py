@@ -18,8 +18,9 @@ SECRETS_PATH = os.path.join(DATA_DIR, "secrets.env")
 PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
 # 主人在机器人里（⚙️ 实盘/模拟）切换的频道模式：{频道: {"mode": live/paper, "base": 切换时 config.yaml 里的 mode}}
 MODES_PATH = os.path.join(DATA_DIR, "modes.json")
-RISK_PATH = os.path.join(DATA_DIR, "risk.json")   # 主人在机器人里调的每单风险（/risk）
-RISK_KEYS = ("risk_per_trade_pct", "risk_per_trade_usdt")
+RISK_PATH = os.path.join(DATA_DIR, "risk.json")   # 主人在机器人里调的风控设置（/risk）
+RISK_KEYS = ("risk_per_trade_pct", "risk_per_trade_usdt")    # 每单风险（这两项一起改）
+LIMIT_KEYS = ("max_open_positions", "max_daily_losses")      # 同时最多几单、每天最多亏几单（机器人里也能改）
 
 # 所有风控参数的默认值（config.yaml 里写了就以 config.yaml 为准）
 DEFAULT_RISK = {
@@ -29,6 +30,7 @@ DEFAULT_RISK = {
     "liq_safety": 0.7,                # 止损距离 ≤ 强平距离 × 0.7（已计入维持保证金率和手续费）
     "max_margin_pct": 25.0,           # 单笔保证金最多占权益 %
     "max_open_positions": 3,          # 同时最多几单（持仓+挂单）
+    "max_daily_losses": 0,            # 每天最多亏几单（实盘/模拟分开算）：到了当天不再开新仓，第二天 0 点恢复；0 = 不限
     "fallback_sl_mode": "atr",        # 信号没给止损时：atr 按波动率补 / pct 固定百分比 / off 不跟
     "fallback_sl_atr_mult": 2.0,      # atr 模式：止损距离 = 1 小时 ATR(14) × 此倍数
     "fallback_sl_min_pct": 1.5,       # 补的止损离进场价最近 %
@@ -164,7 +166,10 @@ class Config:
         self.risk.update(raw.get("risk") or {})
         # 每单风险：config.yaml 写的是默认值，主人在机器人里调过（data/risk.json）就用调过的
         self.risk_yaml = {k: float(self.risk.get(k) or 0) for k in RISK_KEYS}
+        self.limits_yaml = {k: int(self.risk.get(k) or 0) for k in LIMIT_KEYS}
         self.risk_override = _load_json(RISK_PATH)
+        if "risk_per_trade_pct" in self.risk_override:   # 旧格式（只有每单风险）
+            self.risk_override = {"trade": self.risk_override}
         self._apply_risk_override()
 
         self.channels: list[ChannelCfg] = []
@@ -201,28 +206,46 @@ class Config:
         self.mode_overrides = _load_json(MODES_PATH)
 
     def _apply_risk_override(self):
-        """机器人里调过每单风险就用调过的；之后 config.yaml 又改了每单风险，就以 config.yaml 为准（谁最后改算谁的）。"""
-        o = self.risk_override
-        use = bool(o) and o.get("base") == self.risk_yaml and all(isinstance(o.get(k), (int, float)) for k in RISK_KEYS)
+        """机器人里调过的风控设置就用调过的；之后 config.yaml 又改了那一项，就以 config.yaml 为准（谁最后改算谁的）。"""
+        o = self.risk_override if isinstance(self.risk_override, dict) else {}
+        t = o.get("trade") if isinstance(o.get("trade"), dict) else {}
+        use = t.get("base") == self.risk_yaml and all(isinstance(t.get(k), (int, float)) for k in RISK_KEYS)
         for k in RISK_KEYS:
-            self.risk[k] = float(o[k]) if use else self.risk_yaml[k]
+            self.risk[k] = float(t[k]) if use else self.risk_yaml[k]
+        for k in LIMIT_KEYS:
+            e = o.get(k) if isinstance(o.get(k), dict) else {}
+            ok = isinstance(e.get("value"), int) and e.get("base") == self.limits_yaml[k]
+            self.risk[k] = e["value"] if ok else self.limits_yaml[k]
 
-    def risk_from_bot(self) -> bool:
-        """现在的每单风险是不是主人在机器人里调的（不是 config.yaml 的默认值）。"""
-        return any(self.risk[k] != self.risk_yaml[k] for k in RISK_KEYS)
+    def risk_from_bot(self, key: str = "trade") -> bool:
+        """这一项现在是不是主人在机器人里调的（不是 config.yaml 的默认值）。key：trade（每单风险）或 LIMIT_KEYS 里的一项。"""
+        if key == "trade":
+            return any(self.risk[k] != self.risk_yaml[k] for k in RISK_KEYS)
+        return self.risk[key] != self.limits_yaml[key]
+
+    def _save_risk_override(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(RISK_PATH, "w", encoding="utf-8") as f:
+            json.dump(self.risk_override, f, ensure_ascii=False)
+        self._apply_risk_override()
 
     def set_trade_risk(self, pct: float | None = None, usdt: float | None = None):
         """机器人里调每单风险：按权益百分比（pct）或固定金额（usdt）。保存到 data/risk.json，重启后照样有效。"""
         new = {"risk_per_trade_pct": float(self.risk["risk_per_trade_pct"] if pct is None else pct),
                "risk_per_trade_usdt": 0.0 if usdt is None else float(usdt)}
         if new == self.risk_yaml:
-            self.risk_override = {}   # 和 config.yaml 一样了，不用再记
+            self.risk_override.pop("trade", None)   # 和 config.yaml 一样了，不用再记
         else:
-            self.risk_override = dict(new, base=dict(self.risk_yaml), at=int(time.time()))
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(RISK_PATH, "w", encoding="utf-8") as f:
-            json.dump(self.risk_override, f, ensure_ascii=False)
-        self._apply_risk_override()
+            self.risk_override["trade"] = dict(new, base=dict(self.risk_yaml), at=int(time.time()))
+        self._save_risk_override()
+
+    def set_limit(self, key: str, value: int):
+        """机器人里调「同时最多几单」「每天最多亏几单」（0 = 不限）。保存到 data/risk.json。"""
+        if int(value) == self.limits_yaml[key]:
+            self.risk_override.pop(key, None)
+        else:
+            self.risk_override[key] = {"value": int(value), "base": self.limits_yaml[key], "at": int(time.time())}
+        self._save_risk_override()
 
     def risk_for(self, ch: ChannelCfg) -> dict:
         r = copy.deepcopy(self.risk)

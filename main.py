@@ -619,8 +619,12 @@ async def mode_callback(data: str, cfg: Config, engine: Engine) -> tuple[str, di
     return mode_panel(cfg, engine)
 
 
-RISK_CHOICES = [[1, 2, 3], [5, 8, 10]]   # 「💰 每单风险」面板上的按钮：每单亏总权益的 %
+RISK_CHOICES = [[1, 2, 3], [5, 8, 10]]   # 「每单风险」的按钮：每单亏总权益的 %
 RISK_MAX_PCT = 20.0                      # 防手滑：每单最多亏总权益的 20%（固定金额也不能超过权益的 20%）
+# 机器人里能调的上限：按钮上的名字 → (config 里的名字, 说法, 可选的值；0 = 不限)
+LIMITS = {"maxpos": ("max_open_positions", "同时最多持仓", [[3, 5, 8], [10, 15, 20]]),
+          "maxloss": ("max_daily_losses", "每天最多亏", [[3, 4, 5], [6, 8, 0]])}
+LIMIT_MAX = 30
 
 
 async def _equity(engine: Engine) -> float | None:
@@ -644,16 +648,54 @@ def describe_risk(pct: float, usdt: float, equity: float | None = None) -> str:
     return f"总权益的 {pct:g}%" + (f"（按现在权益 {equity:.0f}U 算约 {equity * pct / 100:.1f}U）" if equity else "")
 
 
+def limit_desc(which: str, v: int) -> str:
+    return "不限" if which == "maxloss" and v <= 0 else f"{v} 单"
+
+
+def limit_now(cfg: Config, which: str) -> int:
+    return int(cfg.risk.get(LIMITS[which][0]) or 0)
+
+
 async def risk_panel(cfg: Config, engine: Engine, head: str = "") -> tuple[str, dict]:
-    """💰 每单风险：现在是多少，按钮改成常用的比例。"""
+    """💰 风控设置：每单风险、同时最多几单、每天最多亏几单。点按钮进去改。"""
     pct, usdt = risk_now(cfg)
+    mp, ml = limit_now(cfg, "maxpos"), limit_now(cfg, "maxloss")
+    mark = lambda key: "（机器人里调的）" if cfg.risk_from_bot(key) else ""
     lines = [head, ""] if head else []
-    lines += ["💰 每单风险（一单打到止损亏多少）",
-              f"现在：{describe_risk(pct, usdt, await _equity(engine))}" + ("（机器人里调的）" if cfg.risk_from_bot() else ""),
-              "点下面的按钮改（按总权益的比例）；也可以发 /risk 3%（按比例）或 /risk 5u（固定金额）。",
-              "只影响之后新开的单子，已经开着的不变；实盘、模拟一起改。调大要再确认一次。"]
-    rows = [[{"text": ("✅ " if usdt <= 0 and pct == v else "") + f"{v}%", "callback_data": f"risk:pct:{v}"} for v in row]
-            for row in RISK_CHOICES]
+    lines += ["💰 风控设置（点下面的按钮改）",
+              f"• 每单风险：{describe_risk(pct, usdt, await _equity(engine))}{mark('trade')}",
+              f"• 同时最多持仓：{mp} 单（持仓 + 挂单，实盘/模拟分开算）{mark('max_open_positions')}",
+              f"• 每天最多亏：{limit_desc('maxloss', ml)}{mark('max_daily_losses')}"
+              + ("（到了当天不再开新仓，明天 0 点恢复；保本出场不算）" if ml else "")]
+    losses = getattr(engine, "losses_today", None)
+    if ml and losses:
+        lines.append(f"  今天已亏：实盘 {losses('live')} 单、模拟 {losses('paper')} 单")
+    lines += ["也可以直接发：/risk 3% 或 /risk 5u（每单风险），/maxpos 8（同时最多几单），/maxloss 4（每天最多亏几单，0 = 不限）",
+              "调大要再确认一次；只影响之后新开的单子。"]
+    rows = [[{"text": f"💰 每单风险：{describe_risk(pct, usdt)}", "callback_data": "risk:menu:trade"}],
+            [{"text": f"📦 同时最多持仓：{mp} 单", "callback_data": "risk:menu:maxpos"}],
+            [{"text": f"⛔ 每天最多亏：{limit_desc('maxloss', ml)}", "callback_data": "risk:menu:maxloss"}]]
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+async def risk_submenu(cfg: Config, engine: Engine, which: str, head: str = "") -> tuple[str, dict]:
+    """风控设置里的一项：trade（每单风险）/ maxpos（同时最多几单）/ maxloss（每天最多亏几单）。"""
+    lines = [head, ""] if head else []
+    if which == "trade":
+        pct, usdt = risk_now(cfg)
+        lines += ["💰 每单风险（一单打到止损亏多少）", f"现在：{describe_risk(pct, usdt, await _equity(engine))}",
+                  "点下面改成总权益的几 %；要固定金额就发 /risk 5u。"]
+        rows = [[{"text": ("✅ " if usdt <= 0 and pct == v else "") + f"{v}%", "callback_data": f"risk:pct:{v}"} for v in row]
+                for row in RISK_CHOICES]
+    else:
+        cur = limit_now(cfg, which)
+        lines += (["📦 同时最多持仓几单（持仓 + 挂单，实盘/模拟分开算）", f"现在：{limit_desc(which, cur)}",
+                   f"其他数字发 /maxpos 数字（1～{LIMIT_MAX}）。"] if which == "maxpos" else
+                  ["⛔ 每天最多亏几单：到了当天不再开新仓，明天 0 点（北京时间）自动恢复；保本出场不算亏损单",
+                   f"现在：{limit_desc(which, cur)}", f"其他数字发 /maxloss 数字（0 = 不限，最多 {LIMIT_MAX}）。"])
+        rows = [[{"text": ("✅ " if cur == v else "") + limit_desc(which, v).replace(" 单", ""), "callback_data": f"risk:{which}:{v}"}
+                 for v in row] for row in LIMITS[which][2]]
+    rows.append([{"text": "« 返回风控设置", "callback_data": "risk:panel"}])
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -665,18 +707,24 @@ def parse_risk(arg: str) -> tuple[str, float] | None:
     return ("usdt" if m.group(2) in ("u", "usdt") else "pct"), float(m.group(1))
 
 
+def confirm_markup(which: str, value) -> dict:
+    return {"inline_keyboard": [[{"text": "✅ 确认调大", "callback_data": f"riskok:{which}:{value:g}:{int(time.time())}"},
+                                 {"text": "取消", "callback_data": "risk:panel"}]]}
+
+
 async def risk_change(cfg: Config, engine: Engine, kind: str, value: float, confirmed: bool = False) -> tuple[str, dict]:
     """把每单风险改成 value（kind：pct 占总权益 % / usdt 固定金额）。调大（多亏）要先确认；明显打错的不改。"""
     pct, usdt = risk_now(cfg)
     equity = await _equity(engine)
+    back = lambda head: risk_submenu(cfg, engine, "trade", head)
     if kind == "pct" and not 0.1 <= value <= RISK_MAX_PCT:
-        return await risk_panel(cfg, engine, f"⚠️ 每单风险只能设总权益的 0.1%～{RISK_MAX_PCT:g}%，没有改。")
+        return await back(f"⚠️ 每单风险只能设总权益的 0.1%～{RISK_MAX_PCT:g}%，没有改。")
     if kind == "usdt" and (value <= 0 or (equity and value > equity * RISK_MAX_PCT / 100)):
-        return await risk_panel(cfg, engine, f"⚠️ 固定 {value:g}U 超过了现在权益 {equity:.0f}U 的 {RISK_MAX_PCT:g}%，怕是打错了，没有改。"
-                                if value > 0 else "⚠️ 金额要大于 0，没有改。")
+        return await back(f"⚠️ 固定 {value:g}U 超过了现在权益 {equity:.0f}U 的 {RISK_MAX_PCT:g}%，怕是打错了，没有改。"
+                          if value > 0 else "⚠️ 金额要大于 0，没有改。")
     new = (value, 0.0) if kind == "pct" else (pct, value)
     if new == (pct, usdt):
-        return await risk_panel(cfg, engine, f"每单风险本来就是 {describe_risk(pct, usdt)}，没有变。")
+        return await back(f"每单风险本来就是 {describe_risk(pct, usdt)}，没有变。")
 
     def loss(p, u):
         return u if u > 0 else (equity * p / 100 if equity else None)
@@ -688,40 +736,77 @@ async def risk_change(cfg: Config, engine: Engine, kind: str, value: float, conf
         bigger = old_loss is None or new_loss is None or new_loss > old_loss
     if bigger and not confirmed:
         return (f"⚠️ 确定把每单风险从 {describe_risk(pct, usdt, equity)}\n调大到 {describe_risk(*new, equity)} 吗？\n"
-                f"之后实盘每单打到止损会亏得更多。",
-                {"inline_keyboard": [[{"text": "✅ 确认调大", "callback_data": f"riskok:{kind}:{value:g}:{int(time.time())}"},
-                                      {"text": "取消", "callback_data": "risk:panel"}]]})
+                f"之后实盘每单打到止损会亏得更多。", confirm_markup(kind, value))
     if kind == "pct":
         cfg.set_trade_risk(pct=value)
     else:
         cfg.set_trade_risk(usdt=value)
     log.info("主人把每单风险改成 %s", describe_risk(*new))
-    return await risk_panel(cfg, engine, f"✅ 每单风险改成 {describe_risk(*new, equity)}，下一单开始按这个算")
+    return await back(f"✅ 每单风险改成 {describe_risk(*new, equity)}，下一单开始按这个算")
+
+
+async def limit_change(cfg: Config, engine: Engine, which: str, value: int, confirmed: bool = False) -> tuple[str, dict]:
+    """改「同时最多持仓」（maxpos）或「每天最多亏几单」（maxloss，0 = 不限）。调大（风险更大）要先确认。"""
+    key, name, _ = LIMITS[which]
+    cur = limit_now(cfg, which)
+    back = lambda head: risk_submenu(cfg, engine, which, head)
+    low = 1 if which == "maxpos" else 0
+    if not low <= value <= LIMIT_MAX:
+        return await back(f"⚠️ {name}只能设 {low}～{LIMIT_MAX}" + ("（0 = 不限）" if which == "maxloss" else "") + "，没有改。")
+    if value == cur:
+        return await back(f"{name}本来就是 {limit_desc(which, cur)}，没有变。")
+    bigger = value > cur if which == "maxpos" else (value == 0 or (cur != 0 and value > cur))
+    if bigger and not confirmed:
+        pct, usdt = risk_now(cfg)
+        each = f"{usdt:g}U" if usdt > 0 else f"总权益的 {pct:g}%"
+        worst = (f"{value} 单同时打到止损最多约亏 " + (f"{value * usdt:g}U" if usdt > 0 else f"总权益的 {value * pct:g}%")
+                 if which == "maxpos" else
+                 "改成不限以后，一天亏多少单都会继续开新仓" if value == 0 else
+                 f"一天最多约亏 " + (f"{value * usdt:g}U" if usdt > 0 else f"总权益的 {value * pct:g}%"))
+        return (f"⚠️ 确定把{name}从 {limit_desc(which, cur)} 调到 {limit_desc(which, value)} 吗？\n"
+                f"现在每单风险是 {each}：{worst}。", confirm_markup(which, value))
+    cfg.set_limit(key, value)
+    log.info("主人把%s改成 %s", name, limit_desc(which, value))
+    return await back(f"✅ {name}改成 {limit_desc(which, value)}，马上生效")
 
 
 async def risk_callback(data: str, cfg: Config, engine: Engine) -> tuple[str, dict]:
-    """点了「💰 每单风险」面板上的按钮。data：risk:panel / risk:pct:5 / riskok:pct:10:时间"""
+    """点了「💰 风控设置」里的按钮。data：risk:panel / risk:menu:maxpos / risk:pct:5 / risk:maxloss:6 /
+    riskok:pct:10:时间（确认调大）"""
     parts = data.split(":")
     try:
-        if parts[0] == "risk" and len(parts) == 3 and parts[1] in ("pct", "usdt"):
-            return await risk_change(cfg, engine, parts[1], float(parts[2]))
-        if parts[0] == "riskok" and len(parts) == 4 and parts[1] in ("pct", "usdt"):
-            if time.time() - int(parts[3]) > MODE_CONFIRM_TTL:
-                return await risk_panel(cfg, engine, "⌛ 确认按钮已经过期，没有改。")
-            return await risk_change(cfg, engine, parts[1], float(parts[2]), confirmed=True)
+        if parts[:2] == ["risk", "menu"] and len(parts) == 3 and parts[2] in ("trade", *LIMITS):
+            return await risk_submenu(cfg, engine, parts[2])
+        confirmed = parts[0] == "riskok"
+        if confirmed and len(parts) == 4 and time.time() - int(parts[3]) > MODE_CONFIRM_TTL:
+            return await risk_panel(cfg, engine, "⌛ 确认按钮已经过期，没有改。")
+        if len(parts) == (4 if confirmed else 3):
+            if parts[1] in ("pct", "usdt"):
+                return await risk_change(cfg, engine, parts[1], float(parts[2]), confirmed)
+            if parts[1] in LIMITS:
+                return await limit_change(cfg, engine, parts[1], int(float(parts[2])), confirmed)
     except ValueError:
         pass
     return await risk_panel(cfg, engine)
 
 
 async def risk_command(text: str, cfg: Config, engine: Engine) -> tuple[str, dict]:
-    """/risk：看每单风险、点按钮改；/risk 5% 按总权益比例；/risk 10u 固定金额。"""
-    arg = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
-    if not arg.strip():
+    """/risk：风控设置面板；/risk 5% 每单亏总权益的 5%；/risk 10u 每单固定亏 10U；
+    /maxpos 10 同时最多几单；/maxloss 6 每天最多亏几单（0 = 不限）。"""
+    cmd = text.split()[0].lower().split("@")[0]
+    arg = text.split(maxsplit=1)[1].strip() if len(text.split()) > 1 else ""
+    if cmd in ("/maxpos", "/maxloss"):
+        which = cmd[1:]
+        if not arg:
+            return await risk_submenu(cfg, engine, which)
+        if not re.fullmatch(r"\d+", arg):
+            return await risk_submenu(cfg, engine, which, f"没看懂「{arg[:20]}」，要发整数，例如 {cmd} 6")
+        return await limit_change(cfg, engine, which, int(arg))
+    if not arg:
         return await risk_panel(cfg, engine)
     r = parse_risk(arg)
     if not r:
-        return await risk_panel(cfg, engine, f"没看懂「{arg.strip()[:20]}」。按总权益比例发 /risk 5%，固定金额发 /risk 10u")
+        return await risk_panel(cfg, engine, f"没看懂「{arg[:20]}」。每单亏总权益的比例发 /risk 5%，固定金额发 /risk 10u")
     return await risk_change(cfg, engine, *r)
 
 
@@ -807,7 +892,7 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
     cmd = text.split()[0].lower().split("@")[0]
     if cmd == "/mode":
         return mode_panel(cfg, engine)
-    if cmd == "/risk":
+    if cmd in ("/risk", "/maxpos", "/maxloss"):
         return await risk_command(text, cfg, engine)
     if cmd == "/cb":  # 消息下面的按钮：实盘/模拟面板、每单风险面板、回测
         data = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
