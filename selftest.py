@@ -158,4 +158,18 @@ t2 = dict(t, status="open", remaining=p["qty"], soft_sl=93.7, be_moved=0,
 simulate_candle(t2, 3, high=100, low=93, fee_rate=R["fee_rate"], be_after_tp1=True)
 check(f"同根K线止损+止盈 → 按止损，{t2['r_mult']:+.2f}R", t2["exit_reason"] == "止损离场" and abs(t2["r_mult"] + 1) < 0.01)
 
+# ---------- 6. 挂单（maker）手续费：限价单成交、止盈挂单按挂单费，止损按市价费 ----------
+t3 = {"side": "long", "status": "pending", "entry_price": 100.0, "qty": 10.0, "remaining": 0.0, "sl": 98.0, "soft_sl": 98.0,
+      "risk_usdt": 20.0, "realized": 0.0, "be_moved": 0,
+      "tps": [{"price": 102.0, "frac": 0.5, "qty": None, "filled": False}, {"price": 104.0, "frac": 0.5, "qty": None, "filled": False}]}
+simulate_candle(t3, 1, high=100.5, low=99.9, fee_rate=0.0008, be_after_tp1=True, maker_fee=0.0002, maker_tp=True)
+check(f"限价单成交按挂单费：{-t3['realized']:.2f}U（10×100×0.02%）", abs(t3["realized"] + 0.2) < 1e-9)
+simulate_candle(t3, 2, high=102.5, low=100.5, fee_rate=0.0008, be_after_tp1=True, maker_fee=0.0002, maker_tp=True)
+check("止盈挂单按挂单费", abs(t3["realized"] - (-0.2 + 5 * 2 - 5 * 102 * 0.0002)) < 1e-9)
+simulate_candle(t3, 3, high=100.5, low=99.5, fee_rate=0.0008, be_after_tp1=True, maker_fee=0.0002, maker_tp=True)
+check(f"保本止损按市价费：{t3['exit_reason']}", t3["status"] == "closed"
+      and abs(t3["realized"] - (-0.2 + 10 - 5 * 102 * 0.0002 - 5 * 100 * 0.0008)) < 1e-9)
+p = plan_entry("long", 99, 101, 97, [103], 100, R, 1000)
+check("开仓计划记下进场区（挂单开仓算最差接受价用）", p["lo"] == 99 and p["hi"] == 101)
+
 print(f"\n全部 {ok} 项通过 ✅")

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS trades(
   realized REAL DEFAULT 0, order_id TEXT,
   created_at INTEGER, opened_at INTEGER, closed_at INTEGER, expires_at INTEGER,
   last_candle_ts INTEGER, be_moved INTEGER DEFAULT 0,
-  exit_reason TEXT, pnl REAL, r_mult REAL, sl_source TEXT, sl_order_id TEXT, exchange TEXT
+  exit_reason TEXT, pnl REAL, r_mult REAL, sl_source TEXT, sl_order_id TEXT, exchange TEXT, chase_to REAL
 );
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -34,6 +34,7 @@ TRADE_FIELDS = {
     "entry_kind", "entry_price", "qty", "remaining", "sl", "soft_sl", "tps", "leverage", "risk_usdt",
     "realized", "order_id", "created_at", "opened_at", "closed_at", "expires_at",
     "last_candle_ts", "be_moved", "exit_reason", "pnl", "r_mult", "sl_source", "sl_order_id", "exchange",
+    "chase_to",   # 挂单开仓：没成交的部分改市价时，能接受的最差价格
 }
 ACTIVE = ("pending", "open")
 
@@ -45,7 +46,8 @@ class DB:
         self.conn.executescript(SCHEMA)
         # 旧版数据库升级：补上新加的列
         for table, col, typ in (("trades", "sl_source", "TEXT"), ("trades", "sl_order_id", "TEXT"),
-                                ("trades", "exchange", "TEXT"), ("messages", "has_image", "INTEGER DEFAULT 0")):
+                                ("trades", "exchange", "TEXT"), ("trades", "chase_to", "REAL"),
+                                ("messages", "has_image", "INTEGER DEFAULT 0")):
             if col not in {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
         self.conn.commit()

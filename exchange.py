@@ -6,7 +6,9 @@
     Bitget：开仓单自带止损（preset stop loss）
     Gate / WEEX：持仓出现后另挂一张「平掉整个仓位」的止损触发单（place_sl），
           平仓时由 engine 撤掉（cancel_sl）
-- 交易所里不挂止盈限价单（会冻结仓位），止盈由 engine 盯盘后用「只减仓」市价单执行
+- 止盈：默认由 engine 盯盘后用「只减仓」市价单执行（有的交易所挂着的止盈限价单会冻结仓位，导致止损平不掉）。
+  WEEX 在 /weextest 实测过「挂着止盈单时止损照样能平掉整个仓位」之后，开仓和止盈改用挂单（maker，手续费低），
+  止损永远是市价
 - 数量一律用币本位（BTC 个数）；Gate 按张下单，这里负责换算
 """
 from __future__ import annotations
@@ -237,6 +239,53 @@ class Exchange:
                 return p
         return None
 
+    # ---------------- 挂单（maker）----------------
+    @property
+    def maker_capable(self) -> bool:
+        """会用挂单（maker）开仓、止盈的交易所。目前只有 WEEX（/weextest 里实测挂单流程）。"""
+        return self.name == "weex"
+
+    def fees(self, symbol: str) -> tuple[float | None, float | None]:
+        """交易所公布的这个币的（挂单 maker, 吃单 taker）手续费率；查不到的是 None。
+        WEEX 吃单 0.08%，挂单大多 0.02%（少数币 0.03%～0.08%）。"""
+        m = (self.ex.markets or {}).get(symbol) or {}
+        return tuple(float(m[k]) if m.get(k) is not None else None for k in ("maker", "taker"))
+
+    async def quote(self, symbol: str) -> tuple[float, float] | None:
+        """盘口最好的买价、卖价（买一、卖一）；盘口是空的返回 None。"""
+        ob = await self.ex.fetch_order_book(symbol, 5)
+        if not ob.get("bids") or not ob.get("asks"):
+            return None
+        return float(ob["bids"][0][0]), float(ob["asks"][0][0])
+
+    def price_step(self, symbol: str) -> float:
+        """最小价格变动单位。"""
+        p = (self.ex.market(symbol).get("precision") or {}).get("price")
+        if p is None:
+            return 0.0
+        return float(p) if self.ex.precisionMode == TICK_SIZE else 10 ** (-int(p))
+
+    @staticmethod
+    def _order_id(o: dict) -> str:
+        """下单结果里的单号；交易所说没成功（WEEX 有时不报错、只回 success=false）就报错。"""
+        info = o.get("info") or {}
+        if info.get("success") is False or not o.get("id"):
+            raise RuntimeError(f"下单失败：{info.get('errorCode') or ''} {info.get('errorMessage') or info.get('errorMsg') or info}")
+        return str(o["id"])
+
+    async def open_maker(self, symbol: str, side: str, qty: float, price: float) -> str:
+        """只做 maker 的限价开仓单（POST_ONLY）：挂上去会直接成交的价格，交易所会拒绝或撤掉，保证只付挂单手续费。"""
+        extra = {"timeInForce": "POST_ONLY"} if self.name == "weex" else {"postOnly": True}
+        o = await self.ex.create_order(symbol, "limit", "buy" if side == "long" else "sell",
+                                       self._amt(symbol, qty), price, self._params(extra))
+        return self._order_id(o)
+
+    async def place_tp(self, symbol: str, side: str, qty: float, price: float) -> str:
+        """挂在交易所里的止盈单：只减仓的限价单（GTC）。价格没到时挂在盘口上，成交按挂单（maker）手续费算。"""
+        o = await self.ex.create_order(symbol, "limit", "sell" if side == "long" else "buy",
+                                       self._amt(symbol, qty), price, self._params({"reduceOnly": True}))
+        return self._order_id(o)
+
     # ---------------- 下单 ----------------
     def _params(self, extra: dict | None = None) -> dict:
         p = {} if (self.uta or self.name in ("gate", "weex")) else {"marginMode": self.cfg.margin_mode}
@@ -386,12 +435,14 @@ class Exchange:
             log.info("撤单 %s %s：%s", symbol, order_id, str(e)[:120])
 
     async def order_status(self, symbol: str, order_id: str) -> dict:
+        """{status: open（还挂着）/ closed（全部成交）/ canceled / …, filled: 已成交数量（币本位）, average: 成交均价}"""
         o = await self.ex.fetch_order(order_id, symbol)
         cs = self._contract_size(symbol)
         st = o.get("status")
         if self.name == "weex" and st in ("pending", "canceling"):  # 等待生效 / 正在撤：都还算挂着
             st = "open"
-        return {"status": st, "filled": float(o.get("filled") or 0) * cs, "average": o.get("average")}
+        avg = float(o.get("average") or 0) or None
+        return {"status": st, "filled": float(o.get("filled") or 0) * cs, "average": avg}
 
     async def closed_pnl(self, symbol: str, since_ms: int) -> tuple[float | None, float | None]:
         """最近一次平仓的净盈亏（含手续费）和平仓均价；查不到返回 (None, None)。"""

@@ -363,42 +363,131 @@ async def verify_keys(name: str, values: list[str]) -> tuple[bool, str]:
         await ex.close()
 
 
-async def exchange_selftest(ex: Exchange) -> tuple[str, bool]:
-    """/gatetest、/weextest：用最小数量的 BTC（约 8U 仓位、逐仓 5 倍，手续费约 0.01U）在真实账户上实测下单流程：
+async def _wait_status(ex: Exchange, s: str, oid: str, want: tuple, tries: int = 5) -> dict:
+    """查挂单状态，等它变成 want 里的某个状态（最多约 5 秒）。"""
+    st = await ex.order_status(s, oid)
+    for _ in range(tries):
+        if st["status"] in want:
+            break
+        await asyncio.sleep(1)
+        st = await ex.order_status(s, oid)
+    return st
+
+
+async def _maker_entry_test(ex: Exchange, s: str, qty: float, lines: list, oids: list) -> bool:
+    """挂单开仓：远离现价的只做 maker 买单能挂上、能撤掉；会直接成交的只做 maker 买单不会按市价成交。"""
+    bid, ask = await ex.quote(s)
+    oid = await ex.open_maker(s, "long", qty, bid * 0.98)
+    oids.append(oid)
+    st = await _wait_status(ex, s, oid, ("open",))
+    await ex.cancel(s, oid)
+    st2 = await _wait_status(ex, s, oid, ("canceled", "cancelled", "expired"))
+    rest = st["status"] == "open" and st["filled"] == 0 and st2["status"] != "open" and st2["filled"] == 0
+    lines.append(f"{'✅' if rest else '❌'} 挂单开仓（只做 maker，比现价低 2%）：挂上后 {st['status']}，撤单后 {st2['status']}")
+    bid, ask = await ex.quote(s)
+    try:   # 比卖一还高的买单会直接成交：只做 maker 的单子应该被交易所拒绝或马上撤掉
+        oid = await ex.open_maker(s, "long", qty, ask * 1.001)
+    except Exception as e:
+        lines.append(f"✅ 会直接成交的挂单被交易所拒绝（不会按市价成交）：{str(e)[:80]}")
+        return rest
+    oids.append(oid)
+    st = await _wait_status(ex, s, oid, ("canceled", "cancelled", "expired", "rejected", "closed"))
+    pos = (await ex.positions()).get(s)
+    taken = st["filled"] > 0 or bool(pos)
+    if st["status"] == "open":
+        await ex.cancel(s, oid)
+    if pos:
+        await ex.reduce_market(s, pos["side"], pos["size"])
+    ok = not taken and st["status"] != "open"
+    lines.append(f"✅ 会直接成交的挂单被交易所撤掉（状态 {st['status']}，没有按市价成交）" if ok else
+                 f"❌ 只做 maker 的挂单没有被拒绝：状态 {st['status']}，成交 {st['filled']:g}" + ("（已平掉）" if pos else ""))
+    return rest and ok
+
+
+async def _maker_tp_test(ex: Exchange, s: str, p: dict, sid: str, lines: list, oids: list) -> tuple[str | None, bool]:
+    """持仓 + 止损挂着的时候，挂一张止盈挂单（只减仓限价单，+3%，数量 = 整个仓位）：确认挂上了，止损单还在、还管整个仓位。"""
+    try:
+        tid = await ex.place_tp(s, "long", p["size"], p["entry"] * 1.03)
+    except Exception as e:
+        lines.append(f"❌ 止盈挂单挂不上：{str(e)[:150]}")
+        return None, False
+    oids.append(tid)
+    st = await _wait_status(ex, s, tid, ("open",))
+    sl = await ex.sl_info(s, sid)
+    ok = st["status"] == "open" and st["filled"] == 0 and sl["open"] and sl["covers"]
+    lines.append(f"{'✅' if ok else '❌'} 止盈挂单（只减仓限价单，+3%，整个仓位）：{st['status']}；止损单"
+                 + ("还在、还管整个仓位" if sl["open"] and sl["covers"] else f"出问题了（{sl['status']}，{sl['detail']}）"))
+    return tid, ok
+
+
+async def _place_trigger_sl(ex: Exchange, s: str, lines: list) -> tuple[str, int]:
+    """挂一张马上会触发的止损：先试越过现价的（条件已经满足，应该马上触发）；交易所不接受，就贴着现价（低 0.01%）挂、
+    等价格自然波动触发。返回 (单号, 最多等几轮，每轮 30 秒)。"""
+    px = await ex.last_price(s)
+    try:
+        return await ex.place_sl(s, "long", px * 1.002), 1
+    except Exception as e:
+        lines.append(f"ℹ️ 交易所不接受已越过现价的止损（{str(e)[:80]}），改挂贴着现价的等它触发")
+        return await ex.place_sl(s, "long", px * 0.9999), 6
+
+
+async def exchange_selftest(ex: Exchange) -> dict:
+    """/gatetest、/weextest：用最小数量的 BTC（约 10U 仓位、逐仓 5 倍，手续费约 0.01U）在真实账户上实测下单流程：
     开仓 → 挂止损单、查到、撤掉 → 挂一张马上满足条件的止损单，确认它真的把整个仓位平掉 → 查到这次的盈亏。
-    结束时一定清理干净。返回 (结果文字, 是否每一步都通过)。"""
+    WEEX 另外测挂单（maker）：只做 maker 的开仓单能挂能撤、会直接成交的被拒绝；持仓时挂上止盈挂单（只减仓限价单），
+    确认挂着止盈单时止损照样平掉整个仓位、止盈单没有成交。结束时一定清理干净。
+    返回 {text, ok: 基本流程全部通过, bad: 基本流程出了真错误（不是价格没碰到这种）,
+          maker: 挂单流程全部通过（不测挂单的交易所是 None）, maker_bad: 挂单流程出了真错误}"""
     s = "BTC/USDT:USDT"
     qty = ex.min_qty(s)
+    maker = ex.maker_capable
     lines = [f"🧪 {ex.label} 实盘接口测试（{qty:g} BTC）"]
+    res = {"ok": False, "bad": False, "maker": None, "maker_bad": False}
     if (await ex.positions()).get(s):
-        return "账户里已经有 BTC 仓位，为了不干扰它，测试没有进行。", False
-    since, sids, ok = int(time.time() * 1000) - 60000, [], False
+        res["text"] = "账户里已经有 BTC 仓位，为了不干扰它，测试没有进行。"
+        return res
+    since, sids, oids, sl_failed = int(time.time() * 1000) - 60000, [], [], False
+    mk = {"entry": None, "tp": None, "sl_with_tp": None, "tp_after": None} if maker else {}
     try:
         await ex.prepare(s, 5, "long")
         lines.append("✅ 设置逐仓 5 倍杠杆")
+        if maker:
+            try:
+                mk["entry"] = await _maker_entry_test(ex, s, qty, lines, oids)
+            except Exception as e:
+                lines.append(f"❌ 挂单开仓测试出错：{str(e)[:150]}")
+                mk["entry"] = False
         await ex.open_market(s, "long", qty, 0)
         p = await ex.wait_position(s)
         if not p:
-            lines.append("❌ 市价开仓后没查到持仓")
-            return "\n".join(lines), False
+            raise RuntimeError("市价开仓后没查到持仓")
         lines.append(f"✅ 市价开多 {p['size']:g} BTC @{p['entry']:g}")
         sids.append(await ex.place_sl(s, "long", p["entry"] * 0.95))
         st = await ex.sl_info(s, sids[-1])
         placed = st["open"] and st["covers"]
         lines.append(f"{'✅' if placed else '❌'} 挂止损单（-5%）：状态 {st['status']}，触发价 {st['trigger']}，{st['detail']}")
+        tid = None
+        if maker:
+            tid, mk["tp"] = await _maker_tp_test(ex, s, p, sids[-1], lines, oids)
+            if not mk["tp"] and tid:
+                await ex.cancel(s, tid)
+                tid = None
         await ex.cancel_sl(s, sids[-1])
         await asyncio.sleep(1)
         st = await ex.sl_info(s, sids[-1])
         cancelled = not st["open"]
         lines.append(f"{'✅' if cancelled else '❌'} 撤销止损单：{st['status']}")
-        px = await ex.last_price(s)
-        try:  # 触发价高于现价的多单止损 = 条件已经满足，应该马上触发
-            sids.append(await ex.place_sl(s, "long", px * 1.002))
-            rounds = 1
-        except Exception as e:  # 交易所不接受已满足条件的止损：挂一张贴着现价（低 0.01%）的，等价格自然波动触发
-            lines.append(f"ℹ️ 交易所不接受已越过现价的止损（{str(e)[:80]}），改挂贴着现价的等它触发")
-            sids.append(await ex.place_sl(s, "long", px * 0.9999))
-            rounds = 6
+        try:
+            sid, rounds = await _place_trigger_sl(ex, s, lines)
+        except Exception as e:
+            if not tid:
+                raise
+            lines.append(f"❌ 挂着止盈挂单时，止损单挂不上（{str(e)[:100]}）：止盈不能挂在交易所")
+            mk["sl_with_tp"] = False
+            await ex.cancel(s, tid)
+            tid = None
+            sid, rounds = await _place_trigger_sl(ex, s, lines)
+        sids.append(sid)
         closed = False
         for r in range(rounds):  # 每轮 30 秒；价格一直没碰到，就按最新价重挂一张更贴近的（最多 3 分钟）
             for _ in range(15):
@@ -410,22 +499,55 @@ async def exchange_selftest(ex: Exchange) -> tuple[str, bool]:
                 break
             await ex.cancel_sl(s, sids[-1])
             sids.append(await ex.place_sl(s, "long", (await ex.last_price(s)) * 0.9999))
-        lines.append("✅ 止损单触发后，整个仓位被平掉" if closed
-                     else f"⚠️ {rounds * 30} 秒内止损没有触发（价格一直没碰到），这一项没测出结果，请再测一次")
-        ok = placed and cancelled and closed
+        if closed:
+            lines.append("✅ 止损单触发后，整个仓位被平掉" + ("（挂着止盈挂单也照样平掉）" if tid else ""))
+            if tid:
+                mk["sl_with_tp"] = True
+        else:
+            left = (await ex.positions()).get(s)
+            gone = not (await ex.sl_info(s, sids[-1]))["open"]   # 最后一张止损单已经不在了 = 触发过了
+            if left and tid and (gone or left["size"] < p["size"] * 0.999):
+                lines.append(f"❌ 止损单触发了，但仓位没被全部平掉（还剩 {left['size']:g}）：挂着的止盈挂单占住了仓位，"
+                             f"止盈不能挂在交易所")
+                mk["sl_with_tp"] = False
+            elif left and gone:
+                lines.append(f"❌ 止损单触发了，但仓位还在（还剩 {left['size']:g}）")
+                sl_failed = True
+            else:
+                lines.append(f"⚠️ {rounds * 30} 秒内止损没有触发（价格一直没碰到），这一项没测出结果，请再测一次")
+        if tid and closed:   # 仓位平掉以后，止盈挂单不能成交（不能反向开仓）
+            st = await ex.order_status(s, tid)
+            if st["filled"] > 0:
+                lines.append(f"❌ 止盈挂单竟然成交了 {st['filled']:g}（价格没到，不应该成交）")
+                mk["tp_after"] = False
+            else:
+                if st["status"] == "open":
+                    await ex.cancel(s, tid)
+                lines.append("✅ 仓位平掉后，止盈挂单" + ("还挂着，已撤掉（程序平仓时也会自动撤）" if st["status"] == "open"
+                                                   else f"自动失效了（{st['status']}）") + "，没有成交")
+                mk["tp_after"] = True
+        res["ok"] = placed and cancelled and closed
+        res["bad"] = not (placed and cancelled) or sl_failed
     except Exception as e:
         lines.append(f"❌ 出错：{str(e)[:200]}")
-    finally:  # 不管上面成不成功：平掉测试仓位、撤掉测试挂的止损单
+        res["bad"] = True
+    finally:  # 不管上面成不成功：平掉测试仓位、撤掉测试挂的止损单和挂单
         pos = (await ex.positions()).get(s)
         if pos:
             await ex.reduce_market(s, pos["side"], pos["size"])
             lines.append("（收尾：已市价平掉测试仓位）")
         for sid in sids:
             await ex.cancel_sl(s, sid)
+        for oid in oids:
+            await ex.cancel(s, oid)
+    if maker:
+        res["maker"] = all(v is True for v in mk.values())
+        res["maker_bad"] = any(v is False for v in mk.values())
     await asyncio.sleep(2)
     pnl, _ = await ex.closed_pnl(s, since)
     lines.append(f"测试花费（含手续费）：{pnl:+.4f}U" if pnl is not None else "测试盈亏：暂时查询不到")
-    return "\n".join(lines), ok
+    res["text"] = "\n".join(lines)
+    return res
 
 
 MODE_CONFIRM_TTL = 300  # 「确认切到实盘」按钮 5 分钟内有效
@@ -607,16 +729,26 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
             await notifier.send("🧪 开始测试，大约 30 秒～2 分钟……")
             if temp:  # 另一个交易所：和程序正在用的账户互不影响，不用暂停盯盘
                 await ex.init()
-                text, passed = await exchange_selftest(ex)
+                r = await exchange_selftest(ex)
             else:
                 async with engine.lock:
-                    text, passed = await exchange_selftest(ex)
-            label = LABELS[name]
-            if passed:  # 记下来：这个交易所的下单流程验证过了，可以真实下单
+                    r = await exchange_selftest(ex)
+            label, text = LABELS[name], r["text"]
+            if r["maker"]:  # 挂单（maker）开仓/止盈验证过了：以后用挂单，手续费低
+                engine.db.kv_set(f"selftest_maker_ok:{name}", int(time.time()))
+            elif r["maker_bad"]:  # 挂单流程真出错了：继续用市价（止盈由程序盯盘）
+                engine.db.kv_set(f"selftest_maker_ok:{name}", None)
+            if r["maker"] is not None:
+                text += ("\n✅ 挂单测试通过：以后开仓先挂单、止盈挂在交易所（maker 手续费），止损还是市价" if r["maker"] else
+                         "\n⚠️ 挂单测试没通过：继续用市价开仓、程序盯盘止盈（不影响实盘）" if r["maker_bad"] else
+                         "\n⚠️ 挂单测试这次没测出结果，先继续用市价，请再测一次")
+            if r["ok"]:  # 记下来：这个交易所的下单流程验证过了，可以真实下单
                 engine.db.kv_set(f"selftest_ok:{name}", int(time.time()))
                 return text + (f"\n✅ 全部通过：{label} 可以实盘下单了" if not temp else f"\n✅ 全部通过：换成 {label} 后就能实盘下单")
-            if "❌" in text:  # 真出错了（不是价格没碰到这种）：在重新测通过之前不在这个交易所真实下单
+            if r["bad"]:  # 真出错了（不是价格没碰到这种）：在重新测通过之前不在这个交易所真实下单
                 engine.db.kv_set(f"selftest_ok:{name}", None)
+            elif engine.db.kv_get(f"selftest_ok:{name}"):
+                return text + f"\n这次有一项没测出结果（没有出错）；{label} 之前已经验证通过，实盘照常。可以过一会儿再测一次。"
             return text + f"\n这次没有全部通过，{label} 暂时不会真实下单。请把这条消息截图发给 Claude Code。"
         finally:
             if temp:

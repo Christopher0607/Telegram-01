@@ -183,6 +183,9 @@ def history_exchange(cfg, sim: dict):
         async def last_price(self, symbol: str) -> float | None:
             return await self.price_at(symbol, self._now())
 
+        async def quote(self, symbol: str):
+            return None   # 没有历史盘口：回测不查买卖价差
+
         async def last_prices(self, symbols: list) -> dict:
             return {s: await self.last_price(s) for s in symbols}
 
@@ -285,6 +288,7 @@ async def simulate(job_path: str, out_path: str):
                 skips[k] = skips.get(k, 0) + 1
     out = {
         "title": job["title"], "start": job["start"], "end": job["end"], "days": job["days"], "risk_pct": pct,
+        "maker": eng.maker_on("paper"),
         "messages": len(job["events"]),
         "signals": sum(1 for e in job["events"] if any(a.get("type") == "open" for a in (e["parsed"].get("actions") or []))),
         "parse_errors": sum(1 for e in job["events"] if "error" in e["parsed"]),
@@ -350,8 +354,10 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
             icon = "✅" if t["r"] > 0 else "🔴"
             lines.append(f"{icon} {datetime.fromtimestamp(t['opened_at'] / 1000, tz).strftime('%m-%d %H:%M')} "
                          f"{t['base']} {SIDE_CN.get(t['side'], '')} {t['r']:+.2f}R｜{t['reason']}")
+    fee = ("开仓、止盈按挂单手续费（假设挂单都能成交），止损按市价手续费" if res.get("maker")
+           else "手续费按市价算")
     lines.append("\n说明：用 1 分钟 K 线模拟，进场按信号那一分钟的价格，同一根 K 线碰到止损和止盈按止损算；"
-                 "没算滑点和资金费。历史表现不代表以后。")
+                 f"{fee}；没算滑点和资金费。历史表现不代表以后。")
     return "\n".join(lines)
 
 

@@ -44,6 +44,7 @@ DEFAULT_RISK = {
     "limit_order_ttl_min": 240,       # 限价单多久不成交就撤
     "max_signal_age_sec": 300,        # 超过此秒数的旧消息不处理
     "min_24h_volume_usdt": 3_000_000, # 24h 成交额低于此值的币不做
+    "max_spread_pct": 0.3,            # 买一卖一价差超过此 % 的币不做（盘口太薄，止损市价平仓会多亏）；0 = 不查
     "allowed_symbols": [],            # 为空 = 全部允许
     "blocked_symbols": [],
     "min_open_confidence": "high",
@@ -51,7 +52,7 @@ DEFAULT_RISK = {
     "follow_close": True,             # 跟随频道的平仓/减仓指令
     "follow_move_sl": True,           # 跟随频道的移动止损
     "follow_update_tp": True,         # 跟随频道的止盈更新
-    "fee_rate": 0.0006,               # 单边手续费估算（算仓位和模拟盘盈亏用）
+    "fee_rate": 0.0006,               # 单边手续费估算：交易所没公布这个币的费率时才用（算仓位和模拟盘盈亏）
 }
 
 
@@ -145,6 +146,9 @@ class Config:
         ex = raw.get("exchange") or {}
         self.exchange_name = str(ex.get("name", "bitget")).lower()   # bitget、gate 或 weex
         self.margin_mode = str(ex.get("margin_mode", "isolated")).lower()
+        # 挂单（maker）开仓和止盈：手续费比市价低；止损永远是市价。实盘要先通过 /weextest 的挂单测试才会用
+        self.maker_orders = bool(ex.get("maker_orders", False))
+        self.maker_entry_wait_sec = float(ex.get("maker_entry_wait_sec", 30))   # 开仓挂单最多等几秒，没成交的改市价
         llm = raw.get("llm") or {}
         self.llm_provider = str(llm.get("provider", "deepseek")).lower()
         self.llm_model = str(llm.get("model", "deepseek-v4-flash"))

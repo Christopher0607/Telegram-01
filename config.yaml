@@ -13,6 +13,8 @@ live_trading: true
 exchange:
   name: weex                   # gate、weex 或 bitget（实盘下单、模拟盘行情都用这个交易所）
   margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓
+  maker_orders: true           # 开仓、止盈用挂单（maker）：WEEX 挂单费 0.02%，市价 0.08%；止损永远是市价。要先通过 /weextest 的挂单测试才启用
+  maker_entry_wait_sec: 30     # 开仓挂单最多等 30 秒（盘口变了跟着改价），没成交的部分改市价；价格已经跑出可接受范围就不追
 
 llm:
   provider: deepseek           # deepseek 或 anthropic
@@ -67,9 +69,10 @@ risk:
   limit_order_ttl_min: 240     # 限价单 4 小时不成交就撤
   max_signal_age_sec: 300      # 超过 5 分钟的旧消息不处理（防止重启后补跟旧单）
   min_24h_volume_usdt: 200000  # 24h 成交额低于 20 万 U 的币不做（2026-09-27 用户要求从 300 万降到 20 万：WEEX 小币盘口厚、约每秒都有成交）
+  max_spread_pct: 0.3          # 买一卖一价差超过 0.3% 的币不做（盘口太薄，止损市价平仓会多亏；降成交额门槛时一起加的保险）
   allowed_symbols: []          # 只做这些币，例如 [BTC, ETH, SOL]；空 = 不限制
   blocked_symbols: []          # 永远不做的币
   follow_close: true           # 跟随频道的平仓/减仓指令
   follow_move_sl: true         # 跟随频道的提损/保本（只收紧，不放宽）
   follow_update_tp: true       # 跟随频道后续更新的止盈位
-  fee_rate: 0.0006             # 单边手续费估算
+  fee_rate: 0.0006             # 单边手续费估算：只在交易所没公布这个币的费率时用（WEEX 公布了：市价 0.08%，挂单大多 0.02%）
