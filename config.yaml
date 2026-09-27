@@ -66,7 +66,7 @@ risk:
   allow_limit_orders: true
   limit_order_ttl_min: 240     # 限价单 4 小时不成交就撤
   max_signal_age_sec: 300      # 超过 5 分钟的旧消息不处理（防止重启后补跟旧单）
-  min_24h_volume_usdt: 3000000 # 24h 成交额低于 300 万 U 的币不做
+  min_24h_volume_usdt: 200000  # 24h 成交额低于 20 万 U 的币不做（2026-09-27 用户要求从 300 万降到 20 万：WEEX 小币盘口厚、约每秒都有成交）
   allowed_symbols: []          # 只做这些币，例如 [BTC, ETH, SOL]；空 = 不限制
   blocked_symbols: []          # 永远不做的币
   follow_close: true           # 跟随频道的平仓/减仓指令
