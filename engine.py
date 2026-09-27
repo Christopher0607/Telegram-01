@@ -1439,7 +1439,9 @@ class Engine:
                                                     f"模拟 {self.losses_today('paper')} 单）" if ml else "不限")
                      + "；点「💰 风控设置」可以改")
         mb = self.maker_block()
-        if self.cfg.maker_orders:
+        if not self.cfg.maker_orders:
+            lines.append("📝 下单方式：全部市价（开仓、到价止盈、止损）")
+        else:
             lines.append("📝 下单方式：开仓先挂单、止盈挂在交易所（maker 手续费），止损市价" if not mb
                          else f"📝 下单方式：市价（挂单还没启用：{mb}）")
         lines.append(f"🧪 模拟盘：{'开着' if self.cfg.paper_enabled else '已停止（模拟频道不跟、不提醒）'}｜模拟权益 {self.paper_equity():.2f}U")
