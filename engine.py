@@ -38,6 +38,7 @@ HELP = ("📖 命令\n"
         "/trades  最近 10 笔已平仓交易（/trades 20 看 20 笔）\n"
         "/ai      最近 10 条频道消息的 AI 识别结果（/ai 20 看 20 条）\n"
         "/mode    每个频道切换实盘/模拟（也可以点「⚙️ 实盘/模拟」按钮）\n"
+        "/risk    每单风险（一单打到止损亏多少）：/risk 5% 按总权益比例，/risk 10u 固定金额（也可以点「💰 每单风险」按钮）\n"
         "/backtest 频道名  回测它最近 30 天按现在规则的成绩（不写频道名就给按钮选）\n"
         "/pause   暂停实盘开新仓\n"
         "/resume  恢复实盘开新仓\n"
@@ -1381,12 +1382,17 @@ class Engine:
         paused = self.paused() or (self.live_block() if self.cfg.live_trading else None)
         lines = [f"🤖 运行中｜交易所：{self.ex.label}｜实盘总开关：{'开' if self.cfg.live_trading else '关（全部模拟）'}｜实盘开新仓：{('⏸ ' + paused) if paused else '正常'}"
                  + (f"｜版本 {self.version}" if self.version else "")]
+        eq = None
         if self.ex.has_keys:
             try:
                 eq, free = await self.ex.balance()
                 lines.append(f"💰 实盘权益 {eq:.2f}U，可用 {free:.2f}U")
             except Exception as e:
                 lines.append(f"💰 实盘账户查询失败：{str(e)[:100]}")
+        pct, usdt = float(self.cfg.risk["risk_per_trade_pct"]), float(self.cfg.risk.get("risk_per_trade_usdt") or 0)
+        lines.append("🎯 每单风险：" + (f"固定 {usdt:g}U" if usdt > 0 else
+                                      f"总权益的 {pct:g}%" + (f"（实盘约 {eq * pct / 100:.1f}U）" if eq else ""))
+                     + "（打到止损亏多少，点「💰 每单风险」可以改）")
         mb = self.maker_block()
         if self.cfg.maker_orders:
             lines.append("📝 下单方式：开仓先挂单、止盈挂在交易所（maker 手续费），止损市价" if not mb

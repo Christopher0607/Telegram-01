@@ -18,6 +18,8 @@ SECRETS_PATH = os.path.join(DATA_DIR, "secrets.env")
 PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
 # 主人在机器人里（⚙️ 实盘/模拟）切换的频道模式：{频道: {"mode": live/paper, "base": 切换时 config.yaml 里的 mode}}
 MODES_PATH = os.path.join(DATA_DIR, "modes.json")
+RISK_PATH = os.path.join(DATA_DIR, "risk.json")   # 主人在机器人里调的每单风险（/risk）
+RISK_KEYS = ("risk_per_trade_pct", "risk_per_trade_usdt")
 
 # 所有风控参数的默认值（config.yaml 里写了就以 config.yaml 为准）
 DEFAULT_RISK = {
@@ -160,6 +162,10 @@ class Config:
 
         self.risk = copy.deepcopy(DEFAULT_RISK)
         self.risk.update(raw.get("risk") or {})
+        # 每单风险：config.yaml 写的是默认值，主人在机器人里调过（data/risk.json）就用调过的
+        self.risk_yaml = {k: float(self.risk.get(k) or 0) for k in RISK_KEYS}
+        self.risk_override = _load_json(RISK_PATH)
+        self._apply_risk_override()
 
         self.channels: list[ChannelCfg] = []
         for c in raw.get("channels") or []:
@@ -193,6 +199,30 @@ class Config:
         self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
         self.mode_overrides = _load_json(MODES_PATH)
+
+    def _apply_risk_override(self):
+        """机器人里调过每单风险就用调过的；之后 config.yaml 又改了每单风险，就以 config.yaml 为准（谁最后改算谁的）。"""
+        o = self.risk_override
+        use = bool(o) and o.get("base") == self.risk_yaml and all(isinstance(o.get(k), (int, float)) for k in RISK_KEYS)
+        for k in RISK_KEYS:
+            self.risk[k] = float(o[k]) if use else self.risk_yaml[k]
+
+    def risk_from_bot(self) -> bool:
+        """现在的每单风险是不是主人在机器人里调的（不是 config.yaml 的默认值）。"""
+        return any(self.risk[k] != self.risk_yaml[k] for k in RISK_KEYS)
+
+    def set_trade_risk(self, pct: float | None = None, usdt: float | None = None):
+        """机器人里调每单风险：按权益百分比（pct）或固定金额（usdt）。保存到 data/risk.json，重启后照样有效。"""
+        new = {"risk_per_trade_pct": float(self.risk["risk_per_trade_pct"] if pct is None else pct),
+               "risk_per_trade_usdt": 0.0 if usdt is None else float(usdt)}
+        if new == self.risk_yaml:
+            self.risk_override = {}   # 和 config.yaml 一样了，不用再记
+        else:
+            self.risk_override = dict(new, base=dict(self.risk_yaml), at=int(time.time()))
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(RISK_PATH, "w", encoding="utf-8") as f:
+            json.dump(self.risk_override, f, ensure_ascii=False)
+        self._apply_risk_override()
 
     def risk_for(self, ch: ChannelCfg) -> dict:
         r = copy.deepcopy(self.risk)

@@ -20,9 +20,11 @@ log = logging.getLogger("notifier")
 # 输入框下方常驻的按钮：点一下就等于发对应的命令
 BUTTON_ROWS = [["📊 状态", "📈 战绩", "📜 最近交易"],
                ["🧠 AI识别", "⏸ 暂停开仓", "▶️ 恢复开仓"],
-               ["⚙️ 实盘/模拟", "🛑 全部平仓", "📖 帮助"]]
+               ["⚙️ 实盘/模拟", "💰 每单风险", "📖 帮助"],
+               ["🛑 全部平仓"]]
 BUTTON_CMDS = {"📊 状态": "/status", "📈 战绩": "/stats", "📜 最近交易": "/trades", "🧠 AI识别": "/ai",
-               "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "⚙️ 实盘/模拟": "/mode", "📖 帮助": "/help"}
+               "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "⚙️ 实盘/模拟": "/mode", "💰 每单风险": "/risk",
+               "📖 帮助": "/help"}
 CLOSEALL_BUTTON = "🛑 全部平仓"   # 这个按钮要再点一次「确认」才执行
 CONFIRM_TTL = 300                 # 确认按钮 5 分钟内有效
 KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
@@ -30,6 +32,7 @@ KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
 # 输入框左边「菜单」里的命令（/closeall、/gatetest 会真实下单，不放进菜单，免得误点）
 MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩"), ("trades", "最近 10 笔已平仓交易"),
         ("ai", "最近 10 条频道消息的 AI 识别结果"), ("mode", "每个频道切换实盘/模拟"),
+        ("risk", "每单风险：一单打到止损亏多少"),
         ("backtest", "回测某个频道最近 30 天的成绩"),
         ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
         ("ip", "服务器 IP"), ("help", "全部命令")]
@@ -186,7 +189,7 @@ class Notifier:
         m = cq.get("message") or {}
         where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
         data = cq.get("data") or ""
-        if data.startswith(("mode:", "modeok:", "bt:")):  # 实盘/模拟面板、回测：在原消息上更新
+        if data.startswith(("mode:", "modeok:", "bt:", "risk:", "riskok:")):  # 实盘/模拟、每单风险面板、回测：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))
