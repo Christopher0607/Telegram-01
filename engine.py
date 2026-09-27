@@ -608,8 +608,12 @@ class Engine:
         if base in [str(s).upper() for s in (risk["blocked_symbols"] or [])]:
             raise Reject(f"{base} 在黑名单 blocked_symbols 里")
         symbol, scale = self.ex.resolve(base)
+        reload = getattr(self.ex, "reload_markets", None)
+        if not symbol and reload and await reload():   # 可能是刚上的币：合约列表是启动时拉的，重新拉一次再找
+            symbol, scale = self.ex.resolve(base)
         if not symbol:
-            raise Reject(f"{self.ex.label} 没有 {base} 的 USDT 永续合约")
+            raise Reject(f"{self.ex.label} 的 API 里没有 {base} 的 USDT 永续合约（App 里能看到也没用：API 不支持的币，程序下不了单；"
+                         f"以后交易所把它加进 API，程序会自动认到）")
 
         active = self.db.active_trades(mode)
         for t in active:

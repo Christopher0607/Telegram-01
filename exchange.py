@@ -63,6 +63,7 @@ class Exchange:
         self.attached_sl = self.name == "bitget"
         self.uta = False
         self._tiers: dict = {}
+        self._markets_at = time.time()
 
     async def init(self):
         await self.ex.load_markets()
@@ -89,6 +90,18 @@ class Exchange:
         await self.ex.close()
 
     # ---------------- 市场信息 ----------------
+    async def reload_markets(self, min_gap: float = 600) -> bool:
+        """重新拉一次合约列表（启动时拉的列表里没有新上的币）。10 分钟内最多一次；真的重新拉了返回 True。"""
+        if time.time() - self._markets_at < min_gap:
+            return False
+        self._markets_at = time.time()
+        try:
+            await self.ex.load_markets(True)
+            return True
+        except Exception as e:
+            log.info("重新拉合约列表失败：%s", str(e)[:120])
+            return False
+
     def resolve(self, base: str) -> tuple[str | None, float]:
         """币种 → ccxt 合约代码。有些币在交易所是 1000 倍合约（如 1000PEPE），此时价格要 ×1000；
         反过来频道写 1000PEPE、交易所只有 PEPE 时，价格要 ÷1000。"""
