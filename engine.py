@@ -29,7 +29,8 @@ CONF_RANK = {"low": 0, "medium": 1, "high": 2}
 # 有真实账户下单测试的交易所：测试全部通过（记在数据库里）之后才会真实下单
 SELFTEST = {"gate": "/gatetest", "weex": "/weextest"}
 SIDE_CN = {"long": "多", "short": "空"}
-TP_OVERRUN = 0.003   # 止盈挂单：价格冲过止盈价 0.3% 还没成交完，撤掉改市价
+TP_OVERRUN = 0.003       # 止盈挂单：价格冲过止盈价 0.3% 还没成交完，马上撤掉改市价
+TP_TOUCH_WAIT_MS = 10_000  # 止盈挂单：价格到了止盈价，挂单 10 秒还没成交完（排队没轮到），也撤掉改市价
 MODE_CN = {"live": "实盘", "paper": "模拟"}
 
 HELP = ("📖 命令\n"
@@ -867,6 +868,7 @@ class Engine:
                 continue
             try:
                 x["order_id"], x["done"] = await self.ex.place_tp(t["symbol"], t["side"], q, x["price"]), 0.0
+                x.pop("touch_at", None)
             except Exception as e:
                 x["tp_err"] = (x.get("tp_err") or 0) + 1
                 log.warning("#%s 止盈%d 挂单失败：%s", t["id"], i + 1, e)
@@ -1134,7 +1136,7 @@ class Engine:
 
     async def check_live_tps(self, t, price: float):
         """实盘止盈：价格到达止盈位 →
-        这一档挂在交易所（maker）：等挂单成交；价格已经冲过止盈价 0.3% 还没成交完，撤掉挂单、没成交的部分市价平；
+        这一档挂在交易所（maker）：等挂单成交；价格到了 10 秒还没成交完、或者已经冲过止盈价 0.3%，撤掉挂单、没成交的部分市价平；
         没挂单的：只减仓市价单平掉这一档。"""
         long = t["side"] == "long"
         tps = t["tps"]
@@ -1149,7 +1151,10 @@ class Engine:
                 if x.get("filled"):
                     continue
                 over = (price - x["price"]) / x["price"] if long else (x["price"] - price) / x["price"]
-                if over < TP_OVERRUN and self.maker_on("live"):
+                if not x.get("touch_at"):
+                    x["touch_at"] = now_ms()   # 第一次看到价格到了这一档
+                    self.db.save_trade(t)
+                if over < TP_OVERRUN and self.maker_on("live") and now_ms() - x["touch_at"] < TP_TOUCH_WAIT_MS:
                     return   # 价格刚到：挂单排队成交需要一点时间（挂单止盈关掉了就不等，马上撤单改市价）
                 if await self.sync_tp_orders(t, cancel_idx=i):   # 撤掉这一档的挂单（撤单前成交的部分照常记账）
                     return
@@ -1157,7 +1162,7 @@ class Engine:
                     continue
                 if x.get("order_id"):
                     return   # 撤单没确认（网络问题）：挂单可能还在，先不市价平，免得平两次；5 秒后再试
-                log.info("#%s 止盈%d 价格冲过 %.2f%% 挂单还没成交完，改市价", t["id"], i + 1, over * 100)
+                log.info("#%s 止盈%d 价格到了（冲过 %.2f%%）挂单还没成交完，改市价", t["id"], i + 1, over * 100)
             q = x.get("qty") or 0.0
             if i == len(tps) - 1 or q >= t["remaining"] * 0.999:
                 await self.on_close(t, 1.0, f"止盈{i + 1} 触发，全部平仓")

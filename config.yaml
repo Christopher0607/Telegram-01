@@ -13,7 +13,7 @@ live_trading: true
 exchange:
   name: weex                   # gate、weex 或 bitget（实盘下单、模拟盘行情都用这个交易所）
   margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓
-  maker_orders: false          # 开仓、止盈用挂单（maker）省手续费；止损永远是市价。2026-09-28 用户要求全部市价：WEEX 上好几单价格到了止盈价，挂单却没成交
+  maker_orders: true           # 开仓、止盈用挂单（maker）省手续费（WEEX 挂单 0.02%，市价 0.08%）；止损永远是市价。2026-09-28 改回挂单（之前没成交的几单其实是 WEEX 价格没碰到止盈价）
   maker_entry_wait_sec: 30     # 开仓挂单最多等 30 秒（盘口变了跟着改价），没成交的部分改市价；价格已经跑出可接受范围就不追
 
 llm:
