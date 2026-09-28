@@ -904,11 +904,11 @@ class Engine:
         self.db.save_trade(t)
         return got
 
-    async def sync_tp_orders(self, t: dict, cancel_idx: int | None = None) -> bool:
-        """止盈挂单有没有成交（cancel_idx：先撤掉这一档的挂单）。有成交就更新剩余仓位、按新数量重挂止损、
-        第一止盈后保本，并通知。返回 True = 仓位已经全部平掉（已经收尾）。"""
+    async def sync_tp_orders(self, t: dict, cancel_idx: int | None = None, cancel_all: bool = False) -> bool:
+        """止盈挂单有没有成交（cancel_idx：先撤掉这一档的挂单；cancel_all：全部撤掉）。有成交就更新剩余仓位、
+        按新数量重挂止损、第一止盈后保本，并通知。返回 True = 仓位已经全部平掉（已经收尾）。"""
         was = [bool(x.get("filled")) for x in t["tps"]]
-        got = await self.poll_tp_orders(t, cancel=cancel_idx is not None, only=cancel_idx)
+        got = await self.poll_tp_orders(t, cancel=cancel_all or cancel_idx is not None, only=cancel_idx)
         if got <= 0:
             return False
         p = (await self.ex.positions()).get(t["symbol"])
@@ -1149,8 +1149,8 @@ class Engine:
                 if x.get("filled"):
                     continue
                 over = (price - x["price"]) / x["price"] if long else (x["price"] - price) / x["price"]
-                if over < TP_OVERRUN:
-                    return   # 价格刚到：挂单排队成交需要一点时间
+                if over < TP_OVERRUN and self.maker_on("live"):
+                    return   # 价格刚到：挂单排队成交需要一点时间（挂单止盈关掉了就不等，马上撤单改市价）
                 if await self.sync_tp_orders(t, cancel_idx=i):   # 撤掉这一档的挂单（撤单前成交的部分照常记账）
                     return
                 if x.get("filled"):
@@ -1183,9 +1183,13 @@ class Engine:
     async def sync_open(self, t, pos):
         p = pos.get(t["symbol"])
         resting = any(x.get("order_id") for x in t["tps"])
-        if (not p or p["side"] != t["side"] or p["size"] < t["remaining"] * 0.999) and resting:
-            if await self.sync_tp_orders(t):   # 仓位变小/没了：先看是不是止盈挂单成交了（最后一档成交 = 已收尾）
+        drop = resting and not self.maker_on("live")   # 挂单止盈关掉了：撤掉交易所里的止盈单，之后到价由程序市价平
+        if resting and (drop or not p or p["side"] != t["side"] or p["size"] < t["remaining"] * 0.999):
+            if await self.sync_tp_orders(t, cancel_all=drop):   # 仓位变小/没了：先看是不是止盈挂单成交了（最后一档成交 = 已收尾）
                 return
+            if drop and not any(x.get("order_id") for x in t["tps"]):
+                await self.notify(f"ℹ️ #{t['id']} [实盘] {t['base']} 已改成市价止盈：交易所里的止盈挂单撤掉了，"
+                                  f"价格一碰到止盈价就由程序市价平")
             p = (await self.ex.positions()).get(t["symbol"])
         if not p or p["side"] != t["side"]:
             await self.finalize_live(t, "交易所止盈/止损成交")
