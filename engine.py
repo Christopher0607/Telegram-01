@@ -44,6 +44,7 @@ HELP = ("📖 命令\n"
         "/maxpos 10  同时最多几单（持仓+挂单）\n"
         "/maxloss 6  每天最多亏几单，到了当天不再开新仓（0 = 不限）\n"
         "/backtest 频道名  回测它最近 30 天按现在规则的成绩（不写频道名就给按钮选）\n"
+        "/check   逐单核对实盘单的止损、止盈（直接查交易所）\n"
         "/pause   暂停实盘开新仓\n"
         "/resume  恢复实盘开新仓\n"
         "/closeall 立即平掉本程序开的所有实盘仓位、撤挂单，并暂停\n"
@@ -84,6 +85,11 @@ class MsgCtx:
 # ====================================================================
 def fmt(x) -> str:
     return "-" if x is None else f"{float(x):.8g}"
+
+
+def trig_text(o: dict) -> str:
+    """交易所条件单（open_tpsl 的一项）→「触发价（数量）」；数量 0 = 整个仓位，不写。"""
+    return fmt(o["trigger"]) + (f"（数量 {fmt(o['qty'])}）" if o.get("qty") else "")
 
 
 def sized_sl_qty(sl_order_id) -> float | None:
@@ -393,6 +399,7 @@ class Engine:
         self.cfg, self.db, self.ex, self.parser, self.notifier = cfg, db, ex, parser, notifier
         self.lock = asyncio.Lock()
         self._err_ts: dict[str, float] = {}
+        self.sl_fixes: dict[int, int] = {}   # 每单补挂过几次交易所止损（audit_live）
         self.version = ""  # 启动时读 data/version.txt（服务器上当前运行的代码版本）
 
     # ---------------- 小工具 ----------------
@@ -1133,6 +1140,13 @@ class Engine:
             except Exception as e:
                 log.exception("核对出错")
                 await self.notify_error(f"sync{t['id']}", f"⚠️ 核对 #{t['id']} {t['base']} 出错：{str(e)[:150]}")
+        if tick % 60 == 0:   # 每 5 分钟：交易所里的止损单、止盈挂单还在不在（在 App 里被撤了就补挂）
+            for t in self.db.active_trades("live"):
+                try:
+                    for msg in await self.audit_live(t):
+                        await self.notify(msg)
+                except Exception as e:
+                    log.warning("核对 #%s 的止损止盈挂单出错：%s", t["id"], e)
 
     async def check_live_tps(self, t, price: float):
         """实盘止盈：价格到达止盈位 →
@@ -1409,6 +1423,11 @@ class Engine:
         if cmd == "/trades":
             arg = text.split()[1] if len(text.split()) > 1 else ""
             return self.trades_text(max(1, min(int(arg) if arg.isdigit() else 10, 30)))
+        if cmd == "/check":
+            if self.ex.has_keys and self.db.active_trades("live"):
+                await self.notify("🔍 正在去交易所逐单核对，稍等几秒…")
+            async with self.lock:   # 和盯盘错开：别在程序重挂止损/止盈的那一刻去查
+                return await self.check_text()
         if cmd == "/pause":
             self.set_paused("手动暂停")
             return "⏸ 已暂停实盘开新仓。模拟盘继续记录，已有持仓照常管理。/resume 恢复"
@@ -1528,6 +1547,179 @@ class Engine:
                 lines.append(f"{icon} #{t['id']} {t['base']} {SIDE_CN[t['side']]} {res}"
                              f"｜{t.get('exit_reason') or ''}｜{t['title']}｜{when}")
         return "\n".join(lines)
+
+    # ---------------- 核对交易所里的止损、止盈 ----------------
+    async def audit_live(self, t: dict) -> list[str]:
+        """核对交易所里这一单的止损单、止盈挂单还在不在（在 App 里被手动撤掉、被交易所撤掉……），不在就马上补挂。
+        止损单照 fit_sl 的做法先挂新的再撤旧的：万一是查错了，旧的那张也会被撤掉，不会变成两张。
+        同一单最多补挂 3 次（免得和在 App 里故意撤单的人来回拉锯）。返回发现并处理了什么。
+        监控每 5 分钟跑一次（结果发通知），/check 当场跑一次。"""
+        out = []
+        if t["mode"] != "live" or t["status"] != "open":
+            return out
+        sid = t.get("sl_order_id")
+        if sid and not self.ex.attached_sl:
+            info = await self.ex.sl_info(t["symbol"], sid)
+            p = None if (info["open"] and info["covers"]) else (await self.ex.positions()).get(t["symbol"])
+            if p and p["side"] == t["side"]:   # 仓位没了 = 止损刚好触发：不用补，下一轮核对收尾
+                n = self.sl_fixes[t["id"]] = self.sl_fixes.get(t["id"], 0) + 1
+                what = "数量不对" if info["open"] else "不见了"
+                if n > 3:
+                    if n == 4:
+                        out.append(f"⚠️ #{t['id']} [实盘] {t['base']} 交易所里的止损单补挂 3 次后又{what}，不再自动补挂。"
+                                   f"程序盯盘止损 {fmt(t['soft_sl'])} 照常执行；请在 {self.ex.label} App 里看一下这个仓位的止损")
+                else:
+                    try:
+                        t["sl_order_id"] = await self.ex.place_sl(t["symbol"], t["side"], t["sl"])
+                    except Exception as e:
+                        out.append(f"❌ #{t['id']} [实盘] {t['base']} 交易所里的止损单{what}，重挂失败：{str(e)[:100]}。"
+                                   f"程序盯盘止损 {fmt(t['soft_sl'])} 照常执行，5 分钟后再试；也可以在 App 里自己给这个仓位设止损")
+                    else:
+                        self.db.save_trade(t)
+                        await self.ex.cancel_sl(t["symbol"], sid)
+                        out.append(f"🛡 #{t['id']} [实盘] {t['base']} 交易所里的止损单{what}（可能在 App 里被撤了），"
+                                   f"已重新挂上：止损 {fmt(t['sl'])}")
+        if self.maker_on("live") and any(x.get("order_id") for x in t["tps"]):
+            had = [bool(x.get("order_id")) for x in t["tps"]]
+            if await self.sync_tp_orders(t):   # 止盈挂单成交、仓位已经全部平掉（已经收尾、通知过了）
+                return out
+            gone = [i for i, x in enumerate(t["tps"]) if had[i] and not x.get("order_id") and not x.get("filled")]
+            if gone:
+                await self.place_tp_orders(t)
+                again = all(t["tps"][i].get("order_id") for i in gone)
+                out.append(f"🎯 #{t['id']} [实盘] {t['base']} {'、'.join(f'止盈{i + 1}' for i in gone)} 的挂单被撤了（没成交完），"
+                           + ("已重新挂上" if again else "没挂上的到价由程序市价平"))
+        return out
+
+    async def _sl_line(self, t: dict, size: float) -> tuple[bool, list[str]]:
+        """/check 里一单的止损：(正常吗, 几行说明)。"""
+        head = f"🛑 止损 {fmt(t['sl'])}："
+        rows = []
+        if self.ex.attached_sl:
+            rows.append(head + f"✅ 跟着仓位挂在交易所（{self.ex.label}）")
+        elif size <= 0:
+            return True, [head + "一成交就马上挂到交易所"]
+        elif not t.get("sl_order_id"):
+            return False, [head + "❌ 交易所里没有止损单（程序 30 秒内补挂，挂不上会马上平仓）"]
+        else:
+            info = await self.ex.sl_info(t["symbol"], t["sl_order_id"])
+            if not info["open"]:
+                return False, [head + f"❌ 交易所里没有（{info['status']}）"]
+            if not info["covers"]:
+                return False, [head + f"⚠️ 交易所里挂着，但平不掉整个仓位（{info['detail']}）"]
+            trig = float(info["trigger"] or 0)
+            moved = trig > 0 and abs(trig - t["sl"]) > max(self.ex.price_step(t["symbol"]) or 0, abs(t["sl"]) * 1e-6)
+            rows.append(head + "✅ 在交易所挂着" + (f"（交易所里是 {fmt(trig)}，可能在 App 里改过）" if moved else ""))
+        if t["soft_sl"] != t["sl"] and t["status"] == "open":
+            rows.append(f"   程序盯盘的止损已收紧到 {fmt(t['soft_sl'])}（{'保本' if t['be_moved'] else '频道移动止损'}）："
+                        f"价格碰到由程序市价平，交易所那张留着兜底")
+        return True, rows
+
+    async def _tp_lines(self, t: dict) -> tuple[int, list[str]]:
+        """/check 里一单的止盈：(不对的有几处, 每档一行)。"""
+        if not t["tps"]:
+            return 0, ["🎯 止盈：信号没给，等频道指令（止损照常）"]
+        if t["status"] != "open":
+            return 0, [f"🎯 止盈 {' / '.join(fmt(x['price']) for x in t['tps'])}：开仓完成后再挂"]
+        bad, rows = 0, []
+        for i, x in enumerate(t["tps"]):
+            head = f"🎯 止盈{i + 1} {fmt(x['price'])}："
+            q = x.get("qty") or 0.0
+            if x.get("filled"):
+                rows.append(head + "已完成")
+            elif x.get("order_id"):
+                try:
+                    st = await self.ex.order_status(t["symbol"], x["order_id"])
+                except Exception as e:
+                    bad += 1
+                    rows.append(head + f"⚠️ 查询挂单失败：{str(e)[:80]}")
+                    continue
+                if st["status"] == "open":
+                    rows.append(head + f"✅ 挂单 {fmt(q)} 在交易所" + (f"（已成交 {fmt(st['filled'])}）" if st["filled"] else ""))
+                elif st["status"] == "closed":
+                    rows.append(head + "✅ 挂单刚成交（程序马上记账）")
+                else:
+                    bad += 1
+                    rows.append(head + f"⚠️ 挂单状态 {st['status']}（程序 5 分钟内补挂，到价也会市价平）")
+            elif q <= 0:
+                rows.append(head + "到价只把止损移到开仓价（这一档不减仓）")
+            elif not self.maker_on("live"):
+                rows.append(head + f"程序盯盘，到价市价平 {fmt(q)}")
+            elif (x.get("tp_err") or 0) >= 3:
+                rows.append(head + f"⚠️ 挂不上交易所，到价由程序市价平 {fmt(q)}")
+            else:
+                rows.append(head + f"程序盯盘，到价市价平 {fmt(q)}（30 秒内补挂到交易所）")
+        return bad, rows
+
+    async def check_text(self) -> str:
+        """/check：先跑一遍 audit_live（交易所里不见了的止损单、止盈挂单当场补挂），再逐单列出交易所里的止损、止盈；
+        最后列出不是机器人开的仓位（手动单）在交易所有没有止损、止盈条件单。不开仓、不平仓。"""
+        head = f"🔍 止损止盈核对（刚刚直接查的 {self.ex.label}）"
+        if not self.ex.has_keys:
+            return head + f"\n还没设置 {self.ex.label} API，没有实盘单。模拟单是程序自己算的，不在交易所里。"
+        fixed = []
+        for t in self.db.active_trades("live"):
+            try:
+                fixed += await self.audit_live(t)
+            except Exception as e:
+                fixed.append(f"⚠️ #{t['id']} {t['base']} 核对出错：{str(e)[:100]}")
+        trades = self.db.active_trades("live")
+        pos = await self.ex.positions()
+        body, bad, no_sl = [], 0, []
+        for t in trades:
+            p = pos.get(t["symbol"])
+            size = p["size"] if (p and p["side"] == t["side"]) else 0.0
+            body.append(f"\n#{t['id']} {t['base']} {SIDE_CN[t['side']]}｜{t['title'] or t['channel']}")
+            if t["status"] == "pending":
+                body.append("⏳ 挂单开仓中，还没成交" if size <= 0 else f"⏳ 挂单开仓中，已成交 {fmt(size)}")
+            elif size <= 0:
+                body.append("交易所里已经没有这个仓位（刚平掉？30 秒内自动收尾）")
+                continue
+            else:
+                off = abs(size - t["remaining"]) > max(size, t["remaining"]) * 0.001
+                body.append(f"仓位 {fmt(size)}｜开仓价 {fmt(t['entry_price'])}"
+                            + (f"（程序记录 {fmt(t['remaining'])}，30 秒内自动同步）" if off else ""))
+            try:
+                ok, rows = await self._sl_line(t, size)
+            except Exception as e:
+                ok, rows = False, [f"🛑 止损 {fmt(t['sl'])}：⚠️ 查询失败：{str(e)[:80]}"]
+            bad += not ok
+            n, tp_rows = await self._tp_lines(t)
+            bad += n
+            body += rows + tp_rows
+        mine = {(t["symbol"], t["side"]) for t in trades}
+        others = [(s, p) for s, p in pos.items() if (s, p["side"]) not in mine]
+        if others:
+            body.append("\n不是机器人开的仓位（手动单，机器人不管它的止损止盈）：")
+        for s, p in others:
+            name = s.split("/")[0] if "/" in s else s[:-4] if s.endswith("USDT") else s   # GRAMUSDT → GRAM
+            what = f"• {name} {SIDE_CN.get(p['side'], p['side'])} {fmt(p['size'])}："
+            try:
+                orders = await self.ex.open_tpsl(s)
+            except Exception as e:
+                body.append(what + f"⚠️ 查询条件单失败：{str(e)[:80]}")
+                continue
+            if orders is None:
+                body.append(what + "请在 App 里自己确认止损止盈")
+                continue
+            orders = [o for o in orders if o["side"] in (None, p["side"])]
+            sls = [trig_text(o) for o in orders if o["kind"] == "sl"]
+            tps = [trig_text(o) for o in orders if o["kind"] == "tp"]
+            if not sls:
+                no_sl.append(name)
+            body.append(what + (f"止损 ✅ {'、'.join(sls)}" if sls else "❌ 交易所里没有止损")
+                        + (f"；止盈 {'、'.join(tps)}" if tps else "；没有止盈条件单"))
+        if not trades:
+            summary = "机器人现在没有实盘单。"
+        elif bad:
+            summary = f"❌ 有 {bad} 处不对（下面标了 ❌ / ⚠️）。程序会自动补挂；过几分钟再点一次还是这样，请截图发给 Claude Code。"
+        else:
+            summary = f"✅ 机器人开的 {len(trades)} 单实盘，交易所里都有止损；止盈见下面每一单。"
+        if no_sl:
+            summary += f"\n⚠️ 手动单 {'、'.join(no_sl)} 在交易所里没有止损，需要的话请在 App 里设。"
+        if fixed:
+            summary += "\n\n刚才核对时发现并处理了：\n" + "\n".join(fixed)
+        return "\n".join([head, summary] + body)
 
     def void_paper(self) -> int:
         """停止模拟盘：还开着的模拟单（持仓、挂单）全部作废，不计入战绩。返回作废了几笔。"""

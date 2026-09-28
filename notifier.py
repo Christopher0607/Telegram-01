@@ -21,11 +21,11 @@ log = logging.getLogger("notifier")
 BUTTON_ROWS = [["📊 状态", "📈 战绩", "📜 最近交易"],
                ["🧠 AI识别", "⏸ 暂停开仓", "▶️ 恢复开仓"],
                ["⚙️ 实盘/模拟", "💰 风控设置", "📖 帮助"],
-               ["🛑 全部平仓"]]
+               ["🔍 核对止损止盈", "🛑 全部平仓"]]
 BUTTON_CMDS = {"📊 状态": "/status", "📈 战绩": "/stats", "📜 最近交易": "/trades", "🧠 AI识别": "/ai",
                "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "⚙️ 实盘/模拟": "/mode", "💰 风控设置": "/risk",
                "💰 每单风险": "/risk",   # 旧按钮名（还没刷新按钮的时候也能用）
-               "📖 帮助": "/help"}
+               "🔍 核对止损止盈": "/check", "📖 帮助": "/help"}
 CLOSEALL_BUTTON = "🛑 全部平仓"   # 这个按钮要再点一次「确认」才执行
 CONFIRM_TTL = 300                 # 确认按钮 5 分钟内有效
 KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
@@ -34,6 +34,7 @@ KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
 MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩"), ("trades", "最近 10 笔已平仓交易"),
         ("ai", "最近 10 条频道消息的 AI 识别结果"), ("mode", "每个频道切换实盘/模拟"),
         ("risk", "风控设置：每单风险、同时最多几单、每天最多亏几单"),
+        ("check", "核对实盘单的止损、止盈（直接查交易所）"),
         ("backtest", "回测某个频道最近 30 天的成绩"),
         ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
         ("ip", "服务器 IP"), ("help", "全部命令")]

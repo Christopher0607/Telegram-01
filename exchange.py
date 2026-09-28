@@ -435,6 +435,24 @@ class Exchange:
         return {"open": o.get("status") == "open", "covers": True, "status": o.get("status"), "trigger": trig.get("price"),
                 "detail": f"规则 {trig.get('rule')}（2 = 价格≤触发价，1 = 价格≥触发价）"}
 
+    async def open_tpsl(self, symbol: str) -> list[dict] | None:
+        """这个币在交易所挂着的条件单（止损、止盈，包括在 App 里给仓位设的），/check 查手动单用：
+        [{"kind": "sl" / "tp" / "?", "trigger": 触发价, "qty": 数量（0 = 整个仓位）, "side": "long" / "short" / None}]。
+        symbol 可以是 API 里没有的合约代码（比如 GRAMUSDT）。目前只支持 WEEX，别的交易所返回 None。"""
+        if self.name != "weex":
+            return None
+        mid = self.ex.markets[symbol]["id"] if symbol in (self.ex.markets or {}) else symbol
+        out = []
+        for o in await self.ex.contractPrivateGetCapiV3OpenAlgoOrders({"symbol": mid}) or []:
+            if str(o.get("algoStatus")) not in WEEX_OPEN_SL:
+                continue
+            typ = str(o.get("orderType") or "")
+            out.append({"kind": "tp" if typ.startswith("TAKE_PROFIT") else "sl" if "STOP" in typ else "?",
+                        "trigger": float(o.get("triggerPrice") or 0),
+                        "qty": 0.0 if o.get("closePosition") else float(o.get("quantity") or 0),
+                        "side": {"LONG": "long", "SHORT": "short"}.get(str(o.get("positionSide")).upper())})
+        return out
+
     async def reduce_market(self, symbol: str, side: str, qty: float):
         return await self.ex.create_order(symbol, "market", "sell" if side == "long" else "buy",
                                           self._amt(symbol, qty), None, self._params({"reduceOnly": True}))
