@@ -45,6 +45,8 @@ channels:
     mode: paper
     # overrides:               # 任何风控参数都能按频道单独设置，例如这个频道的无止损单不跟：
     #   fallback_sl_mode: off
+  - username: zishenlaotu      # 糊糊圖圖來炒幣（2026-09-28 加）：免费单只给方向和进场价（止损写「私信助理」），止损由程序按波动率补、止盈按 2R
+    mode: paper
 
 risk:
   # 每单风险、同时最多几单、每天最多亏几单，也可以在机器人里调（「💰 风控设置」按钮 / /risk），保存在服务器上；谁最后改算谁的
