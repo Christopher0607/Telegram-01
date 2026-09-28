@@ -14,7 +14,8 @@
 完成后，机器人会发「🚀 信号跟单已启动」。之后你只需要看通知和每晚的日报。
 想改参数或开实盘，跟 Claude Code 说一声：它改完提交到 GitHub，服务器会在 5 分钟内自动更新。
 
-交易所现在用 WEEX（`config.yaml` 里 `exchange.name: weex`；也支持 `gate`、`bitget`）。WEEX 的 API 用 `/weex KEY SECRET PASSPHRASE` 设置、`/weextest` 实测，换交易所前可以先测。Gate API：给机器人发 `/ip` 拿到服务器 IP，在 Gate 建子账户 API（只给「合约」读写权限、不给提现、IP 白名单填这个 IP），然后发 `/gate KEY SECRET` 给机器人。机器人验证通过后才会保存，并会删掉你这条消息。第一次开实盘前发一次 `/gatetest`：用 1 张 BTC 合约（约 8U，花费约 0.01U）实测开仓、挂止损、止损触发平仓。
+交易所现在用 Gate（`config.yaml` 里 `exchange.name: gate`；也支持 `weex`、`bitget`）。WEEX 的 API 用 `/weex KEY SECRET PASSPHRASE` 设置、`/weextest` 实测，换交易所前可以先测。
+换交易所时，旧交易所上还没平完的实盘单不用先平掉：只要旧交易所的 API 还在，程序会继续在旧交易所管到平仓（止损、止盈、保本、跟频道平仓、「🔍 核对止损止盈」都照常），新单在新交易所开；「📊 状态」里会多一行「🔚 旧交易所（收尾）」。Gate API：给机器人发 `/ip` 拿到服务器 IP，在 Gate 建子账户 API（只给「合约」读写权限、不给提现、IP 白名单填这个 IP），然后发 `/gate KEY SECRET` 给机器人。机器人验证通过后才会保存，并会删掉你这条消息。第一次开实盘前发一次 `/gatetest`：用 1 张 BTC 合约（约 8U，花费约 0.01U）实测开仓、挂止损、止损触发平仓。
 
 下面是有电脑、能 SSH 时的手动部署步骤，用手机部署不用看。
 

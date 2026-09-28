@@ -1212,6 +1212,24 @@ async def init_exchange(ex: Exchange, notifier: Notifier):
             await asyncio.sleep(60)
 
 
+async def attach_old_exchanges(engine: Engine, cfg: Config, notifier: Notifier):
+    """换了交易所以后，旧交易所上还开着的实盘单：有旧交易所的 API 就接着用它管到平仓（engine.others），新单在新交易所开。
+    连不上也照样接上（ccxt 下次调用时会自己再拉合约列表），免得因为一时连不上就把单子丢下不管。"""
+    names = {t.get("exchange") for t in engine.db.active_trades("live")} - {None, engine.ex.name}
+    for name in sorted(n for n in names if n in LABELS):
+        x = Exchange(cfg, name)
+        if not x.has_keys:   # 没有旧交易所的 API：adopt_exchange 会提醒主人自己去 App 处理
+            await x.close()
+            continue
+        try:
+            await x.init()
+        except Exception as e:
+            log.exception("连接 %s 失败", x.label)
+            await notifier.send(f"⚠️ 连不上 {x.label}（那边还有没平完的实盘单）：{str(e)[:150]}\n程序会一直重试，"
+                                f"如果之后一直出现「{x.label}（收尾中）持仓监控出错」，请把消息发给 Claude Code。")
+        engine.others[name] = x
+
+
 async def cmd_run(cfg: Config):
     db = DB(os.path.join(DATA_DIR, "trader.db"))
     ex = Exchange(cfg)
@@ -1237,7 +1255,8 @@ async def cmd_run(cfg: Config):
     await init_exchange(ex, notifier)  # 放在绑定和登录之后：连不上交易所时也能通过机器人告诉你
     parser = SignalParser(cfg)
     engine = Engine(cfg, db, ex, parser, notifier)
-    await engine.adopt_exchange()  # 换了交易所：旧交易所的实盘单提醒主人处理
+    await attach_old_exchanges(engine, cfg, notifier)   # 换了交易所：旧交易所上没平完的实盘单接着管到平仓
+    await engine.adopt_exchange()  # 旧交易所没有 API 的实盘单提醒主人处理
     chans = await resolve_channels(client, cfg, join=True)
     if not chans:
         sys.exit("❌ 没有可监听的频道，检查 config.yaml")
@@ -1310,6 +1329,8 @@ async def cmd_run(cfg: Config):
         for t in tasks:
             t.cancel()
         await ex.close()
+        for x in engine.others.values():
+            await x.close()
         await parser.close()
         await notifier.close()
 

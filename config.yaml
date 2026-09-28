@@ -8,12 +8,13 @@
 # 再把那个频道的 mode 改成 live，并把这里改成 true。
 # 2026-09-26：实盘跟 UMIE 和会员群；其他 3 个频道回到模拟继续记录。
 # 同日换到 WEEX：/weextest 全部通过之前程序不会在 WEEX 真实下单（代码里有检查）。
+# 2026-09-28 换回 Gate（手续费低）：新单在 Gate 开，WEEX 上没平完的单子程序继续在 WEEX 管到平仓。
 live_trading: true
 
 exchange:
-  name: weex                   # gate、weex 或 bitget（实盘下单、模拟盘行情都用这个交易所）
+  name: gate                   # gate、weex 或 bitget（新开的实盘单、模拟盘行情都用这个交易所；旧交易所没平完的单子继续在旧交易所管）
   margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓
-  maker_orders: true           # 开仓、止盈用挂单（maker）省手续费（WEEX 挂单 0.02%，市价 0.08%）；止损永远是市价。2026-09-28 改回挂单（之前没成交的几单其实是 WEEX 价格没碰到止盈价）
+  maker_orders: true           # 开仓、止盈用挂单（maker）省手续费（WEEX 挂单 0.02%，市价 0.08%）；止损永远是市价。现在只有 WEEX 支持，Gate 上全部市价（0.05%）
   maker_entry_wait_sec: 30     # 开仓挂单最多等 30 秒（盘口变了跟着改价），没成交的部分改市价；价格已经跑出可接受范围就不追
 
 llm:
