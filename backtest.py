@@ -25,6 +25,7 @@ from config import BASE_DIR, DATA_DIR, Config
 
 log = logging.getLogger("backtest")
 MIN, HOUR, DAY = 60_000, 3_600_000, 86_400_000
+GATE_1M_KEEP = 9_600 * MIN   # Gate 只给最近 1 万根 1 分钟 K 线（约 6.9 天）；留点余量，更早的换别的交易所的行情
 BT_DIR = os.path.join(DATA_DIR, "backtest")
 SIDE_CN = {"long": "多", "short": "空"}
 _running: set[str] = set()
@@ -80,7 +81,8 @@ async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send) -> 
         finally:
             await parser.close()
         n_err = sum(1 for e in events if "error" in e["parsed"])
-        await send(f"🧠 识别完了 {len(events)} 条（{n_err} 条识别失败），正在用历史行情一单单模拟……")
+        await send(f"🧠 识别完了 {len(events)} 条（{n_err} 条识别失败），正在用历史行情一单单模拟"
+                   f"（还会换成以前的规则再跑一遍做对比）……")
         os.makedirs(BT_DIR, exist_ok=True)
         job_path = os.path.join(BT_DIR, f"{ch.username}.json")
         out_path = os.path.join(BT_DIR, f"{ch.username}.result.json")
@@ -121,6 +123,29 @@ def history_exchange(cfg, sim: dict):
                 self.ex.rateLimit = 6   # ccxt 按 25 的额度算历史 K 线（实际只算 5），调快一点，还远低于每 10 秒 500 的上限
             self._blocks: dict = {}
             self._sem = asyncio.Semaphore(4)
+            self._old = None            # 更早的 1 分钟 K 线从哪个交易所拿（见 _source）
+            self._old_lock = asyncio.Lock()
+            self.old_used = ""          # 用过的话记下交易所名字，报告里说明
+
+        async def _source(self, symbol: str, tf: str, start: int):
+            """这段 K 线从哪个交易所拿。Gate 只保留最近 1 万根 K 线（1 分钟的约 7 天），更早的 1 分钟 K 线改用 WEEX 的
+            公开行情（同一个币两边价格一般只差 0.1% 左右）。WEEX 没有这个合约就返回 None（这段没有行情）。"""
+            if self.name != "gate" or tf != "1m" or start >= self._now_real() - GATE_1M_KEEP:
+                return self
+            async with self._old_lock:
+                if self._old is None:
+                    self._old = Exchange(cfg, "weex")
+                    self._old.ex.rateLimit = 6
+                    await self._old.init()
+            if symbol not in (self._old.ex.markets or {}):
+                return None
+            self.old_used = self._old.label
+            return self._old
+
+        async def close(self):
+            await super().close()
+            if self._old:
+                await self._old.close()
 
         def _now(self) -> int:
             return int(sim["now"] * 1000)
@@ -136,13 +161,20 @@ def history_exchange(cfg, sim: dict):
             until = min(start + w - 1, self._now_real())   # WEEX 的结束时间不能是将来
             if until < start:
                 return []
+            src = await self._source(symbol, tf, start)
+            if src is None:
+                return []
             async with self._sem:
                 for i in range(4):
                     try:
-                        if self.name == "weex":  # 普通 K 线接口不管 since，要用历史接口（一次最多 99 根，从 since 开始）
-                            rows = await self.ex.fetch_ohlcv(symbol, tf, start, 99, {"historical": True, "until": until})
+                        if src.name == "weex":  # 普通 K 线接口不管 since，要用历史接口（一次最多 99 根，从 since 开始）
+                            rows, s, step = [], start, 99 * (MIN if tf == "1m" else HOUR)
+                            while s <= until:
+                                rows += await src.ex.fetch_ohlcv(symbol, tf, s, 99, {"historical": True,
+                                                                                      "until": min(s + step - 1, until)}) or []
+                                s += step
                         else:
-                            rows = await self.ex.fetch_ohlcv(symbol, tf, since=start, limit=200)
+                            rows = await src.ex.fetch_ohlcv(symbol, tf, since=start, limit=200)
                         break
                     except Exception:
                         if i == 3:
@@ -177,7 +209,8 @@ def history_exchange(cfg, sim: dict):
         async def ticker(self, symbol: str) -> dict:
             now = self._now()
             hs = await self.bars(symbol, "1h", now - DAY, now - HOUR)
-            vol = sum(float(c[5]) * float(c[4]) for c in hs) * 24 / max(len(hs), 1) if hs else None
+            cs = self._contract_size(symbol)   # Gate 的 K 线成交量是「张」，要乘合约面值换成币
+            vol = sum(float(c[5]) * cs * float(c[4]) for c in hs) * 24 / max(len(hs), 1) if hs else None
             return {"last": await self.price_at(symbol, now), "quoteVolume": vol}
 
         async def last_price(self, symbol: str) -> float | None:
@@ -197,6 +230,27 @@ def history_exchange(cfg, sim: dict):
             return await self.bars(symbol, "1m", since_ms, self._now() // MIN * MIN)
 
     return HistEx()
+
+
+VARIANTS = (   # 回测时同一段行情拿来对比的规则（在现在的规则上改这几项）
+    ("只关掉「晒盈利就清仓」", {"close_on_profit_post": False}),
+    ("只关掉「进场一律市价」（挂限价等回调）", {"market_entry": False, "allow_limit_orders": True}),
+    ("以前的做法：进场挂限价等回调、晒盈利不清仓", {"market_entry": False, "allow_limit_orders": True, "close_on_profit_post": False}),
+)
+
+
+def closed_stats(rs: list) -> dict:
+    """已平仓单子（按平仓顺序）的 R → 单数、胜率 %、总 R、平均 R、最大回撤 R、最长连亏。"""
+    cum = peak = dd = 0.0
+    streak = worst = 0
+    for r in rs:
+        cum += r
+        peak, dd = max(peak, cum), min(dd, cum - peak)
+        streak = streak + 1 if r < 0 else 0
+        worst = max(worst, streak)
+    n = len(rs)
+    return {"n": n, "win": sum(1 for r in rs if r > 0) / n * 100 if n else 0.0, "total": sum(rs),
+            "avg": sum(rs) / n if n else 0.0, "dd": dd, "streak": worst}
 
 
 def skip_reason(outcome: str) -> str:
@@ -246,37 +300,60 @@ async def simulate(job_path: str, out_path: str):
         async def send(self, text, markup=None):
             return True
 
-    tmp = tempfile.mkdtemp()
-    db = DB(os.path.join(tmp, "bt.db"))
-    eng = E.Engine(cfg, db, ex, Parser(), Quiet())
+    base_risk = dict(cfg.risk)
 
-    async def advance(t: float):
-        # 有限价挂单时一分钟一分钟推进（挂单超时要按时撤）；只有持仓时一次推进到位（逐根 K 线撮合，结果一样）
-        while sim["now"] < t:
-            pending = any(x["status"] == "pending" for x in db.active_trades("paper"))
-            sim["now"] = min(t, sim["now"] + 60) if pending else t
-            await eng.monitor_paper()
+    async def one_pass(overrides: dict) -> tuple[list, list, bool]:
+        """按一套规则（在现在的风控上改 overrides 这几项）把消息从头喂一遍。返回（所有单子，每条消息的处理结果，是否挂单）。"""
+        sim["now"] = float(job["start"])
+        cfg.risk = dict(base_risk, **overrides)
+        tmp = tempfile.mkdtemp()
+        db = DB(os.path.join(tmp, "bt.db"))
+        eng = E.Engine(cfg, db, ex, Parser(), Quiet())
+
+        async def advance(t: float):
+            # 有限价挂单时一分钟一分钟推进（挂单超时要按时撤）；只有持仓时一次推进到位（逐根 K 线撮合，结果一样）
+            while sim["now"] < t:
+                pending = any(x["status"] == "pending" for x in db.active_trades("paper"))
+                sim["now"] = min(t, sim["now"] + 60) if pending else t
+                await eng.monitor_paper()
+
+        try:
+            for e in sorted(job["events"], key=lambda e: (e["ts"], e["id"])):
+                await advance(e["ts"])
+                ctx = E.MsgCtx(ch, ch.title, -1, e["id"], datetime.fromtimestamp(e["ts"], timezone.utc), e["text"],
+                               reply_to=e["reply_to"], reply_text=e["reply_text"], forwarded=e["forwarded"])
+                await eng.handle_message(ctx)
+            await advance(job["end"])
+            trades = [db._row(r) for r in db.conn.execute("SELECT * FROM trades ORDER BY id")]
+            for t in trades:   # 还没平仓的：按结束时的价格算浮动盈亏
+                if t["status"] == "open":
+                    px = await ex.last_price(t["symbol"]) or t["entry_price"]
+                    sign = 1 if t["side"] == "long" else -1
+                    pnl = (t["realized"] or 0) + sign * (px - t["entry_price"]) * t["remaining"] \
+                        - t["remaining"] * px * float(cfg.risk_for(ch)["fee_rate"])
+                    t["unrealized_r"] = pnl / t["risk_usdt"] if t["risk_usdt"] else None
+            outcomes = [r["outcome"] or "" for r in db.conn.execute("SELECT outcome FROM messages")]
+            return trades, outcomes, eng.maker_on("paper")
+        finally:
+            db.conn.close()
+            shutil.rmtree(tmp, ignore_errors=True)
 
     try:
-        for e in sorted(job["events"], key=lambda e: (e["ts"], e["id"])):
-            await advance(e["ts"])
-            ctx = E.MsgCtx(ch, ch.title, -1, e["id"], datetime.fromtimestamp(e["ts"], timezone.utc), e["text"],
-                           reply_to=e["reply_to"], reply_text=e["reply_text"], forwarded=e["forwarded"])
-            await eng.handle_message(ctx)
-        await advance(job["end"])
-        trades = [db._row(r) for r in db.conn.execute("SELECT * FROM trades ORDER BY id")]
-        for t in trades:   # 还没平仓的：按结束时的价格算浮动盈亏
-            if t["status"] == "open":
-                px = await ex.last_price(t["symbol"]) or t["entry_price"]
-                sign = 1 if t["side"] == "long" else -1
-                pnl = (t["realized"] or 0) + sign * (px - t["entry_price"]) * t["remaining"] \
-                    - t["remaining"] * px * float(cfg.risk_for(ch)["fee_rate"])
-                t["unrealized_r"] = pnl / t["risk_usdt"] if t["risk_usdt"] else None
-        outcomes = [r["outcome"] or "" for r in db.conn.execute("SELECT outcome FROM messages")]
+        trades, outcomes, maker = await one_pass({})
+        compare = []
+        now_rules = cfg.risk_for(ch)
+        if now_rules.get("market_entry") or now_rules.get("close_on_profit_post"):
+            for label, ov in VARIANTS:   # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少
+                if all(now_rules.get(k) == v for k, v in ov.items()):
+                    continue
+                tr, _, _ = await one_pass(ov)
+                compare.append(dict(label=label, opened=sum(1 for t in tr if t.get("opened_at")),
+                                    **closed_stats([t["r_mult"] for t in sorted(
+                                        (t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None),
+                                        key=lambda t: t["closed_at"])])))
+        cfg.risk = base_risk
     finally:
         await ex.close()
-        db.conn.close()
-        shutil.rmtree(tmp, ignore_errors=True)
 
     risk = cfg.risk_for(ch)
     pct = float(risk["risk_per_trade_pct"]) * ch.risk_multiplier if not float(risk.get("risk_per_trade_usdt") or 0) else None
@@ -287,9 +364,13 @@ async def simulate(job_path: str, out_path: str):
             if part.startswith("skip: "):
                 k = skip_reason(part)
                 skips[k] = skips.get(k, 0) + 1
+    errors = [p[len("error: "):] for o in outcomes for p in o.split(" | ") if p.startswith("error: ")]
     out = {
         "title": job["title"], "start": job["start"], "end": job["end"], "days": job["days"], "risk_pct": pct,
-        "maker": eng.maker_on("paper"),
+        "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
+        "old_source": ex.old_used, "compare": compare,
+        "rules_now": [label for key, label in (("market_entry", "进场一律市价"), ("close_on_profit_post", "晒盈利就清仓"))
+                      if risk.get(key)],
         "messages": len(job["events"]),
         "signals": sum(1 for e in job["events"] if any(a.get("type") == "open" for a in (e["parsed"].get("actions") or []))),
         "parse_errors": sum(1 for e in job["events"] if "error" in e["parsed"]),
@@ -321,19 +402,14 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
     lines.append(f"• 实际开单 {res['opened']} 笔" + (f"，跳过 {skipped} 个：" + "、".join(f"{k} {n}" for k, n in res["skips"][:5])
                                                    if skipped else "")
                  + (f"；另有 {res['cancelled']} 张限价单没成交" if res["cancelled"] else ""))
+    if res.get("errors"):
+        lines.append(f"• 另有 {res['errors']} 个信号没法模拟（{res.get('error_sample') or '出错'}）")
     if not rs:
         lines.append("• 这段时间没有已平仓的单子，没法统计成绩。")
     else:
-        wins = sum(1 for r in rs if r > 0)
-        cum = peak = dd = 0.0
-        streak = worst = 0
-        for r in rs:
-            cum += r
-            peak, dd = max(peak, cum), min(dd, cum - peak)
-            streak = streak + 1 if r < 0 else 0
-            worst = max(worst, streak)
-        lines.append(f"• 已平仓 {len(rs)} 单：胜率 {wins / len(rs) * 100:.0f}%，总 {sum(rs):+.1f}R，平均每单 {sum(rs) / len(rs):+.2f}R")
-        lines.append(f"• 最大回撤 {dd:.1f}R，最长连亏 {worst} 单；最好一单 {max(rs):+.1f}R，最差一单 {min(rs):+.1f}R")
+        s = closed_stats(rs)
+        lines.append(f"• 已平仓 {s['n']} 单：胜率 {s['win']:.0f}%，总 {s['total']:+.1f}R，平均每单 {s['avg']:+.2f}R")
+        lines.append(f"• 最大回撤 {s['dd']:.1f}R，最长连亏 {s['streak']} 单；最好一单 {max(rs):+.1f}R，最差一单 {min(rs):+.1f}R")
         fb = [t["r"] for t in res["closed"] if t["fallback"]]
         if fb:
             lines.append(f"• 其中信号没给止损、程序补止损的 {len(fb)} 单：总 {sum(fb):+.1f}R")
@@ -349,6 +425,13 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
     if res["open"]:
         ur = [t["r"] for t in res["open"] if t["r"] is not None]
         lines.append(f"• 还没平仓 {len(res['open'])} 单，按现价浮动 {sum(ur):+.1f}R（没算进上面的成绩）")
+    if res.get("compare"):
+        def row(st: dict) -> str:
+            return f"{st['total']:+.1f}R｜{st['avg']:+.2f}R｜{st['win']:.0f}%｜{st['dd']:.1f}R（平仓 {st['n']} 单）"
+        lines.append("\n🔁 同一段行情、同一批信号换规则对比（总 R｜平均每单｜胜率｜最大回撤）：")
+        lines.append(f"• 现在的规则（{'、'.join(res.get('rules_now') or [])}）：{row(closed_stats(rs))}")
+        for c in res["compare"]:
+            lines.append(f"• {c['label']}：{row(c)}")
     if res["closed"]:
         lines.append("\n最近的单子：")
         for t in res["closed"][-12:]:
@@ -357,8 +440,10 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
                          f"{t['base']} {SIDE_CN.get(t['side'], '')} {t['r']:+.2f}R｜{t['reason']}")
     fee = ("开仓、止盈按挂单手续费（假设挂单都能成交），止损按市价手续费" if res.get("maker")
            else "手续费按市价算")
+    old = (f"Gate 只留最近约 7 天的 1 分钟 K 线，更早的用 {res['old_source']} 的行情（同一个币两边价格一般只差 0.1% 左右）；"
+           if res.get("old_source") else "")
     lines.append("\n说明：用 1 分钟 K 线模拟，进场按信号那一分钟的价格，同一根 K 线碰到止损和止盈按止损算；"
-                 f"{fee}；没算滑点和资金费。历史表现不代表以后。")
+                 f"{old}{fee}；没算滑点和资金费。历史表现不代表以后。")
     return "\n".join(lines)
 
 
