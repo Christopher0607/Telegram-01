@@ -855,41 +855,87 @@ def find_channel(cfg: Config, word: str) -> ChannelCfg | None:
     return None
 
 
-def start_backtest(cfg: Config, ch: ChannelCfg, days: int, notifier: Notifier, client, engine: Engine | None = None) -> str:
-    """在后台跑回测（不影响实盘），进度和结果直接发给主人。先查一下现在的实盘权益：每单风险是固定金额时，
-    回测报告要用它算收益率。"""
-    name = ch.title or ch.username
-    if ch.entity is None or client is None:
-        return f"「{name}」还没连上，回测不了。"
+def start_backtest(cfg: Config, chs, days: int, notifier: Notifier, client, engine: Engine | None = None) -> str:
+    """在后台跑回测（不影响实盘），进度和结果直接发给主人。chs：一个频道，或者几个频道（当成一个账户一起回测）。
+    先查一下现在的实盘权益：每单风险是固定金额时，回测报告要用它算收益率。"""
+    chs = chs if isinstance(chs, list) else [chs]
+    name = "、".join(c.title or c.username for c in chs)
+    down = [c.title or c.username for c in chs if c.entity is None]
+    if down or client is None:
+        return f"「{'、'.join(down) or name}」还没连上，回测不了。"
 
     async def go():
         try:
             equity = await _equity(engine) if engine else None
         except Exception:   # 查权益出什么问题都不能耽误回测：报告里就只按 U 算
             equity = None
-        await backtest.run(client, cfg, ch, days, lambda m: from_admin(client, ch, m),
-                           build_ctx, SignalParser, notifier.send, equity=equity)
+        if len(chs) == 1:
+            await backtest.run(client, cfg, chs[0], days, lambda m: from_admin(client, chs[0], m),
+                               build_ctx, SignalParser, notifier.send, equity=equity)
+        else:
+            await backtest.run_many(client, cfg, chs, days, lambda c: (lambda m: from_admin(client, c, m)),
+                                    build_ctx, SignalParser, notifier.send, equity=equity)
     task = asyncio.create_task(go())
     _background.add(task)
     task.add_done_callback(_background.discard)
+    if len(chs) > 1:
+        return (f"⏳ 开始组合回测「{name}」最近 {days} 天：几个频道当成一个账户一起跑（共用同时最多几单、每天最多亏几单）。\n"
+                f"每个频道都要拉消息、AI 识别，大约 {5 * len(chs)}～{15 * len(chs)} 分钟，进度和结果会发给你，期间实盘照常跑。")
     return (f"⏳ 开始回测「{name}」最近 {days} 天：拉历史消息 → AI 识别 → 用历史行情一单单模拟。\n"
             f"大约 5～15 分钟，进度和结果会发给你，期间实盘照常跑。")
 
 
+def bt_channels(cfg: Config) -> list:
+    """回测面板上能选的频道（没关、已经连上的），顺序固定：面板按钮里的勾选状态按这个顺序记。"""
+    return [c for c in cfg.channels if c.mode != "off" and c.entity is not None]
+
+
+def backtest_panel(cfg: Config, mask: int, days: int, head: str = "") -> tuple[str, dict]:
+    """回测面板：点频道打勾（可以多选），选好点「开始回测」。选一个 = 单独回测；选几个 = 当成一个账户一起回测。
+    勾选状态放在按钮数据里（mask 的第 i 位 = 第 i 个频道），点一下就在原消息上更新。"""
+    avail = bt_channels(cfg)
+    mask &= (1 << len(avail)) - 1
+    rows = [[{"text": f"{'✅' if mask >> i & 1 else '⬜'} {c.title or c.username}（{cfg.mode_label(c)}）",
+              "callback_data": f"bts:{mask ^ (1 << i)}:{days}"}] for i, c in enumerate(avail)]
+    live = sum(1 << i for i, c in enumerate(avail) if cfg.mode_for(c) == "live")
+    rows.append([{"text": "🔴 只选实盘频道", "callback_data": f"bts:{live}:{days}"},
+                 {"text": "📦 全选", "callback_data": f"bts:{(1 << len(avail)) - 1}:{days}"}])
+    n = bin(mask).count("1")
+    rows.append([{"text": (f"▶️ 开始回测（{n} 个频道一起，最近 {days} 天）" if n > 1 else
+                           f"▶️ 开始回测（最近 {days} 天）" if n else "👆 先点上面的频道打勾"),
+                  "callback_data": f"btgo:{mask}:{days}"}])
+    text = ((head + "\n\n") if head else "") + (
+        f"📊 回测最近 {days} 天：点频道打勾（可以多选），选好点「开始回测」。\n"
+        f"• 选一个：单独看这个频道\n"
+        f"• 选几个：当成一个账户一起跑，共用同时最多几单、每天最多亏几单，同一个币已经有单就不再开，更接近实盘\n"
+        f"也可以直接发：/backtest UMIE 財財 30")
+    return text, {"inline_keyboard": rows}
+
+
+def pick_channels(cfg: Config, names: list[str]) -> list:
+    """/backtest 后面写的频道名：每个词各找一个频道（可以写好几个）；找不全就把整句当成一个名字再找一次。"""
+    found = [find_channel(cfg, n) for n in names]
+    if names and all(found):
+        out = []
+        for c in found:
+            if all(c is not x for x in out):
+                out.append(c)
+        return out
+    one = find_channel(cfg, " ".join(names))
+    return [one] if one else []
+
+
 def backtest_command(text: str, cfg: Config, notifier: Notifier, client, engine: Engine | None = None) -> str | tuple[str, dict]:
-    """/backtest [频道] [天数]：不写频道就给按钮选。"""
+    """/backtest [频道 频道 …] [天数]：不写频道就给面板选（可以多选）；写了几个频道就当成一个账户一起回测。"""
     words = text.split()[1:]
     days = next((max(1, min(int(w), 60)) for w in words if w.isdigit()), 30)
     names = [w for w in words if not w.isdigit()]
     if not names:
-        rows = [[{"text": f"📊 {c.title or c.username}（最近 {days} 天）", "callback_data": f"bt:{c.username}:{days}"}]
-                for c in cfg.channels if c.mode != "off" and c.entity is not None]
-        return (f"📊 回测：选一个频道，按你现在的规则模拟它最近 {days} 天的喊单（也可以发 /backtest 频道名 天数）",
-                {"inline_keyboard": rows})
-    ch = find_channel(cfg, " ".join(names))
-    if not ch:
+        return backtest_panel(cfg, 0, days)
+    chs = pick_channels(cfg, names)
+    if not chs:
         return f"没找到「{' '.join(names)}」，发 /backtest 从按钮里选。"
-    return start_backtest(cfg, ch, days, notifier, client, engine)
+    return start_backtest(cfg, chs, days, notifier, client, engine)
 
 
 def restart_soon():
@@ -948,10 +994,21 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
             return await risk_callback(data, cfg, engine)
         if data.startswith(("paper:", "paperok:")):
             return await paper_callback(data, cfg, engine)
-        if data.startswith("bt:"):
+        if data.startswith("bt:"):   # 旧的单个频道按钮
             parts = data.split(":")
             ch = cfg.channel_by_username(parts[1]) if len(parts) == 3 and parts[2].isdigit() else None
             return start_backtest(cfg, ch, int(parts[2]), notifier, client, engine) if ch else "找不到这个频道，按钮可能过期了。"
+        if data.startswith(("bts:", "btgo:")):   # 回测面板：打勾 / 开始
+            parts = data.split(":")
+            if len(parts) != 3 or not (parts[1].isdigit() and parts[2].isdigit()):
+                return "按钮过期了，请重新发 /backtest。"
+            mask, days = int(parts[1]), int(parts[2])
+            if data.startswith("bts:"):
+                return backtest_panel(cfg, mask, days)
+            chs = [c for i, c in enumerate(bt_channels(cfg)) if mask >> i & 1]
+            if not chs:
+                return backtest_panel(cfg, 0, days, "👆 还没选频道：先点频道打勾，再点「开始回测」")
+            return start_backtest(cfg, chs, days, notifier, client, engine)
         return await mode_callback(data, cfg, engine)
     if cmd == "/backtest":
         return backtest_command(text, cfg, notifier, client, engine)

@@ -35,7 +35,7 @@ MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩
         ("ai", "最近 10 条频道消息的 AI 识别结果"), ("mode", "每个频道切换实盘/模拟"),
         ("risk", "风控设置：每单风险、同时最多几单、每天最多亏几单"),
         ("check", "核对实盘单的止损、止盈（直接查交易所）"),
-        ("backtest", "回测某个频道最近 30 天的成绩"),
+        ("backtest", "回测频道最近 30 天的成绩（可以选几个频道一起）"),
         ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
         ("ip", "服务器 IP"), ("help", "全部命令")]
 
@@ -191,7 +191,7 @@ class Notifier:
         m = cq.get("message") or {}
         where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
         data = cq.get("data") or ""
-        if data.startswith(("mode:", "modeok:", "bt:", "risk:", "riskok:", "paper:", "paperok:")):  # 面板上的按钮：在原消息上更新
+        if data.startswith(("mode:", "modeok:", "bt:", "bts:", "btgo:", "risk:", "riskok:", "paper:", "paperok:")):  # 面板上的按钮：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))

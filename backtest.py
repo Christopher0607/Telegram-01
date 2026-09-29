@@ -67,37 +67,60 @@ async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, 
 
 
 async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send, equity: float | None = None) -> None:
-    """整个回测流程，结果用 send(文字) 发给主人。同一个频道同一时间只跑一个。
+    """一个频道的回测，结果用 send(文字) 发给主人。keep(msg)：这条消息要不要（群里只要群主/管理员的）。
     equity：现在的实盘权益（每单风险是固定金额时用它算收益率；查不到是 None）。"""
-    if ch.username in _running:
-        await send(f"「{ch.title or ch.username}」的回测已经在跑了，请等它完成。")
+    await run_many(client, cfg, [ch], days, lambda c: keep, build_ctx, parser_cls, send, equity)
+
+
+async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parser_cls, send,
+                   equity: float | None = None) -> None:
+    """几个频道当成一个账户一起回测（只有一个就是普通回测）：消息按时间混在一起喂给同一个模拟账户，
+    共用「同时最多几单」「每天最多亏几单」，同一个币已经有单就不再开——跟实盘一样。
+    keep_for(频道) → 这个频道的 keep(msg)。同一组频道同一时间只跑一个。"""
+    key = "+".join(c.username for c in chs)
+    name = "、".join(c.title or c.username for c in chs)
+    if key in _running:
+        await send(f"「{name}」的回测已经在跑了，请等它完成。")
         return
-    _running.add(ch.username)
-    name = ch.title or ch.username
+    _running.add(key)
+    multi = len(chs) > 1
     try:
         end = int(time.time()) // 60 * 60 - 120
         parser = parser_cls(cfg)
+        events = []
         try:
-            events = await collect(client, ch, days, keep, build_ctx, parser, cfg.llm_vision, send)
+            for ch in chs:
+                title = ch.title or ch.username
+
+                async def progress(t, title=title):   # 几个频道一起时，进度前面写上是哪个频道
+                    await send(t.replace("📥 ", f"📥 「{title}」", 1) if multi else t)
+                evs = await collect(client, ch, days, keep_for(ch), build_ctx, parser, cfg.llm_vision, progress)
+                for e in evs:
+                    e["ch"] = ch.username
+                events += evs
         finally:
             await parser.close()
+        events.sort(key=lambda e: e["ts"])
         n_err = sum(1 for e in events if "error" in e["parsed"])
         await send(f"🧠 识别完了 {len(events)} 条（{n_err} 条识别失败），正在用历史行情一单单模拟"
-                   f"（还会换成以前的规则再跑一遍做对比）……")
+                   + ("（几个频道当成一个账户一起跑，" if multi else "（") + "还会换成以前的规则再跑一遍做对比）……")
         os.makedirs(BT_DIR, exist_ok=True)
-        job_path = os.path.join(BT_DIR, f"{ch.username}.json")
-        out_path = os.path.join(BT_DIR, f"{ch.username}.result.json")
+        base = key if not multi else "combo-" + key
+        job_path = os.path.join(BT_DIR, f"{base}.json")
+        out_path = os.path.join(BT_DIR, f"{base}.result.json")
         with open(job_path, "w", encoding="utf-8") as f:
-            json.dump({"channel": ch.username, "title": name, "start": end - days * 86400, "end": end,
+            json.dump({"channel": chs[0].username, "title": name, "start": end - days * 86400, "end": end,
+                       "channels": [{"username": c.username, "title": c.title or c.username} for c in chs],
                        "days": days, "equity": equity, "events": events}, f, ensure_ascii=False)
         proc = await asyncio.create_subprocess_exec(
             sys.executable, os.path.abspath(__file__), "simulate", job_path, out_path, cwd=BASE_DIR,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        limit = 3600 * (2 if multi else 1)
         try:
-            _, err = await asyncio.wait_for(proc.communicate(), 3600)
+            _, err = await asyncio.wait_for(proc.communicate(), limit)
         except asyncio.TimeoutError:
             proc.kill()
-            raise RuntimeError("模拟超过 1 小时还没完成")
+            raise RuntimeError(f"模拟超过 {limit // 3600} 小时还没完成")
         if proc.returncode != 0:
             tail = (err or b"").decode(errors="replace").strip().splitlines()
             raise RuntimeError(tail[-1][:300] if tail else f"模拟进程退出码 {proc.returncode}")
@@ -107,7 +130,7 @@ async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send, equ
         log.exception("回测失败")
         await send(f"❌ 「{name}」回测失败：{str(e)[:300]}\n请把这条消息发给 Claude Code。")
     finally:
-        _running.discard(ch.username)
+        _running.discard(key)
 
 
 # ====================================================================
@@ -254,23 +277,25 @@ def closed_stats(rs: list) -> dict:
             "avg": sum(rs) / n if n else 0.0, "dd": dd, "streak": worst}
 
 
-def money(rs: list, pct: float | None, fixed: float | None, equity: float | None) -> dict:
+def money(rs: list, pct: float | None, fixed: float | None, equity: float | None, mults: list | None = None) -> dict:
     """按每单风险把一串 R（按平仓顺序）换成收益：
     每单亏总权益的 pct% → 复利算收益率；每单固定亏 fixed U → 按 U 算，知道现在的权益 equity 再换成收益率。
+    mults：每一单的风险倍数（几个频道一起回测时，各频道的 risk_multiplier）；不给就都是 1。
     返回 {"ret": 收益率, "ret_dd": 最大回撤（比例，负数）, "pnl_u": 赚了多少 U, "dd_u": 最大回撤 U}，算不出来的不给。"""
+    mults = mults or [1.0] * len(rs)
     if pct:
         eq = pk = 1.0
         mdd = 0.0
-        for r in rs:
-            eq *= 1 + pct / 100 * r
+        for r, k in zip(rs, mults):
+            eq *= 1 + pct * k / 100 * r
             pk = max(pk, eq)
             mdd = min(mdd, eq / pk - 1)
         return {"ret": eq - 1, "ret_dd": mdd}
     if not fixed:
         return {}
     cum = pk = dd_u = mdd = 0.0
-    for r in rs:
-        cum += r * fixed
+    for r, k in zip(rs, mults):
+        cum += r * fixed * k
         pk = max(pk, cum)
         dd_u = min(dd_u, cum - pk)
         if equity:
@@ -311,15 +336,23 @@ async def simulate(job_path: str, out_path: str):
     for k in ("gate_key", "gate_secret", "weex_key", "weex_secret", "weex_passphrase",
               "bitget_key", "bitget_secret", "bitget_passphrase"):
         setattr(cfg, k, "")    # 回测进程不拿交易所密钥：只用公开行情，绝不可能真实下单
-    ch = cfg.channel_by_username(job["channel"])
-    ch.title = job["title"]
+    # 几个频道一起回测：每个频道一个假的 chat_id（跟进指令只找同一个频道的单子），消息 id 按频道区分
+    chans = job.get("channels") or [{"username": job["channel"], "title": job["title"]}]
+    chmap = {}
+    for i, c in enumerate(chans):
+        cc = cfg.channel_by_username(c["username"])
+        cc.title = c["title"]
+        chmap[c["username"]] = (cc, -1 - i)
+    first = chans[0]["username"]
+    ch = chmap[first][0]
+    multi = len(chans) > 1
     ex = history_exchange(cfg, sim)
     await ex.init()
-    parsed = {str(e["id"]): e["parsed"] for e in job["events"]}
+    parsed = {(e.get("ch") or first, str(e["id"])): e["parsed"] for e in job["events"]}
 
     class Parser:
         async def parse(self, ctx):
-            r = parsed.get(str(ctx.msg_id))
+            r = parsed.get((ctx.channel.username, str(ctx.msg_id)))
             if r is None or "error" in r:
                 raise RuntimeError((r or {}).get("error", "没有识别结果"))
             return r
@@ -330,9 +363,13 @@ async def simulate(job_path: str, out_path: str):
 
     base_risk = dict(cfg.risk)
     risk0 = cfg.risk_for(ch)
-    fixed = float(risk0.get("risk_per_trade_usdt") or 0) * ch.risk_multiplier or None
-    pct = None if fixed else float(risk0["risk_per_trade_pct"]) * ch.risk_multiplier
+    unit = 1.0 if multi else ch.risk_multiplier   # 几个频道时每一单按自己频道的倍数算（mult_of）
+    fixed = float(risk0.get("risk_per_trade_usdt") or 0) * unit or None
+    pct = None if fixed else float(risk0["risk_per_trade_pct"]) * unit
     equity = job.get("equity")
+
+    def mult_of(t: dict) -> float:
+        return chmap[t["channel"]][0].risk_multiplier if multi and t.get("channel") in chmap else 1.0
 
     async def one_pass(overrides: dict) -> tuple[list, list, bool]:
         """按一套规则（在现在的风控上改 overrides 这几项）把消息从头喂一遍。返回（所有单子，每条消息的处理结果，是否挂单）。"""
@@ -352,7 +389,8 @@ async def simulate(job_path: str, out_path: str):
         try:
             for e in sorted(job["events"], key=lambda e: (e["ts"], e["id"])):
                 await advance(e["ts"])
-                ctx = E.MsgCtx(ch, ch.title, -1, e["id"], datetime.fromtimestamp(e["ts"], timezone.utc), e["text"],
+                cc, chat_id = chmap[e.get("ch") or first]
+                ctx = E.MsgCtx(cc, cc.title, chat_id, e["id"], datetime.fromtimestamp(e["ts"], timezone.utc), e["text"],
                                reply_to=e["reply_to"], reply_text=e["reply_text"], forwarded=e["forwarded"])
                 await eng.handle_message(ctx)
             await advance(job["end"])
@@ -379,10 +417,10 @@ async def simulate(job_path: str, out_path: str):
                 if all(now_rules.get(k) == v for k, v in ov.items()):
                     continue
                 tr, _, _ = await one_pass(ov)
-                rs = [t["r_mult"] for t in sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None),
-                                                  key=lambda t: t["closed_at"])]
+                done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
+                rs = [t["r_mult"] for t in done]
                 compare.append(dict(label=label, opened=sum(1 for t in tr if t.get("opened_at")),
-                                    **closed_stats(rs), **money(rs, pct, fixed, equity)))
+                                    **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done])))
         cfg.risk = base_risk
     finally:
         await ex.close()
@@ -396,9 +434,16 @@ async def simulate(job_path: str, out_path: str):
                 k = skip_reason(part)
                 skips[k] = skips.get(k, 0) + 1
     errors = [p[len("error: "):] for o in outcomes for p in o.split(" | ") if p.startswith("error: ")]
+    per_channel = []
+    for c in chans if multi else []:   # 几个频道一起时：每个频道各自的成绩
+        mine = [t for t in trades if t.get("channel") == c["username"]]
+        per_channel.append(dict(title=c["title"], opened=sum(1 for t in mine if t.get("opened_at")),
+                                **closed_stats([t["r_mult"] for t in closed if t.get("channel") == c["username"]])))
     out = {
         "title": job["title"], "start": job["start"], "end": job["end"], "days": job["days"], "risk_pct": pct,
-        "risk_usdt": fixed, "equity": equity,
+        "risk_usdt": fixed, "equity": equity, "multi": multi, "per_channel": per_channel,
+        "channels": [c["title"] for c in chans],
+        "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
         "old_source": ex.old_used, "compare": compare,
         "rules_now": [label for key, label in (("market_entry", "进场一律市价"), ("close_on_profit_post", "晒盈利就清仓"))
@@ -411,7 +456,8 @@ async def simulate(job_path: str, out_path: str):
         "skips": sorted(skips.items(), key=lambda kv: -kv[1]),
         "closed": [{"base": t["base"], "side": t["side"], "r": t["r_mult"], "reason": t.get("exit_reason") or "",
                     "opened_at": t.get("opened_at") or t["created_at"], "closed_at": t["closed_at"],
-                    "fallback": t.get("sl_source") == "fallback"} for t in closed],
+                    "fallback": t.get("sl_source") == "fallback", "mult": mult_of(t),
+                    "ch": chmap[t["channel"]][0].title if multi and t.get("channel") in chmap else ""} for t in closed],
         "open": [{"base": t["base"], "side": t["side"], "r": t.get("unrealized_r"), "opened_at": t.get("opened_at") or t["created_at"]}
                  for t in trades if t["status"] == "open"],
     }
@@ -426,8 +472,15 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
     tz = timezone(timedelta(hours=tz_hours))
     day = lambda ts: datetime.fromtimestamp(ts, tz).strftime("%m-%d")
     rs = [t["r"] for t in res["closed"]]
-    lines = [f"📊 回测：{res['title']} 最近 {res['days']} 天（{day(res['start'])} ~ {day(res['end'])}）",
-             "按你现在的规则：同一套 AI 识别、止损、分批止盈、同时最多几单都一样；1R = 一单打到止损亏的钱"]
+    mults = [t.get("mult", 1.0) for t in res["closed"]]
+    if res.get("multi"):
+        mp, ml = (res.get("limits") or [0, 0])[:2]
+        lines = [f"📊 组合回测：{' + '.join(res['channels'])} 最近 {res['days']} 天（{day(res['start'])} ~ {day(res['end'])}）",
+                 f"几个频道当成一个账户一起跑：共用「同时最多 {mp} 单」「每天最多亏 {ml or '不限'} 单」，同一个币已经有单就不再开"
+                 f"（跟实盘一样）；1R = 一单打到止损亏的钱"]
+    else:
+        lines = [f"📊 回测：{res['title']} 最近 {res['days']} 天（{day(res['start'])} ~ {day(res['end'])}）",
+                 "按你现在的规则：同一套 AI 识别、止损、分批止盈、同时最多几单都一样；1R = 一单打到止损亏的钱"]
     lines.append(f"• 要识别的消息 {res['messages']} 条，AI 认出开仓信号 {res['signals']} 个"
                  + (f"（{res['parse_errors']} 条识别失败）" if res["parse_errors"] else ""))
     skipped = sum(n for _, n in res["skips"])
@@ -445,7 +498,7 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         fb = [t["r"] for t in res["closed"] if t["fallback"]]
         if fb:
             lines.append(f"• 其中信号没给止损、程序补止损的 {len(fb)} 单：总 {sum(fb):+.1f}R")
-        m = money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"))
+        m = money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), mults)
         if res.get("risk_pct"):
             lines.append(f"💰 收益率：按每单亏总权益 {res['risk_pct']:g}% 算（复利），这段时间 {m['ret'] * 100:+.0f}%，"
                          f"中途最多回撤 {m['ret_dd'] * 100:.0f}%")
@@ -460,8 +513,12 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
     if res["open"]:
         ur = [t["r"] for t in res["open"] if t["r"] is not None]
         lines.append(f"• 还没平仓 {len(res['open'])} 单，按现价浮动 {sum(ur):+.1f}R（没算进上面的成绩）")
+    if res.get("per_channel"):
+        lines.append("\n各频道（在这个组合里实际开到的单子）：")
+        for c in res["per_channel"]:
+            lines.append(f"• {c['title']}：开 {c['opened']} 单｜平仓 {c['n']} 单｜胜率 {c['win']:.0f}%｜{c['total']:+.1f}R")
     if res.get("compare"):
-        now = {**closed_stats(rs), **money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"))}
+        now = {**closed_stats(rs), **money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), mults)}
         has_ret = now.get("ret") is not None
 
         def row(st: dict) -> str:
@@ -475,8 +532,9 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         lines.append("\n最近的单子：")
         for t in res["closed"][-12:]:
             icon = "✅" if t["r"] > 0 else "🔴"
+            src = f"{t['ch'][:6]}｜" if t.get("ch") else ""
             lines.append(f"{icon} {datetime.fromtimestamp(t['opened_at'] / 1000, tz).strftime('%m-%d %H:%M')} "
-                         f"{t['base']} {SIDE_CN.get(t['side'], '')} {t['r']:+.2f}R｜{t['reason']}")
+                         f"{src}{t['base']} {SIDE_CN.get(t['side'], '')} {t['r']:+.2f}R｜{t['reason']}")
     fee = ("开仓、止盈按挂单手续费（假设挂单都能成交），止损按市价手续费" if res.get("maker")
            else "手续费按市价算")
     old = (f"Gate 只留最近约 7 天的 1 分钟 K 线，更早的用 {res['old_source']} 的行情（同一个币两边价格一般只差 0.1% 左右）；"
