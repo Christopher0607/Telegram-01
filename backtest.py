@@ -66,8 +66,9 @@ async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, 
     return [e for e in await asyncio.gather(*(one(m) for m in kept)) if e]
 
 
-async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send) -> None:
-    """整个回测流程，结果用 send(文字) 发给主人。同一个频道同一时间只跑一个。"""
+async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send, equity: float | None = None) -> None:
+    """整个回测流程，结果用 send(文字) 发给主人。同一个频道同一时间只跑一个。
+    equity：现在的实盘权益（每单风险是固定金额时用它算收益率；查不到是 None）。"""
     if ch.username in _running:
         await send(f"「{ch.title or ch.username}」的回测已经在跑了，请等它完成。")
         return
@@ -88,7 +89,7 @@ async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send) -> 
         out_path = os.path.join(BT_DIR, f"{ch.username}.result.json")
         with open(job_path, "w", encoding="utf-8") as f:
             json.dump({"channel": ch.username, "title": name, "start": end - days * 86400, "end": end,
-                       "days": days, "events": events}, f, ensure_ascii=False)
+                       "days": days, "equity": equity, "events": events}, f, ensure_ascii=False)
         proc = await asyncio.create_subprocess_exec(
             sys.executable, os.path.abspath(__file__), "simulate", job_path, out_path, cwd=BASE_DIR,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -253,6 +254,33 @@ def closed_stats(rs: list) -> dict:
             "avg": sum(rs) / n if n else 0.0, "dd": dd, "streak": worst}
 
 
+def money(rs: list, pct: float | None, fixed: float | None, equity: float | None) -> dict:
+    """按每单风险把一串 R（按平仓顺序）换成收益：
+    每单亏总权益的 pct% → 复利算收益率；每单固定亏 fixed U → 按 U 算，知道现在的权益 equity 再换成收益率。
+    返回 {"ret": 收益率, "ret_dd": 最大回撤（比例，负数）, "pnl_u": 赚了多少 U, "dd_u": 最大回撤 U}，算不出来的不给。"""
+    if pct:
+        eq = pk = 1.0
+        mdd = 0.0
+        for r in rs:
+            eq *= 1 + pct / 100 * r
+            pk = max(pk, eq)
+            mdd = min(mdd, eq / pk - 1)
+        return {"ret": eq - 1, "ret_dd": mdd}
+    if not fixed:
+        return {}
+    cum = pk = dd_u = mdd = 0.0
+    for r in rs:
+        cum += r * fixed
+        pk = max(pk, cum)
+        dd_u = min(dd_u, cum - pk)
+        if equity:
+            mdd = min(mdd, (cum - pk) / (equity + pk))
+    out = {"pnl_u": cum, "dd_u": dd_u}
+    if equity:
+        out.update(ret=cum / equity, ret_dd=mdd)
+    return out
+
+
 def skip_reason(outcome: str) -> str:
     """把跳过原因归成几类，方便统计。"""
     r = outcome[len("skip: "):]
@@ -301,6 +329,10 @@ async def simulate(job_path: str, out_path: str):
             return True
 
     base_risk = dict(cfg.risk)
+    risk0 = cfg.risk_for(ch)
+    fixed = float(risk0.get("risk_per_trade_usdt") or 0) * ch.risk_multiplier or None
+    pct = None if fixed else float(risk0["risk_per_trade_pct"]) * ch.risk_multiplier
+    equity = job.get("equity")
 
     async def one_pass(overrides: dict) -> tuple[list, list, bool]:
         """按一套规则（在现在的风控上改 overrides 这几项）把消息从头喂一遍。返回（所有单子，每条消息的处理结果，是否挂单）。"""
@@ -347,16 +379,15 @@ async def simulate(job_path: str, out_path: str):
                 if all(now_rules.get(k) == v for k, v in ov.items()):
                     continue
                 tr, _, _ = await one_pass(ov)
+                rs = [t["r_mult"] for t in sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None),
+                                                  key=lambda t: t["closed_at"])]
                 compare.append(dict(label=label, opened=sum(1 for t in tr if t.get("opened_at")),
-                                    **closed_stats([t["r_mult"] for t in sorted(
-                                        (t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None),
-                                        key=lambda t: t["closed_at"])])))
+                                    **closed_stats(rs), **money(rs, pct, fixed, equity)))
         cfg.risk = base_risk
     finally:
         await ex.close()
 
     risk = cfg.risk_for(ch)
-    pct = float(risk["risk_per_trade_pct"]) * ch.risk_multiplier if not float(risk.get("risk_per_trade_usdt") or 0) else None
     closed = sorted((t for t in trades if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
     skips: dict = {}
     for o in outcomes:
@@ -367,6 +398,7 @@ async def simulate(job_path: str, out_path: str):
     errors = [p[len("error: "):] for o in outcomes for p in o.split(" | ") if p.startswith("error: ")]
     out = {
         "title": job["title"], "start": job["start"], "end": job["end"], "days": job["days"], "risk_pct": pct,
+        "risk_usdt": fixed, "equity": equity,
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
         "old_source": ex.old_used, "compare": compare,
         "rules_now": [label for key, label in (("market_entry", "进场一律市价"), ("close_on_profit_post", "晒盈利就清仓"))
@@ -413,23 +445,30 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         fb = [t["r"] for t in res["closed"] if t["fallback"]]
         if fb:
             lines.append(f"• 其中信号没给止损、程序补止损的 {len(fb)} 单：总 {sum(fb):+.1f}R")
-        if res["risk_pct"]:
-            eq = pk = 1.0
-            mdd = 0.0
-            for r in rs:   # 按平仓顺序复利：每单亏/赚 权益 × 风险% × R
-                eq *= 1 + res["risk_pct"] / 100 * r
-                pk = max(pk, eq)
-                mdd = min(mdd, eq / pk - 1)
-            lines.append(f"💰 按每单亏总权益 {res['risk_pct']:g}% 算（复利）：这段时间 {(eq - 1) * 100:+.0f}%，"
-                         f"中途最多回撤 {mdd * 100:.0f}%")
+        m = money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"))
+        if res.get("risk_pct"):
+            lines.append(f"💰 收益率：按每单亏总权益 {res['risk_pct']:g}% 算（复利），这段时间 {m['ret'] * 100:+.0f}%，"
+                         f"中途最多回撤 {m['ret_dd'] * 100:.0f}%")
+        elif res.get("risk_usdt"):
+            u = res["risk_usdt"]
+            if m.get("ret") is not None:
+                lines.append(f"💰 收益率：按每单固定亏 {u:g}U、现在权益 {res['equity']:.0f}U 算，这段时间 {m['ret'] * 100:+.0f}%"
+                             f"（{m['pnl_u']:+.0f}U），中途最多回撤 {m['ret_dd'] * 100:.0f}%（{m['dd_u']:.0f}U）")
+            else:
+                lines.append(f"💰 按每单固定亏 {u:g}U 算：这段时间 {m['pnl_u']:+.0f}U，中途最多回撤 {m['dd_u']:.0f}U"
+                             f"（查不到实盘权益，没法换算成百分比）")
     if res["open"]:
         ur = [t["r"] for t in res["open"] if t["r"] is not None]
         lines.append(f"• 还没平仓 {len(res['open'])} 单，按现价浮动 {sum(ur):+.1f}R（没算进上面的成绩）")
     if res.get("compare"):
+        now = {**closed_stats(rs), **money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"))}
+        has_ret = now.get("ret") is not None
+
         def row(st: dict) -> str:
-            return f"{st['total']:+.1f}R｜{st['avg']:+.2f}R｜{st['win']:.0f}%｜{st['dd']:.1f}R（平仓 {st['n']} 单）"
-        lines.append("\n🔁 同一段行情、同一批信号换规则对比（总 R｜平均每单｜胜率｜最大回撤）：")
-        lines.append(f"• 现在的规则（{'、'.join(res.get('rules_now') or [])}）：{row(closed_stats(rs))}")
+            ret = f"｜收益 {st['ret'] * 100:+.0f}%" if st.get("ret") is not None else ""
+            return f"{st['total']:+.1f}R｜{st['avg']:+.2f}R｜{st['win']:.0f}%｜{st['dd']:.1f}R{ret}（平仓 {st['n']} 单）"
+        lines.append(f"\n🔁 同一段行情、同一批信号换规则对比（总 R｜平均每单｜胜率｜最大回撤{'｜收益率' if has_ret else ''}）：")
+        lines.append(f"• 现在的规则（{'、'.join(res.get('rules_now') or [])}）：{row(now)}")
         for c in res["compare"]:
             lines.append(f"• {c['label']}：{row(c)}")
     if res["closed"]:

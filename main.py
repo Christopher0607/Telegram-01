@@ -855,20 +855,28 @@ def find_channel(cfg: Config, word: str) -> ChannelCfg | None:
     return None
 
 
-def start_backtest(cfg: Config, ch: ChannelCfg, days: int, notifier: Notifier, client) -> str:
-    """在后台跑回测（不影响实盘），进度和结果直接发给主人。"""
+def start_backtest(cfg: Config, ch: ChannelCfg, days: int, notifier: Notifier, client, engine: Engine | None = None) -> str:
+    """在后台跑回测（不影响实盘），进度和结果直接发给主人。先查一下现在的实盘权益：每单风险是固定金额时，
+    回测报告要用它算收益率。"""
     name = ch.title or ch.username
     if ch.entity is None or client is None:
         return f"「{name}」还没连上，回测不了。"
-    task = asyncio.create_task(backtest.run(client, cfg, ch, days, lambda m: from_admin(client, ch, m),
-                                            build_ctx, SignalParser, notifier.send))
+
+    async def go():
+        try:
+            equity = await _equity(engine) if engine else None
+        except Exception:   # 查权益出什么问题都不能耽误回测：报告里就只按 U 算
+            equity = None
+        await backtest.run(client, cfg, ch, days, lambda m: from_admin(client, ch, m),
+                           build_ctx, SignalParser, notifier.send, equity=equity)
+    task = asyncio.create_task(go())
     _background.add(task)
     task.add_done_callback(_background.discard)
     return (f"⏳ 开始回测「{name}」最近 {days} 天：拉历史消息 → AI 识别 → 用历史行情一单单模拟。\n"
             f"大约 5～15 分钟，进度和结果会发给你，期间实盘照常跑。")
 
 
-def backtest_command(text: str, cfg: Config, notifier: Notifier, client) -> str | tuple[str, dict]:
+def backtest_command(text: str, cfg: Config, notifier: Notifier, client, engine: Engine | None = None) -> str | tuple[str, dict]:
     """/backtest [频道] [天数]：不写频道就给按钮选。"""
     words = text.split()[1:]
     days = next((max(1, min(int(w), 60)) for w in words if w.isdigit()), 30)
@@ -881,7 +889,7 @@ def backtest_command(text: str, cfg: Config, notifier: Notifier, client) -> str 
     ch = find_channel(cfg, " ".join(names))
     if not ch:
         return f"没找到「{' '.join(names)}」，发 /backtest 从按钮里选。"
-    return start_backtest(cfg, ch, days, notifier, client)
+    return start_backtest(cfg, ch, days, notifier, client, engine)
 
 
 def restart_soon():
@@ -943,10 +951,10 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
         if data.startswith("bt:"):
             parts = data.split(":")
             ch = cfg.channel_by_username(parts[1]) if len(parts) == 3 and parts[2].isdigit() else None
-            return start_backtest(cfg, ch, int(parts[2]), notifier, client) if ch else "找不到这个频道，按钮可能过期了。"
+            return start_backtest(cfg, ch, int(parts[2]), notifier, client, engine) if ch else "找不到这个频道，按钮可能过期了。"
         return await mode_callback(data, cfg, engine)
     if cmd == "/backtest":
-        return backtest_command(text, cfg, notifier, client)
+        return backtest_command(text, cfg, notifier, client, engine)
     if cmd == "/join":
         return await join_command(text, cfg, client, restart)
     if cmd == "/ai":
