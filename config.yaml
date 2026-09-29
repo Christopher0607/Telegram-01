@@ -70,8 +70,9 @@ risk:
     3: [0.5, 0.3, 0.2]         # 3 个及以上：tp1 减 50%、tp2 减 30%、tp3 清仓（tp4 以后不管；2026-09-28 用户要求，原来 30/30/40）
   breakeven_after_tp1: true    # 第一止盈成交后，止损移到开仓价
   min_rr: 1.0                  # 按实际进场价算的盈亏比低于 1 就不开
-  chase_pct: 0.5               # 价格离开进场区 0.5% 以内仍市价进；更远就挂限价等回调
-  allow_limit_orders: true
+  chase_pct: 0.5               # 价格离开进场区 0.5% 以内仍市价进（market_entry 关掉时，更远就挂限价等回调）
+  market_entry: true           # 进场一律市价：价格离开进场区也直接市价进，不挂限价等回调；价格已经越过信号的全部止盈位就不追（2026-09-29 用户要求）
+  allow_limit_orders: false    # market_entry 关掉时：true = 挂限价等回调，false = 不追
   limit_order_ttl_min: 240     # 限价单 4 小时不成交就撤
   max_signal_age_sec: 300      # 超过 5 分钟的旧消息不处理（防止重启后补跟旧单）
   min_24h_volume_usdt: 200000  # 24h 成交额低于 20 万 U 的币不做（2026-09-27 用户要求从 300 万降到 20 万：WEEX 小币盘口厚、约每秒都有成交）
@@ -79,6 +80,7 @@ risk:
   allowed_symbols: []          # 只做这些币，例如 [BTC, ETH, SOL]；空 = 不限制
   blocked_symbols: []          # 永远不做的币
   follow_close: true           # 跟随频道的平仓/减仓指令
+  close_on_profit_post: true   # 频道一发某个币的战绩/浮盈播报（翻倍、浮盈、注意仓位、晒收益截图）就清仓止盈，不贪（2026-09-29 用户要求）
   follow_move_sl: true         # 跟随频道的提损/保本（只收紧，不放宽）
   follow_update_tp: true       # 跟随频道后续更新的止盈位
   fee_rate: 0.0006             # 单边手续费估算：只在交易所没公布这个币的费率时用（WEEX 公布了：市价 0.08%，挂单大多 0.02%）

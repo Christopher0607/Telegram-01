@@ -26,6 +26,7 @@ actions 中每一项是以下之一：
 2) 平仓/减仓 {"type":"close","symbol":"币种或null","fraction":0到1之间的数字,"confidence":"..."}
 3) 移动止损 {"type":"move_sl","symbol":"币种或null","price":数字或null,"breakeven":true或false,"confidence":"..."}
 4) 更新止盈 {"type":"update_tp","symbol":"币种或null","take_profits":[数字,...],"confidence":"..."}
+5) 战绩/浮盈播报 {"type":"profit","symbol":"币种或null","confidence":"..."}
 没有明确交易指令时输出 {"actions": [], "note": "..."}。
 
 解析规则：
@@ -39,8 +40,10 @@ actions 中每一项是以下之一：
 - 平仓：平倉/全平/出了/走了/市價止盈/清倉/離場 → fraction=1；平一半/減半/止盈一半 → 0.5；減倉30% → 0.3；只说"減倉""可止盈部分"没有比例 → 0.5。
 - 移动止损：保本/推保本/止損移到成本或開倉價 → breakeven=true；提損X/止損上移到X/止損改X → price=X。
 - 更新止盈：目標看X/止盈看X/第二止盈看X → take_profits=[X]。
+- 战绩/浮盈播报 → profit：频道在说某个币（或刚喊的那一单）已经赚钱了、或者提醒保护利润：翻倍/幾倍/浮盈/盈利X%/吃到X%/拿下利润/tp1 到了/到達/已止盈/恭喜/注意倉位/控制倉位/保護利潤，或者只发了一张收益截图 → {"type":"profit","symbol":币种或null}。
+  只要出现这些说法就一定要输出 profit；同一条消息里还有减仓/平仓/保本指令时，profit 和那些指令一起输出。回复某条喊单的消息，币种取自被回复的原消息。
 - 一条消息可以有多个 action，例如"第二止盈看0.01742 提損0.01553" → update_tp + move_sl。
-- 以下都不是交易指令（不要输出 action）：行情分析和观点（看涨/看跌/关注/想做空这个/蹲一个位置）；战绩播报（浮盈中/翻倍了/tp1止盈/到達/已止盈）；晒单、广告、会员招募、投票、提问；带条件的计划（跌破X再做空、等X再套保）。
+- 以下都不是交易指令（不要输出 action）：行情分析和观点（看涨/看跌/关注/想做空这个/蹲一个位置）；周/日复盘、胜率统计、好几个币一起的战绩汇总（如"本週52單勝率96%""今日福利單2中2"）；广告、会员招募、投票、提问；带条件的计划（跌破X再做空、等X再套保）。
 - confidence：开仓同时有明确币种、明确方向、明确开仓动作 → high；需要猜测 → medium 或 low。
 - 附带的"被回复的原消息"只用来理解上下文，不要把原消息里的开仓再输出一次。但如果当前消息是在让人对同一笔交易开仓（如"現在回彈可以市價輕倉空"），可以沿用原消息的止损和止盈。
 - 转发消息如果只是战绩/止盈播报，不是指令。
@@ -51,7 +54,7 @@ actions 中每一项是以下之一：
      - 文字是跟进指令（可止盈部分/減倉/保本/平倉）却没写币种 → 从截图读出币种填 symbol（LSKUSDT → LSK），这样才能找到对应的单子。
      - 文字明确表示现在新开了一单（如"來一筆""上車了""進場了""開單了"），并且截图是刚开的仓（目前價格和持倉均價相差不到 1%）→ 输出 open：
        symbol、side 取自截图，entry_type=market，entry_low=entry_high=持倉均價，文字没写止损就 stop_loss=null，confidence=high。
-     - 文字是战绩播报（翻倍、千趴、tp1 到了、小浮盈、已止盈）或者没有文字 → 不输出任何 action。
+     - 文字是战绩播报（翻倍、千趴、tp1 到了、小浮盈、已止盈），或者没有文字只发了收益截图 → 输出 profit，symbol 从截图读出。
 - "image" 字段：用一句话写图片内容，例如"持仓卡片：LSK 多 50x，均价 0.4260，收益 +5.86%"、"NIL 日线 K 线图，标了一条压力带"。没有图片填 ""。
 
 示例：
@@ -65,7 +68,19 @@ actions 中每一项是以下之一：
 输出：{"actions":[{"type":"update_tp","symbol":"COTI","take_profits":[0.01742],"confidence":"high"},{"type":"move_sl","symbol":"COTI","price":0.01553,"breakeven":false,"confidence":"high"}],"note":"COTI 更新止盈并上移止损"}
 
 消息："小浮盈 波動大注意控制倉位"
-输出：{"actions":[],"note":"持仓播报，非指令"}
+输出：{"actions":[{"type":"profit","symbol":null,"confidence":"high"}],"note":"浮盈播报"}
+
+消息："🔥#QNT 50x多單翻倍 當前：200.4%"
+输出：{"actions":[{"type":"profit","symbol":"QNT","confidence":"high"}],"note":"QNT 翻倍播报"}
+
+消息："BTC 浮盈30% 可以減倉一半 推保本"
+输出：{"actions":[{"type":"profit","symbol":"BTC","confidence":"high"},{"type":"close","symbol":"BTC","fraction":0.5,"confidence":"high"},{"type":"move_sl","symbol":"BTC","price":null,"breakeven":true,"confidence":"high"}],"note":"BTC 浮盈播报，减半推保本"}
+
+消息（回复原消息 "$SOL (50X做多) 進場：市價150附近 SL：145"）："注意倉位"
+输出：{"actions":[{"type":"profit","symbol":"SOL","confidence":"high"}],"note":"SOL 提醒注意仓位"}
+
+消息："📊 周策略復盤｜本週共執行 52單策略 ✅盈利：50單 🏆勝率：96%"
+输出：{"actions":[],"note":"周复盘汇总，非指令"}
 """
 
 NICKNAMES = {"大饼": "BTC", "大餅": "BTC", "饼": "BTC", "餅": "BTC", "以太": "ETH", "姨太": "ETH",
@@ -165,6 +180,8 @@ def normalize(data: dict) -> dict:
             tps = [x for x in (to_num(v) for v in (a.get("take_profits") or [])) if x]
             if tps:
                 out.append({"type": "update_tp", "symbol": sym, "take_profits": tps, "confidence": conf})
+        elif t == "profit":
+            out.append({"type": "profit", "symbol": sym, "confidence": conf})
     return {"actions": out, "note": str(data.get("note") or "")[:200], "image": str(data.get("image") or "")[:150]}
 
 

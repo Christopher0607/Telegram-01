@@ -214,6 +214,8 @@ def describe(a: dict) -> str:
         return f"移动止损 {who} → {'保本' if a['breakeven'] else fmt(a['price'])}｜{a['confidence']}"
     if t == "update_tp":
         return f"更新止盈 {who} → {'/'.join(fmt(x) for x in a['take_profits'])}｜{a['confidence']}"
+    if t == "profit":
+        return f"战绩/浮盈播报 {a.get('symbol') or '(没写币种)'}｜{a['confidence']}"
     return str(a)
 
 
@@ -238,7 +240,8 @@ def outcome_cn(outcome: str | None) -> str:
         elif p.startswith("error: "):
             out.append("执行出错：" + p[len("error: "):][:80])
         elif p:
-            out.append(p.replace("close:", "平仓：").replace("move_sl:", "移动止损：").replace("update_tp:", "更新止盈："))
+            out.append(p.replace("close:", "平仓：").replace("move_sl:", "移动止损：").replace("update_tp:", "更新止盈：")
+                       .replace("profit:", "战绩播报："))
     return "；".join(out) or "-"
 
 

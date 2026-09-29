@@ -46,6 +46,8 @@ DEFAULT_RISK = {
     "max_entry_deviation_pct": 15.0,  # 进场价与现价偏差超过此 % 视为识别错误
     "max_sl_distance_pct": 25.0,      # 止损距离超过此 % 视为识别错误
     "allow_limit_orders": True,       # 价格没到进场区时挂限价单等
+    "market_entry": False,            # 进场一律市价：价格离开进场区也直接市价进（不挂限价等回调）；价格已经越过全部止盈位的不追
+    "close_on_profit_post": False,    # 频道发某个币的战绩/浮盈播报（翻倍、浮盈、注意仓位、晒收益截图…）→ 清仓止盈
     "limit_order_ttl_min": 240,       # 限价单多久不成交就撤
     "max_signal_age_sec": 300,        # 超过此秒数的旧消息不处理
     "min_24h_volume_usdt": 3_000_000, # 24h 成交额低于此值的币不做

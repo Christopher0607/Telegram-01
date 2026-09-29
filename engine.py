@@ -210,17 +210,18 @@ def plan_entry(side, lo, hi, sl, tps, price, risk, equity, free=None, multiplier
 
     # ---- 市价还是限价 ----
     chase = float(risk["chase_pct"]) / 100
+    anyway = bool(risk.get("market_entry"))   # 进场一律市价：价格离开进场区也不挂限价等回调
     if lo is None:
         kind, entry = "market", price
     elif long:
-        if price <= hi * (1 + chase):
+        if price <= hi * (1 + chase) or anyway:
             kind, entry = "market", price
         elif risk["allow_limit_orders"]:
             kind, entry = "limit", hi
         else:
             raise Reject(f"现价 {fmt(price)} 已高于进场区 {fmt(lo)}~{fmt(hi)}，不追")
     else:
-        if price >= lo * (1 - chase):
+        if price >= lo * (1 - chase) or anyway:
             kind, entry = "market", price
         elif risk["allow_limit_orders"]:
             kind, entry = "limit", lo
@@ -242,7 +243,10 @@ def plan_entry(side, lo, hi, sl, tps, price, risk, equity, free=None, multiplier
         raise Reject(f"止损距离 {dist / entry * 100:.1f}% 过大，可能识别错误")
 
     # ---- 止盈 ----
+    given = bool(tps)
     tps = sorted({t for t in tps if (t > entry if long else t < entry)}, reverse=not long)
+    if given and not tps:
+        raise Reject(f"现价 {fmt(entry)} 已经越过信号的全部止盈位，这一波走完了，不追")
     if not tps and float(risk["fallback_tp_r"] or 0) > 0:
         r = float(risk["fallback_tp_r"])
         tps = [entry + r * dist if long else entry - r * dist]
@@ -585,6 +589,10 @@ class Engine:
             return await self.on_move_sl(t, act) if risk["follow_move_sl"] else "move_sl: 已关闭跟随"
         if act["type"] == "update_tp":
             return await self.on_update_tp(t, act, risk) if risk["follow_update_tp"] else "update_tp: 已关闭跟随"
+        if act["type"] == "profit":   # 频道晒这一单的盈利/浮盈、提醒注意仓位：不贪，清仓止盈
+            if not risk.get("close_on_profit_post"):
+                return "profit: 只是战绩播报（没打开清仓止盈）"
+            return await self.on_close(t, 1.0, "频道晒盈利/浮盈，清仓止盈")
         return "unknown"
 
     def resolve_target(self, act, ctx) -> dict | None:
@@ -600,6 +608,10 @@ class Engine:
         if sym:
             cands = [t for t in self.db.active_trades()
                      if t["chat_id"] == ctx.chat_id and coin_key(t["base"]) == coin_key(sym)]
+            if len(cands) == 1:
+                return cands[0]
+        elif act["type"] == "profit":   # 战绩播报没写币种：这个频道只有一单在做，说的就是它
+            cands = [t for t in self.db.active_trades() if t["chat_id"] == ctx.chat_id]
             if len(cands) == 1:
                 return cands[0]
         return None
