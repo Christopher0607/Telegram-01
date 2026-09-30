@@ -279,6 +279,13 @@ def plan_entry(side, lo, hi, sl, tps, price, risk, equity, free=None, multiplier
         capped = True
     if qty <= 0:
         raise Reject("可用保证金不足")
+
+    # ---- 亏到 stop_loss_r 就止损：仓位、杠杆还是按信号的止损算（1R = 打到信号止损亏的钱），止损挂近一点，一单最多亏这么多 R ----
+    cut = float(risk.get("stop_loss_r") or 1.0)
+    if 0 < cut < 0.999:
+        near = entry - cut * dist if long else entry + cut * dist
+        notes.append(f"亏到 {cut:g}R 就止损：止损挂在 {fmt(near)}（信号的止损是 {fmt(sl)}）")
+        sl = near
     return {"side": side, "kind": kind, "entry": entry, "sl": sl, "leverage": lev, "qty": qty, "lo": lo, "hi": hi,
             "tps": [{"price": t, "frac": f} for t, f in zip(tps, fracs)],
             "risk_usdt": qty * per_unit_loss, "rr": rr, "capped": capped, "notes": notes,

@@ -66,6 +66,18 @@ async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, 
     return [e for e in await asyncio.gather(*(one(m) for m in kept)) if e]
 
 
+async def send_long(send, text: str, limit: int = 3800) -> None:
+    """Telegram 一条消息最多 4096 个字，长的报告按行拆成几条发（不然后面会被截掉）。"""
+    part = ""
+    for line in text.split("\n"):
+        if part and len(part) + 1 + len(line) > limit:
+            await send(part)
+            part = ""
+        part = f"{part}\n{line}" if part else line
+    if part:
+        await send(part)
+
+
 async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send, equity: float | None = None) -> None:
     """一个频道的回测，结果用 send(文字) 发给主人。keep(msg)：这条消息要不要（群里只要群主/管理员的）。
     equity：现在的实盘权益（每单风险是固定金额时用它算收益率；查不到是 None）。"""
@@ -125,7 +137,7 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
             tail = (err or b"").decode(errors="replace").strip().splitlines()
             raise RuntimeError(tail[-1][:300] if tail else f"模拟进程退出码 {proc.returncode}")
         with open(out_path, encoding="utf-8") as f:
-            await send(report_text(json.load(f)))
+            await send_long(send, report_text(json.load(f)))
     except Exception as e:
         log.exception("回测失败")
         await send(f"❌ 「{name}」回测失败：{str(e)[:300]}\n请把这条消息发给 Claude Code。")
@@ -256,10 +268,28 @@ def history_exchange(cfg, sim: dict):
     return HistEx()
 
 
-HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的方案（跟现在一样的那个自动跳过）
-    ("新方案：晒盈利先平一半、剩下推保本", {"profit_post_close_frac": 0.5}),
-    ("晒盈利就全部平掉", {"profit_post_close_frac": 1.0}),
+HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的几种做法（跟现在一样的自动跳过）
+    ("A", {"profit_post_close_frac": 0.5, "stop_loss_r": 1.0}),
+    ("B", {"profit_post_close_frac": 1.0, "stop_loss_r": 0.5}),
+    ("A+B", {"profit_post_close_frac": 0.5, "stop_loss_r": 0.5}),
+    ("原来", {"profit_post_close_frac": 1.0, "stop_loss_r": 1.0}),
 )
+
+
+def exit_rules(r: dict) -> str:
+    """晒盈利怎么平、亏到哪里止损，写成一句话（报告里用）。"""
+    frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
+    a = ("晒盈利不平仓" if not r.get("close_on_profit_post") else "晒盈利全部平掉" if frac >= 0.95
+         else "晒盈利先平一半、剩下推保本" if abs(frac - 0.5) < 1e-9 else f"晒盈利先平 {frac * 100:.0f}%、剩下推保本")
+    return a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
+
+
+def rules_key(r: dict) -> tuple:
+    """这套规则实际上是哪一种做法：跟现在一样、或者跟前面跑过的一样的对比就不用再跑。"""
+    me, cop = bool(r.get("market_entry")), bool(r.get("close_on_profit_post"))
+    frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
+    return (me, None if me else bool(r.get("allow_limit_orders")), cop,
+            (1.0 if frac >= 0.95 else round(frac, 4)) if cop else None, 1.0 if cut >= 0.999 else round(cut, 4))
 VARIANTS = (   # 回测时同一段行情拿来对比的规则（在现在的规则上改这几项）
     ("只关掉「晒盈利就清仓」", {"close_on_profit_post": False}),
     ("只关掉「进场一律市价」（挂限价等回调）", {"market_entry": False, "allow_limit_orders": True}),
@@ -418,21 +448,23 @@ async def simulate(job_path: str, out_path: str):
         trades, outcomes, maker = await one_pass({})
         compare = []
         now_rules = cfg.risk_for(ch)
-        if now_rules.get("market_entry") or now_rules.get("close_on_profit_post"):
-            # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少
-            for head, (label, ov) in [(True, v) for v in HEAD_VARIANTS] + [(False, v) for v in VARIANTS]:
-                if all(now_rules.get(k) == v for k, v in ov.items()):
-                    continue
-                if set(ov) == {"profit_post_close_frac"} and not now_rules.get("close_on_profit_post"):
-                    continue   # 晒盈利本来就不平仓：平一半还是全平都一样
-                tr, _, _ = await one_pass(ov)
-                done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
-                rs = [t["r_mult"] for t in done]
-                compare.append(dict(label=label, head=head, opened=sum(1 for t in tr if t.get("opened_at")),
-                                    **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
-                                    per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
-                                                      total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
-                                                 for c in (chans if multi and head else [])]))
+        seen = {rules_key(now_rules)}
+        # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少（效果跟现在或者前面一样的不重复跑）
+        for head, (label, ov) in [(True, v) for v in HEAD_VARIANTS] + [(False, v) for v in VARIANTS]:
+            key = rules_key({**now_rules, **ov})
+            if key in seen:
+                continue
+            seen.add(key)
+            if head:
+                label = f"{label}：{exit_rules({**now_rules, **ov})}"
+            tr, _, _ = await one_pass(ov)
+            done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
+            rs = [t["r_mult"] for t in done]
+            compare.append(dict(label=label, head=head, opened=sum(1 for t in tr if t.get("opened_at")),
+                                **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
+                                per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
+                                                  total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
+                                             for c in (chans if multi and head else [])]))
         cfg.risk = base_risk
     finally:
         await ex.close()
@@ -461,8 +493,10 @@ async def simulate(job_path: str, out_path: str):
         "old_source": ex.old_used, "compare": compare,
         "rules_now": [label for key, label in (("market_entry", "进场一律市价"),
                                                ("close_on_profit_post", "晒盈利就清仓" if pfrac >= 0.95 else "晒盈利先减仓推保本"))
-                      if risk.get(key)],
+                      if risk.get(key)] + ([f"亏到 {float(risk['stop_loss_r']):g}R 就止损"]
+                                           if float(risk.get("stop_loss_r") or 1.0) < 0.999 else []),
         "profit_frac": pfrac if risk.get("close_on_profit_post") else None,
+        "exit_rules": exit_rules(risk),
         "messages": len(job["events"]),
         "signals": sum(1 for e in job["events"] if any(a.get("type") == "open" for a in (e["parsed"].get("actions") or []))),
         "parse_errors": sum(1 for e in job["events"] if "error" in e["parsed"]),
@@ -548,9 +582,8 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
                     f"最大回撤 {st['dd']:.1f}R｜最长连亏 {st['streak']} 单"]
         head = [c for c in res["compare"] if c.get("head")]
         if head:
-            pf = res.get("profit_frac") or 1.0
-            lines.append("\n🆚 现在的规则 vs 新方案（同一段行情、同一批信号，只差「频道晒盈利时怎么平」）：")
-            lines.append(f"• 现在：{'晒盈利就全部平掉' if pf >= 0.95 else '晒盈利先平一半、剩下推保本'}")
+            lines.append("\n🆚 现在的规则 vs 新方案（同一段行情、同一批信号，只差「晒盈利怎么平、亏到哪里止损」）：")
+            lines.append(f"• 现在：{res.get('exit_rules') or '晒盈利全部平掉｜打到信号止损才平'}")
             lines += detail(now)
             for c in head:
                 lines.append(f"• {c['label']}")
