@@ -589,10 +589,10 @@ class Engine:
             return await self.on_move_sl(t, act) if risk["follow_move_sl"] else "move_sl: 已关闭跟随"
         if act["type"] == "update_tp":
             return await self.on_update_tp(t, act, risk) if risk["follow_update_tp"] else "update_tp: 已关闭跟随"
-        if act["type"] == "profit":   # 频道晒这一单的盈利/浮盈、提醒注意仓位：不贪，清仓止盈
+        if act["type"] == "profit":   # 频道晒这一单的盈利/浮盈、提醒注意仓位：不贪，止盈
             if not risk.get("close_on_profit_post"):
                 return "profit: 只是战绩播报（没打开清仓止盈）"
-            return await self.on_close(t, 1.0, "频道晒盈利/浮盈，清仓止盈")
+            return await self.on_profit_post(t, risk)
         return "unknown"
 
     def resolve_target(self, act, ctx) -> dict | None:
@@ -1036,6 +1036,37 @@ class Engine:
         price = await ex.last_price(t["symbol"])
         await self.notify(f"✂️ #{t['id']} [实盘] {t['base']} {reason} {frac * 100:.0f}% @≈{fmt(price)}，剩余 {fmt(t['remaining'])}")
         return "reduced"
+
+    async def on_profit_post(self, t, risk) -> str:
+        """频道晒这一单的盈利/浮盈、提醒注意仓位。profit_post_close_frac = 1：全部平掉，不贪；
+        小于 1（例如 0.5）：先平掉这一部分，剩下的止损推到开仓价（保本）留着等止盈，最坏保本出场。
+        已经这样做过的（之前晒过，或者第一止盈成交后已经保本）不再动；这一单现在没有浮盈（进场比频道晚），
+        推不了保本，就全部平掉。"""
+        frac = float(risk.get("profit_post_close_frac") or 1.0)
+        if frac >= 0.95 or t["status"] != "open":
+            return await self.on_close(t, 1.0, "频道晒盈利/浮盈，清仓止盈")
+        if t.get("pp_done") or t["be_moved"]:
+            return "profit: 已经减过仓、推过保本，剩下的等止盈"
+        ex = self.xt(t)
+        price = await ex.last_price(t["symbol"])
+        if not price or not tighter(t["side"], price, t["entry_price"]):
+            return await self.on_close(t, 1.0, "频道晒盈利/浮盈，这一单没浮盈，平仓")
+        if t["mode"] == "live":   # 仓位太小、分不开（减的那部分低于最小下单量）：全部平掉
+            q = ex.round_qty(t["symbol"], t["remaining"] * frac)
+            if q <= 0 or not ex.meets_min(t["symbol"], q, price):
+                return await self.on_close(t, 1.0, "频道晒盈利/浮盈，清仓止盈")
+        res = await self.on_close(t, frac, "频道晒盈利/浮盈，先减仓")
+        if res != "reduced":   # 已经全部平掉（交易所里刚好平了，或者剩下的太少并成全平）
+            return res if res != "reduce too small" else await self.on_close(t, 1.0, "频道晒盈利/浮盈，清仓止盈")
+        t["pp_done"] = 1
+        moved = tighter(t["side"], t["entry_price"], t["soft_sl"])   # 只收紧：频道已经把止损移到盈利区的就不动
+        if moved:
+            t["soft_sl"], t["be_moved"] = t["entry_price"], 1
+            extra = "（交易所里的原止损保留兜底，保本止损由程序盯盘执行）" if t["mode"] == "live" else ""
+            await self.notify(f"🛡 #{t['id']} [{MODE_CN[t['mode']]}] {t['base']} 剩下的止损移到开仓价 "
+                              f"{fmt(t['entry_price'])}（保本），留着等止盈{extra}")
+        self.db.save_trade(t)
+        return "profit: 先减仓，" + ("剩下的推到保本等止盈" if moved else "剩下的止损已经在盈利区，等止盈")
 
     async def on_move_sl(self, t, act) -> str:
         new = t["entry_price"] if act["breakeven"] else act["price"] * (t.get("scale") or 1)

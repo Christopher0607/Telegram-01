@@ -103,7 +103,7 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
         events.sort(key=lambda e: e["ts"])
         n_err = sum(1 for e in events if "error" in e["parsed"])
         await send(f"🧠 识别完了 {len(events)} 条（{n_err} 条识别失败），正在用历史行情一单单模拟"
-                   + ("（几个频道当成一个账户一起跑，" if multi else "（") + "还会换成以前的规则再跑一遍做对比）……")
+                   + ("（几个频道当成一个账户一起跑，" if multi else "（") + "还会换成新方案和以前的规则各跑一遍做对比）……")
         os.makedirs(BT_DIR, exist_ok=True)
         base = key if not multi else "combo-" + key
         job_path = os.path.join(BT_DIR, f"{base}.json")
@@ -256,6 +256,10 @@ def history_exchange(cfg, sim: dict):
     return HistEx()
 
 
+HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的方案（跟现在一样的那个自动跳过）
+    ("新方案：晒盈利先平一半、剩下推保本", {"profit_post_close_frac": 0.5}),
+    ("晒盈利就全部平掉", {"profit_post_close_frac": 1.0}),
+)
 VARIANTS = (   # 回测时同一段行情拿来对比的规则（在现在的规则上改这几项）
     ("只关掉「晒盈利就清仓」", {"close_on_profit_post": False}),
     ("只关掉「进场一律市价」（挂限价等回调）", {"market_entry": False, "allow_limit_orders": True}),
@@ -264,7 +268,7 @@ VARIANTS = (   # 回测时同一段行情拿来对比的规则（在现在的规
 
 
 def closed_stats(rs: list) -> dict:
-    """已平仓单子（按平仓顺序）的 R → 单数、胜率 %、总 R、平均 R、最大回撤 R、最长连亏。"""
+    """已平仓单子（按平仓顺序）的 R → 单数、胜率 %、总 R、平均 R、最大回撤 R、最长连亏、赚的单子平均 R、亏的单子平均 R。"""
     cum = peak = dd = 0.0
     streak = worst = 0
     for r in rs:
@@ -273,8 +277,10 @@ def closed_stats(rs: list) -> dict:
         streak = streak + 1 if r < 0 else 0
         worst = max(worst, streak)
     n = len(rs)
-    return {"n": n, "win": sum(1 for r in rs if r > 0) / n * 100 if n else 0.0, "total": sum(rs),
-            "avg": sum(rs) / n if n else 0.0, "dd": dd, "streak": worst}
+    wins, losses = [r for r in rs if r > 0], [r for r in rs if r < 0]
+    return {"n": n, "win": len(wins) / n * 100 if n else 0.0, "total": sum(rs),
+            "avg": sum(rs) / n if n else 0.0, "dd": dd, "streak": worst,
+            "avg_win": sum(wins) / len(wins) if wins else 0.0, "avg_loss": sum(losses) / len(losses) if losses else 0.0}
 
 
 def money(rs: list, pct: float | None, fixed: float | None, equity: float | None, mults: list | None = None) -> dict:
@@ -413,19 +419,26 @@ async def simulate(job_path: str, out_path: str):
         compare = []
         now_rules = cfg.risk_for(ch)
         if now_rules.get("market_entry") or now_rules.get("close_on_profit_post"):
-            for label, ov in VARIANTS:   # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少
+            # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少
+            for head, (label, ov) in [(True, v) for v in HEAD_VARIANTS] + [(False, v) for v in VARIANTS]:
                 if all(now_rules.get(k) == v for k, v in ov.items()):
                     continue
+                if set(ov) == {"profit_post_close_frac"} and not now_rules.get("close_on_profit_post"):
+                    continue   # 晒盈利本来就不平仓：平一半还是全平都一样
                 tr, _, _ = await one_pass(ov)
                 done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
                 rs = [t["r_mult"] for t in done]
-                compare.append(dict(label=label, opened=sum(1 for t in tr if t.get("opened_at")),
-                                    **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done])))
+                compare.append(dict(label=label, head=head, opened=sum(1 for t in tr if t.get("opened_at")),
+                                    **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
+                                    per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
+                                                      total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
+                                                 for c in (chans if multi and head else [])]))
         cfg.risk = base_risk
     finally:
         await ex.close()
 
     risk = cfg.risk_for(ch)
+    pfrac = float(risk.get("profit_post_close_frac") or 1.0)
     closed = sorted((t for t in trades if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
     skips: dict = {}
     for o in outcomes:
@@ -446,8 +459,10 @@ async def simulate(job_path: str, out_path: str):
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
         "old_source": ex.old_used, "compare": compare,
-        "rules_now": [label for key, label in (("market_entry", "进场一律市价"), ("close_on_profit_post", "晒盈利就清仓"))
+        "rules_now": [label for key, label in (("market_entry", "进场一律市价"),
+                                               ("close_on_profit_post", "晒盈利就清仓" if pfrac >= 0.95 else "晒盈利先减仓推保本"))
                       if risk.get(key)],
+        "profit_frac": pfrac if risk.get("close_on_profit_post") else None,
         "messages": len(job["events"]),
         "signals": sum(1 for e in job["events"] if any(a.get("type") == "open" for a in (e["parsed"].get("actions") or []))),
         "parse_errors": sum(1 for e in job["events"] if "error" in e["parsed"]),
@@ -524,10 +539,32 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         def row(st: dict) -> str:
             ret = f"｜收益 {st['ret'] * 100:+.0f}%" if st.get("ret") is not None else ""
             return f"{st['total']:+.1f}R｜{st['avg']:+.2f}R｜{st['win']:.0f}%｜{st['dd']:.1f}R{ret}（平仓 {st['n']} 单）"
-        lines.append(f"\n🔁 同一段行情、同一批信号换规则对比（总 R｜平均每单｜胜率｜最大回撤{'｜收益率' if has_ret else ''}）：")
-        lines.append(f"• 现在的规则（{'、'.join(res.get('rules_now') or [])}）：{row(now)}")
-        for c in res["compare"]:
-            lines.append(f"• {c['label']}：{row(c)}")
+
+        def detail(st: dict) -> list:
+            ret = (f"｜收益 {st['ret'] * 100:+.0f}%（回撤 {st['ret_dd'] * 100:.0f}%）" if st.get("ret") is not None
+                   else f"｜{st['pnl_u']:+.0f}U" if st.get("pnl_u") is not None else "")
+            return [f"   平仓 {st['n']} 单｜胜率 {st['win']:.0f}%｜总 {st['total']:+.1f}R{ret}",
+                    f"   赚的单子平均 {st.get('avg_win', 0):+.2f}R｜亏的单子平均 {st.get('avg_loss', 0):+.2f}R｜"
+                    f"最大回撤 {st['dd']:.1f}R｜最长连亏 {st['streak']} 单"]
+        head = [c for c in res["compare"] if c.get("head")]
+        if head:
+            pf = res.get("profit_frac") or 1.0
+            lines.append("\n🆚 现在的规则 vs 新方案（同一段行情、同一批信号，只差「频道晒盈利时怎么平」）：")
+            lines.append(f"• 现在：{'晒盈利就全部平掉' if pf >= 0.95 else '晒盈利先平一半、剩下推保本'}")
+            lines += detail(now)
+            for c in head:
+                lines.append(f"• {c['label']}")
+                lines += detail(c)
+                if c.get("per_channel") and res.get("per_channel"):
+                    was = {x["title"]: x["total"] for x in res["per_channel"]}
+                    lines.append("   各频道：" + "；".join(f"{x['title']} {was.get(x['title'], 0):+.1f}R → {x['total']:+.1f}R"
+                                                      for x in c["per_channel"]))
+        rest = [c for c in res["compare"] if not c.get("head")]
+        if rest:
+            lines.append(f"\n🔁 其他规则对比（总 R｜平均每单｜胜率｜最大回撤{'｜收益率' if has_ret else ''}）：")
+            lines.append(f"• 现在的规则（{'、'.join(res.get('rules_now') or [])}）：{row(now)}")
+            for c in rest:
+                lines.append(f"• {c['label']}：{row(c)}")
     if res["closed"]:
         lines.append("\n最近的单子：")
         for t in res["closed"][-12:]:
