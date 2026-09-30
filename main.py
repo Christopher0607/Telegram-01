@@ -878,11 +878,16 @@ def start_backtest(cfg: Config, chs, days: int, notifier: Notifier, client, engi
     task = asyncio.create_task(go())
     _background.add(task)
     task.add_done_callback(_background.discard)
+    k = len(chs) * max(1.0, days / 30)   # 频道越多、天数越长，消息越多，要的时间也越长
+    eta = f"大约 {round(5 * k)}～{round(15 * k)} 分钟"
     if len(chs) > 1:
         return (f"⏳ 开始组合回测「{name}」最近 {days} 天：几个频道当成一个账户一起跑（共用同时最多几单、每天最多亏几单）。\n"
-                f"每个频道都要拉消息、AI 识别，大约 {5 * len(chs)}～{15 * len(chs)} 分钟，进度和结果会发给你，期间实盘照常跑。")
+                f"每个频道都要拉消息、AI 识别，{eta}，进度和结果会发给你，期间实盘照常跑。")
     return (f"⏳ 开始回测「{name}」最近 {days} 天：拉历史消息 → AI 识别 → 用历史行情一单单模拟。\n"
-            f"大约 5～15 分钟，进度和结果会发给你，期间实盘照常跑。")
+            f"{eta}，进度和结果会发给你，期间实盘照常跑。")
+
+
+BT_DAYS = (30, 60, 90)   # 回测面板上能选的天数；最多 90 天（更早的 1 分钟 K 线用 WEEX 的，大约能拿到半年）
 
 
 def bt_channels(cfg: Config) -> list:
@@ -900,15 +905,16 @@ def backtest_panel(cfg: Config, mask: int, days: int, head: str = "") -> tuple[s
     live = sum(1 << i for i, c in enumerate(avail) if cfg.mode_for(c) == "live")
     rows.append([{"text": "🔴 只选实盘频道", "callback_data": f"bts:{live}:{days}"},
                  {"text": "📦 全选", "callback_data": f"bts:{(1 << len(avail)) - 1}:{days}"}])
+    rows.append([{"text": f"{'✅ ' if d == days else ''}{d} 天", "callback_data": f"bts:{mask}:{d}"} for d in BT_DAYS])
     n = bin(mask).count("1")
     rows.append([{"text": (f"▶️ 开始回测（{n} 个频道一起，最近 {days} 天）" if n > 1 else
                            f"▶️ 开始回测（最近 {days} 天）" if n else "👆 先点上面的频道打勾"),
                   "callback_data": f"btgo:{mask}:{days}"}])
     text = ((head + "\n\n") if head else "") + (
-        f"📊 回测最近 {days} 天：点频道打勾（可以多选），选好点「开始回测」。\n"
+        f"📊 回测最近 {days} 天：点频道打勾（可以多选），天数点「30 天 / 60 天 / 90 天」换，选好点「开始回测」。\n"
         f"• 选一个：单独看这个频道\n"
         f"• 选几个：当成一个账户一起跑，共用同时最多几单、每天最多亏几单，同一个币已经有单就不再开，更接近实盘\n"
-        f"也可以直接发：/backtest UMIE 財財 30")
+        f"也可以直接发：/backtest UMIE 財財 90（最后的数字是天数，最多 {BT_DAYS[-1]} 天）")
     return text, {"inline_keyboard": rows}
 
 
@@ -928,7 +934,7 @@ def pick_channels(cfg: Config, names: list[str]) -> list:
 def backtest_command(text: str, cfg: Config, notifier: Notifier, client, engine: Engine | None = None) -> str | tuple[str, dict]:
     """/backtest [频道 频道 …] [天数]：不写频道就给面板选（可以多选）；写了几个频道就当成一个账户一起回测。"""
     words = text.split()[1:]
-    days = next((max(1, min(int(w), 60)) for w in words if w.isdigit()), 30)
+    days = next((max(1, min(int(w), BT_DAYS[-1])) for w in words if w.isdigit()), 30)
     names = [w for w in words if not w.isdigit()]
     if not names:
         return backtest_panel(cfg, 0, days)
@@ -1002,7 +1008,7 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
             parts = data.split(":")
             if len(parts) != 3 or not (parts[1].isdigit() and parts[2].isdigit()):
                 return "按钮过期了，请重新发 /backtest。"
-            mask, days = int(parts[1]), int(parts[2])
+            mask, days = int(parts[1]), max(1, min(int(parts[2]), BT_DAYS[-1]))
             if data.startswith("bts:"):
                 return backtest_panel(cfg, mask, days)
             chs = [c for i, c in enumerate(bt_channels(cfg)) if mask >> i & 1]

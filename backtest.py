@@ -127,7 +127,7 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
         proc = await asyncio.create_subprocess_exec(
             sys.executable, os.path.abspath(__file__), "simulate", job_path, out_path, cwd=BASE_DIR,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        limit = 3600 * (2 if multi else 1)
+        limit = 3600 * (2 if multi else 1) * (2 if days > 30 else 1)
         try:
             _, err = await asyncio.wait_for(proc.communicate(), limit)
         except asyncio.TimeoutError:
