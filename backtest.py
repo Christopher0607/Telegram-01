@@ -342,6 +342,56 @@ def money(rs: list, pct: float | None, fixed: float | None, equity: float | None
     return out
 
 
+COPY_WINDOW_H = 24   # 别的频道 24 小时内发过同一个币、同一方向、点位几乎一样的信号，算「照抄」
+
+
+def copy_check(events: list, chans: list, trades: list) -> list:
+    """几个频道一起回测时，看有没有频道照抄别的频道（晚一点发同一个信号）：同一个币、同一方向、
+    进场价或止损差不到 1%（或者有一个止盈差不到 0.5%），比别的频道晚发、24 小时以内。
+    返回每一对（后发的 ← 先发的）：照抄几个、晚多久，照抄的单子在回测里开了几单、合计多少 R。"""
+    from engine import coin_key
+    title = {c["username"]: c["title"] for c in chans}
+    first = chans[0]["username"]
+    sig = []
+    for e in events:
+        for a in (e["parsed"].get("actions") or []):
+            if a.get("type") == "open" and a.get("symbol") and a.get("side"):
+                ent = [x for x in (a.get("entry_low"), a.get("entry_high")) if x]
+                sig.append(dict(ch=e.get("ch") or first, id=e["id"], ts=e["ts"], coin=coin_key(a["symbol"]), side=a["side"],
+                                entry=sum(ent) / len(ent) if ent else None, sl=a.get("stop_loss"),
+                                tps=[x for x in (a.get("take_profits") or []) if x]))
+    sig.sort(key=lambda s: s["ts"])
+
+    def near(a, b, tol):
+        return bool(a and b) and abs(a - b) / abs(b) <= tol
+
+    def same(s, p):
+        return (near(s["entry"], p["entry"], 0.01) or near(s["sl"], p["sl"], 0.01)
+                or any(near(x, y, 0.005) for x in s["tps"] for y in p["tps"]))
+
+    tmap = {(t.get("channel"), t.get("msg_id")): t for t in trades}
+    pairs: dict = {}
+    for i, s in enumerate(sig):
+        src = [p for p in sig[:i] if p["ch"] != s["ch"] and p["coin"] == s["coin"] and p["side"] == s["side"]
+               and s["ts"] - p["ts"] <= COPY_WINDOW_H * 3600 and same(s, p)]
+        if not src:
+            continue
+        p = src[-1]
+        d = pairs.setdefault((s["ch"], p["ch"]), {"delays": [], "opened": 0, "r": 0.0})
+        d["delays"].append((s["ts"] - p["ts"]) / 60)
+        t = tmap.get((s["ch"], s["id"]))
+        if t and t.get("opened_at"):
+            d["opened"] += 1
+            d["r"] += t.get("r_mult") or 0.0
+    out = []
+    for (later, earlier), d in pairs.items():
+        ds = sorted(d["delays"])
+        out.append(dict(later=title.get(later, later), earlier=title.get(earlier, earlier), n=len(ds),
+                        of=sum(1 for s in sig if s["ch"] == later), dmin=ds[0], dmed=ds[len(ds) // 2], dmax=ds[-1],
+                        opened=d["opened"], r=d["r"]))
+    return sorted(out, key=lambda x: -x["n"])
+
+
 def skip_reason(outcome: str) -> str:
     """把跳过原因归成几类，方便统计。"""
     r = outcome[len("skip: "):]
@@ -479,6 +529,7 @@ async def simulate(job_path: str, out_path: str):
                 k = skip_reason(part)
                 skips[k] = skips.get(k, 0) + 1
     errors = [p[len("error: "):] for o in outcomes for p in o.split(" | ") if p.startswith("error: ")]
+    copies = copy_check(job["events"], chans, trades) if multi else []
     per_channel = []
     for c in chans if multi else []:   # 几个频道一起时：每个频道各自的成绩
         mine = [t for t in trades if t.get("channel") == c["username"]]
@@ -486,7 +537,7 @@ async def simulate(job_path: str, out_path: str):
                                 **closed_stats([t["r_mult"] for t in closed if t.get("channel") == c["username"]])))
     out = {
         "title": job["title"], "start": job["start"], "end": job["end"], "days": job["days"], "risk_pct": pct,
-        "risk_usdt": fixed, "equity": equity, "multi": multi, "per_channel": per_channel,
+        "risk_usdt": fixed, "equity": equity, "multi": multi, "per_channel": per_channel, "copies": copies,
         "channels": [c["title"] for c in chans],
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
@@ -566,6 +617,21 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         lines.append("\n各频道（在这个组合里实际开到的单子）：")
         for c in res["per_channel"]:
             lines.append(f"• {c['title']}：开 {c['opened']} 单｜平仓 {c['n']} 单｜胜率 {c['win']:.0f}%｜{c['total']:+.1f}R")
+    if res.get("multi"):
+        lines.append(f"\n🔍 有没有频道照抄别的频道（同一个币、同一方向、点位几乎一样，比别的频道晚发，{COPY_WINDOW_H} 小时内）：")
+        mins = lambda m: "不到 1 分钟" if m < 1 else f"{m:.0f} 分钟" if m < 120 else f"{m / 60:.1f} 小时"
+        real = [c for c in res.get("copies") or [] if c["n"] >= 3 and c["n"] >= 0.1 * c["of"]]
+        for c in real:
+            left = c["n"] - c["opened"]
+            late = mins(c["dmin"]) if c["dmin"] == c["dmax"] else f"{mins(c['dmin'])}～{mins(c['dmax'])}（中间数 {mins(c['dmed'])}）"
+            lines.append(f"• {c['later']} ← {c['earlier']}：{c['later']}的 {c['of']} 个信号里 {c['n']} 个是照抄的，晚 {late}；"
+                         + (f"回测里开了 {c['opened']} 单（原单已经平了才开），合计 {c['r']:+.1f}R" if c["opened"] else "回测里一单都没开")
+                         + (f"，另外 {left} 个没开（多半是同一个币已经有单）" if left and c["opened"] else ""))
+        few = [c for c in res.get("copies") or [] if c not in real]
+        if few:
+            lines.append("• 偶尔撞车（太少，多半只是碰巧）：" + "；".join(f"{c['later']} ← {c['earlier']} {c['n']} 个" for c in few))
+        if not real:
+            lines.append("• 没发现照抄的频道")
     if res.get("compare"):
         now = {**closed_stats(rs), **money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), mults)}
         has_ret = now.get("ret") is not None
