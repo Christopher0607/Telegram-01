@@ -290,10 +290,14 @@ def rules_key(r: dict) -> tuple:
     frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
     return (me, None if me else bool(r.get("allow_limit_orders")), cop,
             (1.0 if frac >= 0.95 else round(frac, 4)) if cop else None, 1.0 if cut >= 0.999 else round(cut, 4))
-VARIANTS = (   # 回测时同一段行情拿来对比的规则（在现在的规则上改这几项）
-    ("只关掉「晒盈利就清仓」", {"close_on_profit_post": False}),
-    ("只关掉「进场一律市价」（挂限价等回调）", {"market_entry": False, "allow_limit_orders": True}),
-    ("以前的做法：进场挂限价等回调、晒盈利不清仓", {"market_entry": False, "allow_limit_orders": True, "close_on_profit_post": False}),
+VARIANTS = (   # 回测时同一段行情拿来对比的几种完整做法（进场怎么进、晒盈利平不平）；跟现在一样的自动跳过
+    ("进场一律市价、晒盈利就清仓（09-29～10-09 用的）",
+     {"market_entry": True, "close_on_profit_post": True, "profit_post_close_frac": 1.0}),
+    ("挂限价等回调、晒盈利就清仓",
+     {"market_entry": False, "allow_limit_orders": True, "close_on_profit_post": True, "profit_post_close_frac": 1.0}),
+    ("进场一律市价、晒盈利不平仓", {"market_entry": True, "close_on_profit_post": False}),
+    ("挂限价等回调、晒盈利不平仓（09-29 以前、10-09 起的做法）",
+     {"market_entry": False, "allow_limit_orders": True, "close_on_profit_post": False}),
 )
 
 
@@ -542,10 +546,11 @@ async def simulate(job_path: str, out_path: str):
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
         "old_source": ex.old_used, "compare": compare,
-        "rules_now": [label for key, label in (("market_entry", "进场一律市价"),
-                                               ("close_on_profit_post", "晒盈利就清仓" if pfrac >= 0.95 else "晒盈利先减仓推保本"))
-                      if risk.get(key)] + ([f"亏到 {float(risk['stop_loss_r']):g}R 就止损"]
-                                           if float(risk.get("stop_loss_r") or 1.0) < 0.999 else []),
+        "rules_now": [("进场一律市价" if risk.get("market_entry") else "挂限价等回调" if risk.get("allow_limit_orders")
+                       else "价格跑远了不追"),
+                      ("晒盈利不平仓" if not risk.get("close_on_profit_post") else "晒盈利就清仓" if pfrac >= 0.95
+                       else "晒盈利先减仓推保本")] + ([f"亏到 {float(risk['stop_loss_r']):g}R 就止损"]
+                                                if float(risk.get("stop_loss_r") or 1.0) < 0.999 else []),
         "profit_frac": pfrac if risk.get("close_on_profit_post") else None,
         "exit_rules": exit_rules(risk),
         "messages": len(job["events"]),
