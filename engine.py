@@ -590,6 +590,8 @@ class Engine:
         if act["type"] == "close":
             if not risk["follow_close"]:
                 return "close: 已关闭跟随"
+            if act["fraction"] < 0.95 and not risk.get("follow_reduce", True):
+                return "reduce: 频道减仓不跟，按自己的止盈减仓"
             reason = "频道指令平仓" if act["fraction"] >= 0.95 else "频道指令减仓"
             return await self.on_close(t, act["fraction"], reason)
         if act["type"] == "move_sl":

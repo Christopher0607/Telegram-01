@@ -241,7 +241,7 @@ def outcome_cn(outcome: str | None) -> str:
             out.append("执行出错：" + p[len("error: "):][:80])
         elif p:
             out.append(p.replace("close:", "平仓：").replace("move_sl:", "移动止损：").replace("update_tp:", "更新止盈：")
-                       .replace("profit:", "战绩播报："))
+                       .replace("profit:", "战绩播报：").replace("reduce:", "减仓："))
     return "；".join(out) or "-"
 
 

@@ -59,6 +59,7 @@ DEFAULT_RISK = {
     "min_open_confidence": "high",
     "min_manage_confidence": "medium",
     "follow_close": True,             # 跟随频道的平仓/减仓指令
+    "follow_reduce": True,            # 上面打开时，频道的「减仓」（只平一部分）也跟；false = 只跟全部平仓，减仓按自己的止盈走
     "follow_move_sl": True,           # 跟随频道的移动止损
     "follow_update_tp": True,         # 跟随频道的止盈更新
     "fee_rate": 0.0006,               # 单边手续费估算：交易所没公布这个币的费率时才用（算仓位和模拟盘盈亏）
