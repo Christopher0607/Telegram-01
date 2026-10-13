@@ -272,16 +272,19 @@ HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的�
     ("A", {"profit_post_close_frac": 0.5, "stop_loss_r": 1.0}),
     ("B", {"profit_post_close_frac": 1.0, "stop_loss_r": 0.5}),
     ("A+B", {"profit_post_close_frac": 0.5, "stop_loss_r": 0.5}),
+    ("C", {"breakeven_after_tp1": False}),   # 第一止盈后不推保本（现在已经不推的话，下面那个反过来对比）
+    ("C", {"breakeven_after_tp1": True}),
     ("原来", {"profit_post_close_frac": 1.0, "stop_loss_r": 1.0}),
 )
 
 
 def exit_rules(r: dict) -> str:
-    """晒盈利怎么平、亏到哪里止损，写成一句话（报告里用）。"""
+    """晒盈利怎么平、亏到哪里止损、第一止盈后推不推保本，写成一句话（报告里用）。"""
     frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
     a = ("晒盈利不平仓" if not r.get("close_on_profit_post") else "晒盈利全部平掉" if frac >= 0.95
          else "晒盈利先平一半、剩下推保本" if abs(frac - 0.5) < 1e-9 else f"晒盈利先平 {frac * 100:.0f}%、剩下推保本")
-    return a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
+    return (a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
+            + "｜" + ("第一止盈后推保本" if r.get("breakeven_after_tp1", True) else "第一止盈后不推保本"))
 
 
 def rules_key(r: dict) -> tuple:
@@ -289,7 +292,8 @@ def rules_key(r: dict) -> tuple:
     me, cop = bool(r.get("market_entry")), bool(r.get("close_on_profit_post"))
     frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
     return (me, None if me else bool(r.get("allow_limit_orders")), cop,
-            (1.0 if frac >= 0.95 else round(frac, 4)) if cop else None, 1.0 if cut >= 0.999 else round(cut, 4))
+            (1.0 if frac >= 0.95 else round(frac, 4)) if cop else None, 1.0 if cut >= 0.999 else round(cut, 4),
+            bool(r.get("breakeven_after_tp1", True)))
 VARIANTS = (   # 回测时同一段行情拿来对比的几种完整做法（进场怎么进、晒盈利平不平）；跟现在一样的自动跳过
     ("进场一律市价、晒盈利就清仓（09-29～10-09 用的）",
      {"market_entry": True, "close_on_profit_post": True, "profit_post_close_frac": 1.0}),
@@ -653,8 +657,8 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
                     f"最大回撤 {st['dd']:.1f}R｜最长连亏 {st['streak']} 单"]
         head = [c for c in res["compare"] if c.get("head")]
         if head:
-            lines.append("\n🆚 现在的规则 vs 新方案（同一段行情、同一批信号，只差「晒盈利怎么平、亏到哪里止损」）：")
-            lines.append(f"• 现在：{res.get('exit_rules') or '晒盈利全部平掉｜打到信号止损才平'}")
+            lines.append("\n🆚 现在的规则 vs 新方案（同一段行情、同一批信号，只差「晒盈利怎么平、止损怎么放」）：")
+            lines.append(f"• 现在：{res.get('exit_rules') or '晒盈利全部平掉｜打到信号止损才平｜第一止盈后推保本'}")
             lines += detail(now)
             for c in head:
                 lines.append(f"• {c['label']}")
