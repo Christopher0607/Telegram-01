@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from db import now_ms
+from exchange import net_error
 
 log = logging.getLogger("engine")
 
@@ -31,6 +32,8 @@ SELFTEST = {"gate": "/gatetest", "weex": "/weextest"}
 SIDE_CN = {"long": "多", "short": "空"}
 TP_OVERRUN = 0.003       # 止盈挂单：价格冲过止盈价 0.3% 还没成交完，马上撤掉改市价
 TP_TOUCH_WAIT_MS = 10_000  # 止盈挂单：价格到了止盈价，挂单 10 秒还没成交完（排队没轮到），也撤掉改市价
+MONITOR_ALERT_SEC = 60   # 盯盘/核对一直出错超过 1 分钟才提醒：交易所接口偶尔超时、断线一下，下一轮自己就好了
+LIVE_RETRY = "程序每 5 秒自动重试；交易所里挂着的止损单照常有效，保本/移动止损和止盈要等恢复后才执行。"
 MODE_CN = {"live": "实盘", "paper": "模拟"}
 
 HELP = ("📖 命令\n"
@@ -410,6 +413,7 @@ class Engine:
         self.cfg, self.db, self.ex, self.parser, self.notifier = cfg, db, ex, parser, notifier
         self.lock = asyncio.Lock()
         self._err_ts: dict[str, float] = {}
+        self._mon_bad: dict[str, list] = {}  # 盯盘/核对正在连续出错的：{key: [第一次出错的时间, 提醒过没有]}
         self.sl_fixes: dict[int, int] = {}   # 每单补挂过几次交易所止损（audit_live）
         # 换了交易所以后，旧交易所上还开着的实盘单：用旧交易所接着管到平仓（{交易所名: Exchange}，main.py 启动时接上）
         self.others: dict = {}
@@ -419,11 +423,32 @@ class Engine:
     async def notify(self, text: str):
         await self.notifier.send(text)
 
-    async def notify_error(self, key: str, text: str, every: int = 600):
+    async def notify_error(self, key: str, text: str, every: int = 600) -> bool:
         now = time.time()
         if now - self._err_ts.get(key, 0) >= every:
             self._err_ts[key] = now
             await self.notify(text)
+            return True
+        return False
+
+    async def mon_fail(self, key: str, what: str, e: Exception, label: str, tail: str):
+        """盯盘/核对出错：先只记日志，下一轮自动重试；同一件事一直出错超过 1 分钟才提醒（之后 10 分钟内不重复）。
+        交易所接口偶尔超时、断线一下很常见（2026-10-15 Gate 的行情接口断过一下，马上提醒了一条只有网址的出错消息）。"""
+        now = time.time()
+        bad = self._mon_bad.setdefault(key, [now, False])
+        if now - bad[0] < MONITOR_ALERT_SEC:
+            return
+        why = (f"连不上 {label}（{type(e).__name__}，网络或交易所接口临时出问题）" if net_error(e)
+               else f"{type(e).__name__}: {str(e)[:200]}")
+        mins = max(1, round((now - bad[0]) / 60))
+        if await self.notify_error(key, f"⚠️ {what}已经连续 {mins} 分钟出错：{why}\n{tail}（10 分钟内不重复提醒）"):
+            bad[1] = True
+
+    async def mon_ok(self, key: str, what: str):
+        """盯盘/核对这一轮正常了：之前提醒过出错的，告诉用户已经恢复。"""
+        bad = self._mon_bad.pop(key, None)
+        if bad and bad[1]:
+            await self.notify(f"✅ {what}恢复正常（断了大约 {max(1, round((time.time() - bad[0]) / 60))} 分钟）")
 
     def risk_of(self, t: dict) -> dict:
         ch = self.cfg.channel_by_username(t["channel"])
@@ -1182,12 +1207,19 @@ class Engine:
             try:
                 async with self.lock:
                     await self.monitor_live(tick)
-                    if tick % 12 == 0:
-                        await self.monitor_paper()
-                        await self.maybe_daily_report()
+                await self.mon_ok("monitor", "持仓监控")
             except Exception as e:
                 log.exception("监控出错")
-                await self.notify_error("monitor", f"⚠️ 持仓监控出错（10 分钟内不重复提醒）：{str(e)[:200]}")
+                await self.mon_fail("monitor", "持仓监控", e, self.ex.label, LIVE_RETRY)
+            if tick % 12 == 0:   # 实盘盯盘出错也照样盯模拟单、发日报
+                try:
+                    async with self.lock:
+                        await self.monitor_paper()
+                        await self.maybe_daily_report()
+                    await self.mon_ok("monitor-paper", "模拟盘监控")
+                except Exception as e:
+                    log.exception("模拟盘监控出错")
+                    await self.mon_fail("monitor-paper", "模拟盘监控", e, self.ex.label, "程序每分钟自动重试；不影响实盘。")
             tick += 1
             await asyncio.sleep(5)
 
@@ -1202,13 +1234,14 @@ class Engine:
         for ex, ts in sorted(groups.items(), key=lambda g: g[0] is not self.ex):   # 现在的交易所先盯
             try:
                 await self.monitor_on(ex, ts, tick)
+                if ex is not self.ex:
+                    await self.mon_ok(f"monitor-{ex.name}", f"{ex.label}（收尾中）持仓监控")
             except Exception as e:
                 if ex is self.ex:
                     err = e   # 照旧交给 monitor_forever 提醒
                 else:         # 旧交易所（收尾中）出错只提醒，不耽误现在的交易所
                     log.exception("盯盘 %s 出错", ex.label)
-                    await self.notify_error(f"monitor-{ex.name}", f"⚠️ {ex.label}（收尾中）持仓监控出错"
-                                                                  f"（10 分钟内不重复提醒）：{str(e)[:200]}")
+                    await self.mon_fail(f"monitor-{ex.name}", f"{ex.label}（收尾中）持仓监控", e, ex.label, LIVE_RETRY)
         if err:
             raise err
 
@@ -1232,14 +1265,16 @@ class Engine:
             return
         pos = await ex.positions()
         for t in self.live_on(ex):
+            what = f"核对 #{t['id']} {t['base']} "
             try:
                 if t["status"] == "pending":
                     await self.sync_pending(t, pos)
                 else:
                     await self.sync_open(t, pos)
+                await self.mon_ok(f"sync{t['id']}", what)
             except Exception as e:
                 log.exception("核对出错")
-                await self.notify_error(f"sync{t['id']}", f"⚠️ 核对 #{t['id']} {t['base']} 出错：{str(e)[:150]}")
+                await self.mon_fail(f"sync{t['id']}", what, e, ex.label, "程序会自动重试。")
         if tick % 60 == 0:   # 每 5 分钟：交易所里的止损单、止盈挂单还在不在（在 App 里被撤了就补挂）
             for t in self.live_on(ex):
                 try:

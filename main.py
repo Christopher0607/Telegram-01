@@ -1300,7 +1300,7 @@ async def attach_old_exchanges(engine: Engine, cfg: Config, notifier: Notifier):
         except Exception as e:
             log.exception("连接 %s 失败", x.label)
             await notifier.send(f"⚠️ 连不上 {x.label}（那边还有没平完的实盘单）：{str(e)[:150]}\n程序会一直重试，"
-                                f"如果之后一直出现「{x.label}（收尾中）持仓监控出错」，请把消息发给 Claude Code。")
+                                f"如果之后一直提醒「{x.label}（收尾中）持仓监控已经连续…分钟出错」，请把消息发给 Claude Code。")
         engine.others[name] = x
 
 

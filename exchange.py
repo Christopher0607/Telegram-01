@@ -18,6 +18,7 @@ import logging
 import time
 import uuid
 
+import aiohttp
 import ccxt.async_support as ccxt
 from ccxt.base.decimal_to_precision import TICK_SIZE
 
@@ -27,6 +28,19 @@ LABELS = {"bitget": "Bitget", "gate": "Gate", "weex": "WEEX"}
 GATE_MAX_LEVERAGE = 100           # ccxt 给 Gate 设杠杆最多只接受 100 倍
 WEEX_API = "https://api-contract.weex.com/capi/v3"
 WEEX_OPEN_SL = ("NEW", "PENDING", "UNTRIGGERED")   # WEEX 止损单还挂着（没触发、没撤销）的状态
+
+
+def net_error(e: BaseException | None) -> bool:
+    """交易所接口一时连不上（超时、断线、限流、5xx、维护），过几秒一般自己就好了。
+    ccxt 把这些包成 NetworkError 一族，消息里只有一个网址（如「gate GET https://…/tickers」）；
+    aiohttp 的个别连接错误会被包成 ExchangeError，所以顺着 raise … from … 往回找。"""
+    for _ in range(5):
+        if e is None:
+            return False
+        if isinstance(e, (ccxt.NetworkError, asyncio.TimeoutError, ConnectionError, aiohttp.ClientError)):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
 
 
 def sl_ref(sl_order_id) -> str:

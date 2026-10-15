@@ -90,6 +90,7 @@
 - **创建 15 分钟后机器人仍无反应**：最常见的原因是私有仓库没给 GITHUB_READ_TOKEN、代码不在 main 分支，或者 TG_BOT_TOKEN 填错。请用户用手机浏览器打开 cloud.digitalocean.com → Droplets → tg-signal-trader → Access → Launch Droplet Console，运行 `tail -50 /var/log/tgst-setup.log; docker logs --tail 30 tg-signal-trader`，把结果截图给你。首次构建失败时，自动更新任务每 5 分钟会重试一次（`/var/log/tgst-update.log`）。
 - **机器人发「❌ 发送登录验证码失败」**：TG_API_ID / TG_API_HASH / TG_PHONE 填错（服务器上的变量是创建时写入的，要改只能 `destroy --yes` 后用正确的值重新 `create`；这时还没有交易记录，没有损失）。
 - **机器人发「⚠️ 连不上 Gate / WEEX」**：服务器所在地区可能访问不了交易所。先看错误内容；确认是地区限制的话，征得用户同意后换 `--region`（如 `sgp1` 换 `fra1`）重建。
+- **「⚠️ 持仓监控已经连续 N 分钟出错」**（「核对 #N」「模拟盘监控」「XX（收尾中）持仓监控」同样）：2026-10-15 起，交易所接口偶尔超时、断线一下（下一轮就好）不再提醒（以前一出错就发，例如只有一个网址的 `gate GET https://api.gateio.ws/api/v4/futures/usdt/tickers?timezone=utc0`），连续出错满 1 分钟才提醒、之后 10 分钟一次，恢复了发「✅ …恢复正常」（`engine.mon_fail` / `mon_ok`）。写「连不上 Gate（RequestTimeout…）」是网络或交易所的问题：程序每 5 秒重试，交易所里挂着的止损单照常有效，保本/移动止损和程序盯的止盈要等恢复；很久不恢复就请用户看交易所 App 有没有维护公告。写的是程序错误（如 KeyError）就是代码问题，请用户截图给你。
 - **机器人突然完全没反应**：先用 `getMe` 检查 Token。返回 401 说明机器人被删或 Token 被重置。Token 是建服务器时写入的，只能让用户新建机器人（名字按第 2 步的要求），征得同意后 `destroy --yes` 再 `create`；已登录的话，登录状态和交易记录会一起清空。
 - **改动没生效**：确认已合并进 main；在控制台运行 `tail /var/log/tgst-update.log` 查看。**首次部署时的真实原因**：建服务器没配 SSH 密钥，DigitalOcean 把 root 密码（发到用户邮箱）设成「首次登录必须修改」，改之前 cron 会被 PAM 拒绝执行 root 任务，自动更新一次都不会跑，重启也没用。现在的开机脚本改用 systemd 定时器 `tgst-update.timer`，不受影响；2026-09-25 之前建的服务器，需要用户打开控制台，用邮件里的密码登录并设一次新密码。控制台提示 `Current password` 就是这个原因。
 - **/gate（或 /bitget）验证失败**：检查 IP 白名单、合约交易权限（Bitget 还要检查 passphrase）。
