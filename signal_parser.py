@@ -10,6 +10,7 @@ import base64
 import json
 import logging
 import re
+import time
 
 import httpx
 
@@ -194,6 +195,9 @@ class SignalParser:
         self.cfg = cfg
         self.provider = cfg.llm_provider
         self.model = cfg.llm_model
+        # 一条消息最多等多久（几次重试加起来）。DeepSeek 忙的时候会先排队（流式请求每 12 秒发一次 keep-alive），
+        # 排得太久就算这次识别失败，免得一条消息卡住几分钟
+        self.budget = float(getattr(cfg, "llm_timeout_sec", 240))
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0))
 
     async def close(self):
@@ -204,11 +208,19 @@ class SignalParser:
         mime = getattr(ctx, "image_mime", "image/jpeg")
         last_err: Exception | None = None
         attempt = 0
+        start = time.monotonic()
         while attempt < 3:
+            left = self.budget - (time.monotonic() - start)
+            if left < 5:
+                break
             try:
                 user = build_user_prompt(ctx, bool(image))
                 call = self._deepseek if self.provider == "deepseek" else self._anthropic
-                return normalize(extract_json(await call(user, image, mime)))
+                return normalize(extract_json(await asyncio.wait_for(call(user, image, mime), timeout=left)))
+            except asyncio.TimeoutError:   # 排队太久：不再重试（再排一次也一样），这条消息算识别失败
+                last_err = RuntimeError(f"{self.provider} 服务器太忙，等了 {time.monotonic() - start:.0f} 秒还没给结果"
+                                        f"（这条消息没识别；已经开着的单子止损止盈照常）")
+                break
             except ImageRefused as e:  # 图片看不了：去掉图片，只按文字识别（不算一次失败）
                 log.warning("AI 不接受这张图片，改为只看文字：%s", e)
                 image = None
@@ -228,8 +240,11 @@ class SignalParser:
         if image:
             content = [{"type": "text", "text": user},
                        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64.b64encode(image).decode()}"}}]
-        r = await self.http.post(
-            "https://api.deepseek.com/chat/completions",
+        # 用流式请求：DeepSeek 忙的时候先排队，期间每 12 秒发一行「: keep-alive」，连接不会因为读超时断掉；
+        # 一直等到出结果，或者 parse() 的总时限到了
+        parts: list[str] = []
+        async with self.http.stream(
+            "POST", "https://api.deepseek.com/chat/completions",
             headers={"Authorization": f"Bearer {self.cfg.deepseek_key}"},
             json={
                 "model": self.model,
@@ -239,12 +254,24 @@ class SignalParser:
                 "thinking": {"type": "disabled"},   # V4 默认开启思考，关掉更快更省
                 "temperature": 0,
                 "max_tokens": 1000,
-            })
-        if image and r.status_code == 400:
-            raise ImageRefused(f"DeepSeek HTTP 400: {r.text[:300]}")
-        if r.status_code >= 400:
-            raise RuntimeError(f"DeepSeek HTTP {r.status_code}: {r.text[:300]}")
-        return r.json()["choices"][0]["message"]["content"]
+                "stream": True,
+            }) as r:
+            if r.status_code >= 400:
+                body = (await r.aread()).decode(errors="replace")
+                if image and r.status_code == 400:
+                    raise ImageRefused(f"DeepSeek HTTP 400: {body[:300]}")
+                raise RuntimeError(f"DeepSeek HTTP {r.status_code}: {body[:300]}")
+            async for line in r.aiter_lines():
+                if not line.startswith("data:"):
+                    continue   # 空行、「: keep-alive」（还在排队）
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                choice = (json.loads(data).get("choices") or [{}])[0]
+                parts.append((choice.get("delta") or {}).get("content") or "")
+        if not "".join(parts).strip():
+            raise RuntimeError("DeepSeek 返回了空内容")
+        return "".join(parts)
 
     async def _anthropic(self, user: str, image: bytes | None = None, mime: str = "image/jpeg") -> str:
         if not self.cfg.anthropic_key:

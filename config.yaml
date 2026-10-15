@@ -19,7 +19,8 @@ exchange:
 
 llm:
   provider: deepseek           # deepseek 或 anthropic
-  model: deepseek-v4-flash     # 用 anthropic 时可填 claude-sonnet-5
+  model: deepseek-flash        # 2026-10 DeepSeek 把 deepseek-v4-flash 改名成 deepseek-flash（旧名字还能用，但模型列表里已经没有了）；用 anthropic 时可填 claude-sonnet-5
+  timeout_sec: 240             # 一条消息最多等 AI 多少秒。DeepSeek 忙的时候要排队（2026-10-15 实测排了近 2 分钟），等太久就算这条识别失败
   vision: true                 # 频道消息里的图片（喊单图、持仓截图）也交给 AI 看；false = 只看文字
 
 paper:

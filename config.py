@@ -162,6 +162,7 @@ class Config:
         llm = raw.get("llm") or {}
         self.llm_provider = str(llm.get("provider", "deepseek")).lower()
         self.llm_model = str(llm.get("model", "deepseek-v4-flash"))
+        self.llm_timeout_sec = float(llm.get("timeout_sec", 240))   # 一条消息最多等 AI 多少秒（DeepSeek 忙的时候会排队）
         self.llm_vision = bool(llm.get("vision", True))   # 频道消息里的图片也交给 AI 看
         paper = raw.get("paper") or {}
         self.paper_equity = float(paper.get("equity", 1000))

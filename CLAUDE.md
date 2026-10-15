@@ -93,4 +93,5 @@
 - **机器人突然完全没反应**：先用 `getMe` 检查 Token。返回 401 说明机器人被删或 Token 被重置。Token 是建服务器时写入的，只能让用户新建机器人（名字按第 2 步的要求），征得同意后 `destroy --yes` 再 `create`；已登录的话，登录状态和交易记录会一起清空。
 - **改动没生效**：确认已合并进 main；在控制台运行 `tail /var/log/tgst-update.log` 查看。**首次部署时的真实原因**：建服务器没配 SSH 密钥，DigitalOcean 把 root 密码（发到用户邮箱）设成「首次登录必须修改」，改之前 cron 会被 PAM 拒绝执行 root 任务，自动更新一次都不会跑，重启也没用。现在的开机脚本改用 systemd 定时器 `tgst-update.timer`，不受影响；2026-09-25 之前建的服务器，需要用户打开控制台，用邮件里的密码登录并设一次新密码。控制台提示 `Current password` 就是这个原因。
 - **/gate（或 /bitget）验证失败**：检查 IP 白名单、合约交易权限（Bitget 还要检查 passphrase）。
-- **DeepSeek 报 401/402**：Key 错误或余额不足；模型名应为 `deepseek-v4-flash`。
+- **DeepSeek 报 401/402**：Key 错误或余额不足；模型名 2026-10 起是 `deepseek-flash`（旧名 `deepseek-v4-flash` 还能用，但 `/models` 列表里已经没有了）。沙盒里可以查余额（`GET https://api.deepseek.com/user/balance`，密钥从 deploy.env 读、不打印）。
+- **一直报「⚠️ AI 解析失败」**：先看是不是 DeepSeek 在排队（2026-10-15 出现过：请求先回 HTTP 200，然后只发「: keep-alive」，排了 2～3 分钟才出结果；机器人原来只等 45 秒，全部失败）。在沙盒里发一个流式请求看多久出第一个字就知道。现在 `signal_parser` 用流式请求，排队时不会断，一条消息最多等 `llm.timeout_sec`（240 秒）；还不行就是 DeepSeek 那边的问题，等它恢复。期间新的喊单识别不了，已经开着的单子止损止盈照常（不需要 AI）。
