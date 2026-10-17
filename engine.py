@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from config import rules_line
 from db import now_ms
 from exchange import net_error
 
@@ -46,6 +47,7 @@ HELP = ("📖 命令\n"
         "/risk    风控设置（也可以点「💰 风控设置」按钮）：/risk 5% 每单亏总权益的 5%，/risk 10u 每单固定亏 10U\n"
         "/maxpos 10  同时最多几单（持仓+挂单）\n"
         "/maxloss 6  每天最多亏几单，到了当天不再开新仓（0 = 不限）\n"
+        "/rules   跟单规则（也可以点「🧭 跟单规则」按钮）：进场挂限价/市价、晒盈利平不平、止损、第一止盈后推不推保本、跟不跟频道减仓\n"
         "/backtest 频道名 天数  回测它最近 30 天（最多 90 天）按现在规则的成绩；写几个频道名就当成一个账户一起回测（不写就给按钮选，可以多选、选天数）\n"
         "/check   逐单核对实盘单的止损、止盈（直接查交易所）\n"
         "/pause   暂停实盘开新仓\n"
@@ -1613,6 +1615,8 @@ class Engine:
         lines.append(f"🛡 同时最多 {mp} 单｜每天最多亏 " + (f"{ml} 单（今天实盘已亏 {self.losses_today('live')} 单、"
                                                     f"模拟 {self.losses_today('paper')} 单）" if ml else "不限")
                      + "；点「💰 风控设置」可以改")
+        lines.append(f"🧭 跟单规则：{rules_line(self.cfg.risk)}" + ("（机器人里改过）" if self.cfg.rules_from_bot() else "")
+                     + "；点「🧭 跟单规则」可以改")
         mb = self.maker_block()
         if not self.cfg.maker_orders:
             lines.append("📝 下单方式：全部市价（开仓、到价止盈、止损）")

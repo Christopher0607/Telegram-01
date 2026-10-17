@@ -21,7 +21,7 @@ import time
 import types
 from datetime import datetime, timedelta, timezone
 
-from config import BASE_DIR, DATA_DIR, Config
+from config import BASE_DIR, DATA_DIR, Config, entry_rule, exit_rules, follows_reduce, rules_code
 
 log = logging.getLogger("backtest")
 MIN, HOUR, DAY = 60_000, 3_600_000, 86_400_000
@@ -66,8 +66,8 @@ async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, 
     return [e for e in await asyncio.gather(*(one(m) for m in kept)) if e]
 
 
-async def send_long(send, text: str, limit: int = 3800) -> None:
-    """Telegram 一条消息最多 4096 个字，长的报告按行拆成几条发（不然后面会被截掉）。"""
+async def send_long(send, text: str, limit: int = 3800, markup: dict | None = None) -> None:
+    """Telegram 一条消息最多 4096 个字，长的报告按行拆成几条发（不然后面会被截掉）。markup：按钮，放在最后一条下面。"""
     part = ""
     for line in text.split("\n"):
         if part and len(part) + 1 + len(line) > limit:
@@ -75,7 +75,7 @@ async def send_long(send, text: str, limit: int = 3800) -> None:
             part = ""
         part = f"{part}\n{line}" if part else line
     if part:
-        await send(part)
+        await (send(part, markup) if markup else send(part))
 
 
 async def run(client, cfg, ch, days: int, keep, build_ctx, parser_cls, send, equity: float | None = None) -> None:
@@ -137,7 +137,8 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
             tail = (err or b"").decode(errors="replace").strip().splitlines()
             raise RuntimeError(tail[-1][:300] if tail else f"模拟进程退出码 {proc.returncode}")
         with open(out_path, encoding="utf-8") as f:
-            await send_long(send, report_text(json.load(f)))
+            res = json.load(f)
+        await send_long(send, report_text(res), markup=report_markup(res))
     except Exception as e:
         log.exception("回测失败")
         await send(f"❌ 「{name}」回测失败：{str(e)[:300]}\n请把这条消息发给 Claude Code。")
@@ -280,20 +281,6 @@ HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的�
 )
 
 
-def exit_rules(r: dict) -> str:
-    """晒盈利怎么平、亏到哪里止损、第一止盈后推不推保本，写成一句话（报告里用）。"""
-    frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
-    a = ("晒盈利不平仓" if not r.get("close_on_profit_post") else "晒盈利全部平掉" if frac >= 0.95
-         else "晒盈利先平一半、剩下推保本" if abs(frac - 0.5) < 1e-9 else f"晒盈利先平 {frac * 100:.0f}%、剩下推保本")
-    return (a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
-            + "｜" + ("第一止盈后推保本" if r.get("breakeven_after_tp1", True) else "第一止盈后不推保本")
-            + "｜" + ("跟频道减仓" if follows_reduce(r) else "频道减仓不跟"))
-
-
-def follows_reduce(r: dict) -> bool:
-    return bool(r.get("follow_close", True)) and bool(r.get("follow_reduce", True))
-
-
 def rules_key(r: dict) -> tuple:
     """这套规则实际上是哪一种做法：跟现在一样、或者跟前面跑过的一样的对比就不用再跑。"""
     me, cop = bool(r.get("market_entry")), bool(r.get("close_on_profit_post"))
@@ -310,6 +297,7 @@ VARIANTS = (   # 回测时同一段行情拿来对比的几种完整做法（进
     ("挂限价等回调、晒盈利不平仓、跟频道减仓（09-29 以前、10-09～10-13 的做法）",
      {"market_entry": False, "allow_limit_orders": True, "close_on_profit_post": False, "follow_reduce": True}),
 )
+VARIANT_TAGS = ("E", "F", "G", "H")   # 报告里给上面几种做法的代号（「采用 F」按钮用），接在 HEAD_VARIANTS 的 A～D 后面
 
 
 def closed_stats(rs: list) -> dict:
@@ -515,7 +503,8 @@ async def simulate(job_path: str, out_path: str):
         now_rules = cfg.risk_for(ch)
         seen = {rules_key(now_rules)}
         # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少（效果跟现在或者前面一样的不重复跑）
-        for head, (label, ov) in [(True, v) for v in HEAD_VARIANTS] + [(False, v) for v in VARIANTS]:
+        for head, tag, (label, ov) in ([(True, v[0], v) for v in HEAD_VARIANTS]
+                                       + [(False, VARIANT_TAGS[i], v) for i, v in enumerate(VARIANTS)]):
             key = rules_key({**now_rules, **ov})
             if key in seen:
                 continue
@@ -525,7 +514,8 @@ async def simulate(job_path: str, out_path: str):
             tr, _, _ = await one_pass(ov)
             done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
             rs = [t["r_mult"] for t in done]
-            compare.append(dict(label=label, head=head, opened=sum(1 for t in tr if t.get("opened_at")),
+            compare.append(dict(label=label, tag=tag, code=rules_code({**now_rules, **ov}), head=head,
+                                opened=sum(1 for t in tr if t.get("opened_at")),
                                 **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
                                 per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
                                                   total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
@@ -557,8 +547,7 @@ async def simulate(job_path: str, out_path: str):
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
         "old_source": ex.old_used, "compare": compare,
-        "rules_now": [("进场一律市价" if risk.get("market_entry") else "挂限价等回调" if risk.get("allow_limit_orders")
-                       else "价格跑远了不追"),
+        "rules_now": [entry_rule(risk),
                       ("晒盈利不平仓" if not risk.get("close_on_profit_post") else "晒盈利就清仓" if pfrac >= 0.95
                        else "晒盈利先减仓推保本")] + ([f"亏到 {float(risk['stop_loss_r']):g}R 就止损"]
                                                 if float(risk.get("stop_loss_r") or 1.0) < 0.999 else [])
@@ -680,7 +669,7 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
             lines.append(f"\n🔁 其他规则对比（总 R｜平均每单｜胜率｜最大回撤{'｜收益率' if has_ret else ''}）：")
             lines.append(f"• 现在的规则（{'、'.join(res.get('rules_now') or [])}）：{row(now)}")
             for c in rest:
-                lines.append(f"• {c['label']}：{row(c)}")
+                lines.append(f"• {c['tag'] + ' ' if c.get('tag') else ''}{c['label']}：{row(c)}")
     if res["closed"]:
         lines.append("\n最近的单子：")
         for t in res["closed"][-12:]:
@@ -694,7 +683,20 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
            if res.get("old_source") else "")
     lines.append("\n说明：用 1 分钟 K 线模拟，进场按信号那一分钟的价格，同一根 K 线碰到止损和止盈按止损算；"
                  f"{old}{fee}；没算滑点和资金费。历史表现不代表以后。")
+    if report_markup(res):
+        lines.append("\n👇 想换成上面哪一种：点「采用 X」（会先问你一次），或者点「🧭 跟单规则」自己一项项改。")
     return "\n".join(lines)
+
+
+def report_markup(res: dict) -> dict | None:
+    """回测报告下面的按钮：对比过的每一种做法一个「采用」（点了先问一次，确认了才改「🧭 跟单规则」）。"""
+    picks = [c for c in res.get("compare") or [] if c.get("code") and c.get("tag")]
+    if not picks:
+        return None
+    btns = [{"text": f"采用 {c['tag']}", "callback_data": f"rlpick:{c['code']}:{c['tag']}"} for c in picks]
+    rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    rows.append([{"text": "🧭 跟单规则（自己一项项改）", "callback_data": "rlpick:panel:-"}])
+    return {"inline_keyboard": rows}
 
 
 if __name__ == "__main__":

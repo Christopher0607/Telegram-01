@@ -20,8 +20,13 @@ PRIVATE_PATH = os.path.join(DATA_DIR, "private_groups.json")
 MODES_PATH = os.path.join(DATA_DIR, "modes.json")
 RISK_PATH = os.path.join(DATA_DIR, "risk.json")   # 主人在机器人里调的风控设置（/risk）
 PAPER_PATH = os.path.join(DATA_DIR, "paper.json")  # 主人在机器人里停止/恢复模拟盘
+RULES_PATH = os.path.join(DATA_DIR, "rules.json")  # 主人在机器人里改的跟单规则（🧭 跟单规则 / /rules）
 RISK_KEYS = ("risk_per_trade_pct", "risk_per_trade_usdt")    # 每单风险（这两项一起改）
 LIMIT_KEYS = ("max_open_positions", "max_daily_losses")      # 同时最多几单、每天最多亏几单（机器人里也能改）
+# 跟单规则：进场怎么进、晒盈利平不平、止损放哪、第一止盈后推不推保本、跟不跟频道减仓（机器人里也能改，回测里对比的就是这几项）
+RULE_KEYS = ("market_entry", "allow_limit_orders", "close_on_profit_post", "profit_post_close_frac",
+             "stop_loss_r", "breakeven_after_tp1", "follow_reduce")
+RULE_FLOATS = ("profit_post_close_frac", "stop_loss_r")
 
 # 所有风控参数的默认值（config.yaml 里写了就以 config.yaml 为准）
 DEFAULT_RISK = {
@@ -88,6 +93,60 @@ def _saved_owner() -> int:
             return int(json.load(f).get("id") or 0)
     except Exception:
         return 0
+
+
+def rule_value(key: str, v):
+    """跟单规则的值统一成一种写法（config.yaml 里 1 和 1.0、true 和 yes 都算一样）：比例是小数，其余是开/关。"""
+    return float(v if v is not None else 1.0) if key in RULE_FLOATS else bool(v)
+
+
+def follows_reduce(r: dict) -> bool:
+    return bool(r.get("follow_close", True)) and bool(r.get("follow_reduce", True))
+
+
+def entry_rule(r: dict) -> str:
+    """价格跑出进场区以后怎么进（回测报告、🧭 跟单规则、📊 状态都用这个写法）。"""
+    return "进场一律市价" if r.get("market_entry") else "挂限价等回调" if r.get("allow_limit_orders") else "价格跑远了不追"
+
+
+def exit_rules(r: dict) -> str:
+    """晒盈利怎么平、亏到哪里止损、第一止盈后推不推保本、跟不跟频道减仓，写成一句话（回测报告、🧭 跟单规则里用）。"""
+    frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
+    a = ("晒盈利不平仓" if not r.get("close_on_profit_post") else "晒盈利全部平掉" if frac >= 0.95
+         else "晒盈利先平一半、剩下推保本" if abs(frac - 0.5) < 1e-9 else f"晒盈利先平 {frac * 100:.0f}%、剩下推保本")
+    return (a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
+            + "｜" + ("第一止盈后推保本" if r.get("breakeven_after_tp1", True) else "第一止盈后不推保本")
+            + "｜" + ("跟频道减仓" if follows_reduce(r) else "频道减仓不跟"))
+
+
+def rules_line(r: dict) -> str:
+    """整套跟单规则写成一句话：进场｜晒盈利｜止损｜第一止盈后｜频道减仓。"""
+    return entry_rule(r) + "｜" + exit_rules(r)
+
+
+def rules_code(r: dict) -> str:
+    """整套跟单规则写成一个短代号（放进回测报告下面「采用」按钮里）：
+    进场 L 挂限价 / M 市价 / N 不追 - 晒盈利平掉多少（0 = 不平）- 亏到几 R 止损 - 第一止盈后保本 1/0 - 跟频道减仓 1/0。"""
+    entry = "M" if r.get("market_entry") else "L" if r.get("allow_limit_orders") else "N"
+    frac = float(r.get("profit_post_close_frac") or 1.0) if r.get("close_on_profit_post") else 0.0
+    return (f"{entry}-{frac:g}-{float(r.get('stop_loss_r') or 1.0):g}-{int(bool(r.get('breakeven_after_tp1', True)))}"
+            f"-{int(follows_reduce(r))}")
+
+
+def rules_from_code(code: str) -> dict | None:
+    """rules_code 的反过来：代号 → 要改的设置。看不懂（按钮过期、被改过）返回 None。"""
+    try:
+        entry, frac, cut, be, red = code.split("-")
+        frac, cut = float(frac), float(cut)
+    except ValueError:
+        return None
+    if entry not in ("L", "M", "N") or not 0 <= frac <= 1 or not 0 < cut <= 1 or be not in ("0", "1") or red not in ("0", "1"):
+        return None
+    out = {"market_entry": entry == "M", "allow_limit_orders": entry != "N", "close_on_profit_post": frac > 0,
+           "stop_loss_r": cut, "breakeven_after_tp1": be == "1", "follow_reduce": red == "1"}
+    if frac > 0:
+        out["profit_post_close_frac"] = frac
+    return out
 
 
 def _load_json(path: str) -> dict:
@@ -183,6 +242,10 @@ class Config:
         if "risk_per_trade_pct" in self.risk_override:   # 旧格式（只有每单风险）
             self.risk_override = {"trade": self.risk_override}
         self._apply_risk_override()
+        # 跟单规则：同样是 config.yaml 写默认值，主人在机器人里改过（data/rules.json）就用改过的
+        self.rules_yaml = {k: rule_value(k, self.risk.get(k)) for k in RULE_KEYS}
+        self.rules_override = _load_json(RULES_PATH)
+        self._apply_rules_override()
 
         self.channels: list[ChannelCfg] = []
         for c in raw.get("channels") or []:
@@ -250,6 +313,31 @@ class Config:
         else:
             self.risk_override["trade"] = dict(new, base=dict(self.risk_yaml), at=int(time.time()))
         self._save_risk_override()
+
+    def _apply_rules_override(self):
+        """机器人里（🧭 跟单规则）改过的规则就用改过的；之后 config.yaml 又改了那一项，就以 config.yaml 为准（谁最后改算谁的）。"""
+        o = self.rules_override if isinstance(self.rules_override, dict) else {}
+        for k in RULE_KEYS:
+            e = o.get(k) if isinstance(o.get(k), dict) else {}
+            ok = "value" in e and e.get("base") == self.rules_yaml[k]
+            self.risk[k] = rule_value(k, e["value"]) if ok else self.rules_yaml[k]
+
+    def set_rules(self, values: dict):
+        """机器人里改跟单规则（一项或几项一起）。保存到 data/rules.json，重启后照样有效。"""
+        for k, v in values.items():
+            v = rule_value(k, v)
+            if v == self.rules_yaml[k]:
+                self.rules_override.pop(k, None)   # 和 config.yaml 一样了，不用再记
+            else:
+                self.rules_override[k] = {"value": v, "base": self.rules_yaml[k], "at": int(time.time())}
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(RULES_PATH, "w", encoding="utf-8") as f:
+            json.dump(self.rules_override, f, ensure_ascii=False)
+        self._apply_rules_override()
+
+    def rules_from_bot(self) -> list[str]:
+        """哪几项跟单规则现在是主人在机器人里改的（不是 config.yaml 的默认值）。"""
+        return [k for k in RULE_KEYS if self.risk[k] != self.rules_yaml[k]]
 
     def set_limit(self, key: str, value: int):
         """机器人里调「同时最多几单」「每天最多亏几单」（0 = 不限）。保存到 data/risk.json。"""

@@ -32,7 +32,8 @@ from telethon.tl.types import (ChannelParticipantAdmin, ChannelParticipantCreato
                                ChatInviteAlready, ChatParticipantAdmin, ChatParticipantCreator, MessageMediaPhoto)
 
 import backtest
-from config import ChannelCfg, Config, DATA_DIR, load_private_groups, save_private_group, save_secrets
+from config import (RULE_KEYS, ChannelCfg, Config, DATA_DIR, load_private_groups, rules_from_code, rules_line,
+                    save_private_group, save_secrets)
 from db import DB
 from engine import MODE_CN, SIDE_CN, Engine, MsgCtx, fmt
 from exchange import LABELS, Exchange
@@ -707,7 +708,8 @@ async def risk_panel(cfg: Config, engine: Engine, head: str = "") -> tuple[str, 
               "调大要再确认一次；只影响之后新开的单子。"]
     rows = [[{"text": f"💰 每单风险：{describe_risk(pct, usdt)}", "callback_data": "risk:menu:trade"}],
             [{"text": f"📦 同时最多持仓：{mp} 单", "callback_data": "risk:menu:maxpos"}],
-            [{"text": f"⛔ 每天最多亏：{limit_desc('maxloss', ml)}", "callback_data": "risk:menu:maxloss"}]]
+            [{"text": f"⛔ 每天最多亏：{limit_desc('maxloss', ml)}", "callback_data": "risk:menu:maxloss"}],
+            [{"text": "🧭 跟单规则（进场、晒盈利、止损、保本、减仓）", "callback_data": "rules:panel"}]]
     return "\n".join(lines), {"inline_keyboard": rows}
 
 
@@ -855,6 +857,109 @@ def find_channel(cfg: Config, word: str) -> ChannelCfg | None:
     return None
 
 
+# 🧭 跟单规则：回测报告里对比的就是这几项。每一行一项规则：(代号, 按钮上的名字, 选项)；
+# 选项：(代号, 按钮上的字, 完整写法（跟回测报告一样）, 对应的设置)
+RULE_ROWS = (
+    ("entry", "进场", (("limit", "挂限价", "挂限价等回调", {"market_entry": False, "allow_limit_orders": True}),
+                       ("market", "市价", "进场一律市价", {"market_entry": True}))),
+    ("profit", "晒盈利", (("off", "不平", "晒盈利不平仓", {"close_on_profit_post": False}),
+                          ("all", "全平", "晒盈利全部平掉", {"close_on_profit_post": True, "profit_post_close_frac": 1.0}),
+                          ("half", "平一半", "晒盈利先平一半、剩下推保本",
+                           {"close_on_profit_post": True, "profit_post_close_frac": 0.5}))),
+    ("stop", "止损", (("1", "信号止损", "打到信号止损才平", {"stop_loss_r": 1.0}),
+                      ("0.5", "亏0.5R就平", "亏到 0.5R 就止损", {"stop_loss_r": 0.5}))),
+    ("be", "止盈1后", (("1", "推保本", "第一止盈后推保本", {"breakeven_after_tp1": True}),
+                       ("0", "不推", "第一止盈后不推保本", {"breakeven_after_tp1": False}))),
+    ("reduce", "减仓", (("1", "跟频道", "跟频道减仓", {"follow_reduce": True}),
+                        ("0", "不跟", "频道减仓不跟", {"follow_reduce": False}))),
+)
+RULES_NEW_ONLY = ("entry", "stop")   # 这两项只影响之后新开的单子；其它几项已经开着的单子也马上按新的来
+
+
+def rule_picked(cfg: Config, vals: dict) -> bool:
+    return all(cfg.risk.get(k) == v for k, v in vals.items())
+
+
+def rules_panel(cfg: Config, head: str = "") -> tuple[str, dict]:
+    """🧭 跟单规则：进场、晒盈利、止损、第一止盈后、频道减仓。点按钮马上改（保存在服务器 data/rules.json）。"""
+    r = cfg.risk
+    chase, ttl = float(r.get("chase_pct") or 0), float(r.get("limit_order_ttl_min") or 0)
+    lines = [head, ""] if head else []
+    lines += ["🧭 跟单规则（点下面的按钮改，马上生效；实盘、模拟、回测都按这个）",
+              f"现在：{rules_line(r)}",
+              "（写法跟「📊 回测」报告里一样，可以直接对照）", "",
+              f"• 进场：价格跑出进场区 {chase:g}% 以外 → 挂限价等回调（{ttl / 60:g} 小时不成交就撤），或者一律市价追进去",
+              "• 晒盈利：频道晒这个币的盈利/浮盈时 → 不平仓（照止盈止损走）、全部平掉，或者先平一半、剩下的止损推到开仓价",
+              "• 止损：打到信号的止损才平，或者亏到 0.5R 就平（仓位还是按信号的止损算）",
+              "• 止盈1后：第一止盈成交后，剩下的止损推到开仓价（保本），或者不推",
+              "• 减仓：频道说减仓时跟着减，或者不跟（按自己的止盈减仓）；频道说全部平仓、提损、改止盈都照跟", "",
+              "进场、止损只影响之后新开的单子；晒盈利、止盈1后、减仓，已经开着的单子也马上按新的来。"]
+    if cfg.rules_from_bot():
+        lines.append(f"config.yaml 里的默认：{rules_line(dict(r, **cfg.rules_yaml))}")
+    own = [f"{c.title or c.username}（{rules_line(cfg.risk_for(c))}）" for c in cfg.channels
+           if c.mode != "off" and any(k in (c.overrides or {}) for k in RULE_KEYS)]
+    if own:
+        lines.append("⚠️ 这几个频道在 config.yaml 里单独设了规则，不受这里影响：" + "；".join(own))
+    rows = [[{"text": ("✅ " if rule_picked(cfg, vals) else "") + f"{name}·{short}", "callback_data": f"rules:set:{key}:{code}"}
+             for code, short, _, vals in opts] for key, name, opts in RULE_ROWS]
+    if cfg.rules_from_bot():
+        rows.append([{"text": "↩️ 全部恢复 config.yaml 的设置", "callback_data": "rules:reset"}])
+    rows.append([{"text": "💰 风控设置（每单风险、最多几单）", "callback_data": "risk:panel"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def rules_diff(before: str, after: str) -> list[str]:
+    """两套规则（rules_line 的写法）哪几项不一样：["晒盈利不平仓 → 晒盈利全部平掉", …]"""
+    return [f"{a} → {b}" for a, b in zip(before.split("｜"), after.split("｜")) if a != b]
+
+
+def rules_callback(data: str, cfg: Config) -> tuple[str, dict]:
+    """「🧭 跟单规则」面板上的按钮：rules:set:profit:all / rules:reset / rules:panel；
+    回测报告下面的按钮：rlpick:代号:名字（先问一次）→ rlok:代号:名字:时间（确认后才改）。"""
+    parts = data.split(":")
+    if parts[:2] == ["rules", "set"] and len(parts) == 4:
+        row = next((x for x in RULE_ROWS if x[0] == parts[2]), None)
+        opt = next((o for o in row[2] if o[0] == parts[3]), None) if row else None
+        if opt:
+            before = rules_line(cfg.risk)
+            cfg.set_rules(opt[3])
+            if rules_line(cfg.risk) == before:
+                return rules_panel(cfg, f"本来就是「{opt[2]}」，没有变。")
+            log.info("主人把跟单规则改成 %s", rules_line(cfg.risk))
+            return rules_panel(cfg, f"✅ 已改成「{opt[2]}」"
+                               + ("（之后新开的单子按这个）" if row[0] in RULES_NEW_ONLY else "（已经开着的单子也马上按这个）"))
+    if parts[:2] == ["rules", "reset"]:
+        before = rules_line(cfg.risk)
+        cfg.set_rules(dict(cfg.rules_yaml))
+        log.info("主人把跟单规则恢复成 config.yaml 的 %s", rules_line(cfg.risk))
+        changed = rules_diff(before, rules_line(cfg.risk))
+        return rules_panel(cfg, "↩️ 已全部恢复 config.yaml 的设置" + ("：" + "；".join(changed) if changed else ""))
+    if parts[0] in ("rlpick", "rlok") and len(parts) >= 3:
+        if parts[1] == "panel":
+            return rules_panel(cfg)
+        want, tag = rules_from_code(parts[1]), parts[2][:8]
+        if want is None:
+            return rules_panel(cfg, "这个按钮看不懂了（可能是旧报告的），没有改。")
+        now = rules_line(cfg.risk)
+        target = rules_line(dict(cfg.risk, **want))
+        if target == now:
+            return rules_panel(cfg, f"现在用的就是 {tag} 这一种，不用换。")
+        if parts[0] == "rlpick":
+            changed = rules_diff(now, target)
+            a, b = now.split("｜"), target.split("｜")
+            new_only = {i for i in range(len(a)) if a[i] != b[i]} <= {0, 2}   # 只改了进场、止损
+            return (f"把跟单规则换成回测里的 {tag} 这一种吗？\n{target}\n\n跟现在比：\n" + "\n".join(f"• {x}" for x in changed)
+                    + ("\n\n（这几项只影响之后新开的单子）" if new_only else "\n\n（进场、止损只影响之后新开的单子；其它几项已经开着的单子也马上按新的来）"),
+                    {"inline_keyboard": [[{"text": f"✅ 确认换成 {tag}", "callback_data": f"rlok:{parts[1]}:{tag}:{int(time.time())}"},
+                                          {"text": "取消", "callback_data": "cancel"}]]})
+        if len(parts) != 4 or not parts[3].isdigit() or time.time() - int(parts[3]) > MODE_CONFIRM_TTL:
+            return rules_panel(cfg, "⌛ 确认按钮已经过期，没有改。要换请再点一次报告下面的按钮，或者在这里一项项改。")
+        cfg.set_rules(want)
+        log.info("主人采用回测里的 %s：%s", tag, rules_line(cfg.risk))
+        return rules_panel(cfg, f"✅ 已换成回测里的 {tag}：" + "；".join(rules_diff(now, rules_line(cfg.risk))))
+    return rules_panel(cfg)
+
+
 def start_backtest(cfg: Config, chs, days: int, notifier: Notifier, client, engine: Engine | None = None) -> str:
     """在后台跑回测（不影响实盘），进度和结果直接发给主人。chs：一个频道，或者几个频道（当成一个账户一起回测）。
     先查一下现在的实盘权益：每单风险是固定金额时，回测报告要用它算收益率。"""
@@ -994,10 +1099,14 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
         return mode_panel(cfg, engine)
     if cmd in ("/risk", "/maxpos", "/maxloss"):
         return await risk_command(text, cfg, engine)
-    if cmd == "/cb":  # 消息下面的按钮：实盘/模拟面板、每单风险面板、回测
+    if cmd == "/rules":
+        return rules_panel(cfg)
+    if cmd == "/cb":  # 消息下面的按钮：实盘/模拟面板、每单风险面板、跟单规则、回测
         data = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
         if data.startswith(("risk:", "riskok:")):
             return await risk_callback(data, cfg, engine)
+        if data.startswith(("rules:", "rlpick:", "rlok:")):
+            return rules_callback(data, cfg)
         if data.startswith(("paper:", "paperok:")):
             return await paper_callback(data, cfg, engine)
         if data.startswith("bt:"):   # 旧的单个频道按钮
@@ -1395,6 +1504,7 @@ async def cmd_run(cfg: Config):
     await notifier.send(f"🚀 信号跟单已启动（监听账号 {me.first_name}{version}）\n"
                         f"实盘总开关：{'开' if cfg.live_trading else '关，全部模拟'}"
                         f"｜{ex.label} API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n"
+                        f"🧭 跟单规则：{rules_line(cfg.risk)}\n"
                         f"常用功能点输入框下方的按钮，全部命令发 /help", KEYBOARD)
     log.info("开始监听 %d 个频道", len(chans))
     try:

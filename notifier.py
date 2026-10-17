@@ -20,10 +20,11 @@ log = logging.getLogger("notifier")
 # 输入框下方常驻的按钮：点一下就等于发对应的命令
 BUTTON_ROWS = [["📊 状态", "📈 战绩", "📜 最近交易"],
                ["🧠 AI识别", "⏸ 暂停开仓", "▶️ 恢复开仓"],
-               ["⚙️ 实盘/模拟", "💰 风控设置", "📖 帮助"],
-               ["🔍 核对止损止盈", "🛑 全部平仓"]]
+               ["⚙️ 实盘/模拟", "💰 风控设置", "🧭 跟单规则"],
+               ["🔍 核对止损止盈", "📖 帮助", "🛑 全部平仓"]]
 BUTTON_CMDS = {"📊 状态": "/status", "📈 战绩": "/stats", "📜 最近交易": "/trades", "🧠 AI识别": "/ai",
                "⏸ 暂停开仓": "/pause", "▶️ 恢复开仓": "/resume", "⚙️ 实盘/模拟": "/mode", "💰 风控设置": "/risk",
+               "🧭 跟单规则": "/rules",
                "💰 每单风险": "/risk",   # 旧按钮名（还没刷新按钮的时候也能用）
                "🔍 核对止损止盈": "/check", "📖 帮助": "/help"}
 CLOSEALL_BUTTON = "🛑 全部平仓"   # 这个按钮要再点一次「确认」才执行
@@ -34,6 +35,7 @@ KEYBOARD = {"keyboard": [[{"text": b} for b in row] for row in BUTTON_ROWS],
 MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩"), ("trades", "最近 10 笔已平仓交易"),
         ("ai", "最近 10 条频道消息的 AI 识别结果"), ("mode", "每个频道切换实盘/模拟"),
         ("risk", "风控设置：每单风险、同时最多几单、每天最多亏几单"),
+        ("rules", "跟单规则：进场挂限价/市价、晒盈利平不平、止损、保本、跟不跟减仓"),
         ("check", "核对实盘单的止损、止盈（直接查交易所）"),
         ("backtest", "回测频道最近 30～90 天的成绩（可以选几个频道一起，附新方案对比、照抄检查）"),
         ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
@@ -191,7 +193,13 @@ class Notifier:
         m = cq.get("message") or {}
         where = {"chat_id": (m.get("chat") or {}).get("id"), "message_id": m.get("message_id")}
         data = cq.get("data") or ""
-        if data.startswith(("mode:", "modeok:", "bt:", "bts:", "btgo:", "risk:", "riskok:", "paper:", "paperok:")):  # 面板上的按钮：在原消息上更新
+        if data.startswith("rlpick:"):   # 回测报告下面的「采用」按钮：报告留着，另发一条让主人确认
+            reply = await handler(f"/cb {data}", m)
+            text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
+            await self.send(text, markup)
+            return
+        if data.startswith(("mode:", "modeok:", "bt:", "bts:", "btgo:", "risk:", "riskok:", "paper:", "paperok:",
+                            "rules:", "rlok:")):  # 面板上的按钮：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))
