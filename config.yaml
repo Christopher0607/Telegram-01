@@ -38,7 +38,7 @@ channels:
   # 用户给机器人发「/join 邀请链接」，链接只保存在服务器上；群组只跟群主/管理员发的消息。
   - private: vip               # 会员群（2026-09-26 加入）
     mode: live                 # 2026-09-26 用户要求开实盘
-  - private: huhu              # 糊糊的内部会员群（2026-10-18 用户加入）：先模拟，用回测看真实成绩
+  - private: huhu              # 糊糊的内部会员群（2026-10-18 用户加入）；用户当天在机器人里切成了实盘（存在服务器 data/modes.json）
     mode: paper
   - username: zxcccckhf        # 財財加密貨幣頻道：格式最规整（进场/止盈/止损齐全）
     mode: paper
