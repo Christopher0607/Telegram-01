@@ -38,6 +38,8 @@ channels:
   # 用户给机器人发「/join 邀请链接」，链接只保存在服务器上；群组只跟群主/管理员发的消息。
   - private: vip               # 会员群（2026-09-26 加入）
     mode: live                 # 2026-09-26 用户要求开实盘
+  - private: huhu              # 糊糊的内部会员群（2026-10-18 用户加入）：先模拟，用回测看真实成绩
+    mode: paper
   - username: zxcccckhf        # 財財加密貨幣頻道：格式最规整（进场/止盈/止损齐全）
     mode: paper
   - username: chun77chun       # 哈基咪區塊貨幣中心：市价单 + 止盈 + 止损
