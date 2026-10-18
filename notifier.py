@@ -37,6 +37,7 @@ MENU = [("status", "运行状态、权益、持仓"), ("stats", "各频道战绩
         ("risk", "风控设置：每单风险、同时最多几单、每天最多亏几单"),
         ("rules", "跟单规则：进场挂限价/市价、晒盈利平不平、止损、保本、跟不跟减仓"),
         ("check", "核对实盘单的止损、止盈（直接查交易所）"),
+        ("cleanup", "清理 Telegram：退出不用的频道和群、删除私聊（机器人在跟的不动）"),
         ("backtest", "回测频道最近 30～90 天的成绩（可以选几个频道一起，附新方案对比、照抄检查）"),
         ("pause", "暂停实盘开新仓"), ("resume", "恢复实盘开新仓"),
         ("ip", "服务器 IP"), ("help", "全部命令")]
@@ -199,7 +200,7 @@ class Notifier:
             await self.send(text, markup)
             return
         if data.startswith(("mode:", "modeok:", "bt:", "bts:", "btgo:", "risk:", "riskok:", "paper:", "paperok:",
-                            "rules:", "rlok:", "jn:")):  # 面板上的按钮：在原消息上更新
+                            "rules:", "rlok:", "jn:", "cl:", "clok:")):  # 面板上的按钮：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))

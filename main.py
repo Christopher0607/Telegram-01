@@ -1131,6 +1131,167 @@ async def join_pick(data: str, cfg: Config, client, restart) -> str:
             f"3 秒后自动重启开始监听，现在是{cfg.mode_label(slot)}。")
 
 
+# ====================================================================
+# 🧹 清理 Telegram（机器人登录的那个号）：退出不用的频道/群、删除私聊的聊天记录
+# 机器人在跟的频道和群、Telegram 官方通知（收验证码）、收藏夹、跟这个机器人的对话不列出来，不会被删
+# ====================================================================
+CLEAN_KINDS = (("channel", "📢 频道"), ("group", "👥 群"), ("user", "💬 私聊"))
+CLEAN_PAGE = 8          # 每页几个
+CLEAN_TTL = 1800        # 面板 30 分钟没动就过期（列表可能已经变了）
+CLEAN_CONFIRM_TTL = 300
+TG_SERVICE_ID = 777000  # Telegram 官方通知（登录验证码从这里来）
+_clean: dict = {}       # 主人正在用的清理面板：{"items": [...], "sel": set(), "kind", "page", "at"}
+
+
+def clean_protected(cfg: Config) -> tuple[set, set]:
+    """不能动的：机器人在跟的频道/群（按 id）、/join 记下的私人群、Telegram 官方通知、这个机器人；还有 config.yaml 里公开频道的用户名。"""
+    ids = {utils.get_peer_id(c.entity) for c in cfg.channels if c.entity is not None}
+    ids |= {int(v["id"]) for v in load_private_groups().values() if isinstance(v, dict) and v.get("id")}
+    ids.add(TG_SERVICE_ID)
+    bot = (cfg.tg_bot_token or "").split(":")[0]
+    if bot.isdigit():
+        ids.add(int(bot))
+    names = {c.username.lower() for c in cfg.channels if not c.private}
+    return ids, names
+
+
+async def clean_start(cfg: Config, client) -> tuple[str, dict]:
+    """/cleanup：读一遍监听账号的全部对话，打开清理面板。"""
+    ids, names = clean_protected(cfg)
+    items = []
+    async for d in client.iter_dialogs():
+        ent = d.entity
+        if d.id in ids or getattr(ent, "is_self", False) or (getattr(ent, "username", None) or "").lower() in names:
+            continue
+        kind = "user" if d.is_user else "channel" if d.is_channel and not d.is_group else "group"
+        items.append({"id": d.id, "title": d.title or d.name or str(d.id), "kind": kind, "bot": bool(getattr(ent, "bot", False)),
+                      "date": d.date.timestamp() if d.date else 0.0})
+    items.sort(key=lambda x: x["date"])   # 最久没消息的在前：多半是不用的
+    _clean.clear()
+    _clean.update(items=items, sel=set(), kind="channel", page=0, at=time.time(), tz=cfg.tz_offset)
+    return clean_panel()
+
+
+def clean_panel(head: str = "") -> tuple[str, dict]:
+    s = _clean
+    tz = timezone(timedelta(hours=s["tz"]))
+    mine = [i for i, x in enumerate(s["items"]) if x["kind"] == s["kind"]]
+    pages = max(1, -(-len(mine) // CLEAN_PAGE))
+    s["page"] = page = max(0, min(s["page"], pages - 1))
+    shown = mine[page * CLEAN_PAGE:(page + 1) * CLEAN_PAGE]
+    label = dict(CLEAN_KINDS)[s["kind"]]
+    lines = [head, ""] if head else []
+    lines += ["🧹 清理 Telegram（机器人登录的那个号）",
+              "点名字打勾，选好了点最下面的「处理选中的」，会再问你一次。",
+              "频道和群：退出；私聊：删除聊天记录（只删你这边）。退了、删了不能撤销。",
+              "机器人在跟的频道和群、Telegram 官方通知、收藏夹、跟这个机器人的对话不会列出来。",
+              f"现在看：{label}，第 {page + 1}/{pages} 页（最久没消息的在前，括号里是最后一条消息的日期）"]
+    if not mine:
+        lines.append("（这一栏是空的）")
+    rows = [[{"text": ("· " if k == s["kind"] else "") + f"{name} {sum(1 for x in s['items'] if x['kind'] == k)}",
+              "callback_data": f"cl:k:{k}"} for k, name in CLEAN_KINDS]]
+    for i in shown:
+        x = s["items"][i]
+        when = datetime.fromtimestamp(x["date"], tz).strftime("%y-%m-%d") if x["date"] else "没有消息"
+        rows.append([{"text": ("☑️ " if i in s["sel"] else "⬜ ") + ("🤖 " if x["bot"] else "") + f"{x['title'][:24]}（{when}）",
+                      "callback_data": f"cl:t:{i}"}])
+    nav = []
+    if page > 0:
+        nav.append({"text": "« 上一页", "callback_data": f"cl:p:{page - 1}"})
+    if shown:
+        nav.append({"text": "本页全不选" if all(i in s["sel"] for i in shown) else "本页全选", "callback_data": "cl:a"})
+    if page < pages - 1:
+        nav.append({"text": "下一页 »", "callback_data": f"cl:p:{page + 1}"})
+    if nav:
+        rows.append(nav)
+    n = len(s["sel"])
+    rows.append([{"text": f"🗑 处理选中的 {n} 个", "callback_data": "cl:go"}]
+                + ([{"text": "清空勾选", "callback_data": "cl:c"}] if n else []))
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def clean_counts(xs: list) -> str:
+    left = sum(1 for x in xs if x["kind"] != "user")
+    users = len(xs) - left
+    return "、".join(p for p in ((f"退出 {left} 个频道/群" if left else ""), (f"删除 {users} 个私聊" if users else "")) if p)
+
+
+async def clean_callback(data: str, client, notifier: Notifier) -> str | tuple[str, dict]:
+    """清理面板上的按钮：cl:k:频道类型 / cl:p:页 / cl:t:第几个 / cl:a 本页全选 / cl:c 清空 / cl:go 确认 / cl:back；clok:时间 = 真的执行。"""
+    parts = data.split(":")
+    if not _clean or time.time() - _clean["at"] > CLEAN_TTL:
+        _clean.clear()
+        return "这个清理面板过期了（30 分钟没动），请重新发 /cleanup。"
+    s = _clean
+    s["at"] = time.time()
+    if parts[0] == "clok":
+        if len(parts) != 2 or not parts[1].isdigit() or time.time() - int(parts[1]) > CLEAN_CONFIRM_TTL:
+            return clean_panel("⌛ 确认按钮过期了，什么都没做。")
+        targets = [s["items"][i] for i in sorted(s["sel"])]
+        if not targets:
+            return clean_panel("还没勾选。")
+        _clean.clear()
+        task = asyncio.create_task(clean_run(targets, client, notifier))
+        _background.add(task)
+        task.add_done_callback(_background.discard)
+        return f"⏳ 正在处理 {len(targets)} 个（{clean_counts(targets)}），每个隔一秒，做完发消息告诉你。"
+    try:
+        if parts[1] == "k" and parts[2] in dict(CLEAN_KINDS):
+            s["kind"], s["page"] = parts[2], 0
+        elif parts[1] == "p":
+            s["page"] = int(parts[2])
+        elif parts[1] == "t":
+            i = int(parts[2])
+            if 0 <= i < len(s["items"]):
+                s["sel"] ^= {i}
+        elif parts[1] == "a":
+            mine = [i for i, x in enumerate(s["items"]) if x["kind"] == s["kind"]]
+            shown = set(mine[s["page"] * CLEAN_PAGE:(s["page"] + 1) * CLEAN_PAGE])
+            s["sel"] = s["sel"] - shown if shown <= s["sel"] else s["sel"] | shown
+        elif parts[1] == "c":
+            s["sel"] = set()
+        elif parts[1] == "go":
+            if not s["sel"]:
+                return clean_panel("👆 还没勾选：点名字打勾，再点「处理选中的」。")
+            picked = [s["items"][i] for i in sorted(s["sel"])]
+            lines = [f"⚠️ 确定要{clean_counts(picked)}吗？退了、删了不能撤销（你手机上也会消失）："]
+            for k, name in CLEAN_KINDS:
+                xs = [x["title"][:24] for x in picked if x["kind"] == k]
+                if xs:
+                    lines.append(f"{name}：" + "、".join(xs[:40]) + (f" 等 {len(xs)} 个" if len(xs) > 40 else ""))
+            return "\n".join(lines), {"inline_keyboard": [
+                [{"text": "✅ 确认，开始处理", "callback_data": f"clok:{int(time.time())}"}],
+                [{"text": "« 返回修改", "callback_data": "cl:back"}]]}
+    except (IndexError, ValueError):
+        pass
+    return clean_panel()
+
+
+async def clean_run(targets: list, client, notifier: Notifier):
+    """一个个退出/删除（频道和群：退出；私聊：删除聊天记录，只删自己这边），隔一秒，碰到 Telegram 限速就等一等。"""
+    done, fails = [], []
+    for x in targets:
+        for attempt in range(2):
+            try:
+                await client.delete_dialog(x["id"])
+                done.append(x)
+                break
+            except FloodWaitError as e:
+                if attempt or e.seconds > 120:
+                    fails.append((x, f"Telegram 要求等 {e.seconds // 60 + 1} 分钟"))
+                    break
+                await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                fails.append((x, str(e)[:60]))
+                break
+        await asyncio.sleep(1)
+    log.info("清理 Telegram：处理了 %d 个，失败 %d 个", len(done), len(fails))
+    msg = f"🧹 清理完了：{clean_counts(done) or '一个都没处理成'}。"
+    if fails:
+        msg += f"\n没处理成的 {len(fails)} 个：" + "；".join(f"{x['title'][:20]}（{why}）" for x, why in fails[:20])
+    await notifier.send(msg)
+
+
 async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, engine: Engine,
                         client=None, restart=restart_soon) -> str | tuple[str, dict] | None:
     """机器人命令入口：/ai、/ip、/join、/gate、/weex、/bitget、/gatetest、/weextest 在这里处理，其余交给 engine。"""
@@ -1148,6 +1309,8 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
         return await risk_command(text, cfg, engine)
     if cmd == "/rules":
         return rules_panel(cfg)
+    if cmd == "/cleanup":
+        return await clean_start(cfg, client)
     if cmd == "/cb":  # 消息下面的按钮：实盘/模拟面板、每单风险面板、跟单规则、回测
         data = text.split(maxsplit=1)[1] if len(text.split()) > 1 else ""
         if data.startswith(("risk:", "riskok:")):
@@ -1156,6 +1319,8 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
             return rules_callback(data, cfg)
         if data.startswith("jn:"):   # /join 名字（没有邀请链接）列出来的群
             return await join_pick(data, cfg, client, restart)
+        if data.startswith(("cl:", "clok:")):   # 🧹 清理 Telegram 面板
+            return await clean_callback(data, client, notifier)
         if data.startswith(("paper:", "paperok:")):
             return await paper_callback(data, cfg, engine)
         if data.startswith("bt:"):   # 旧的单个频道按钮
