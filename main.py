@@ -89,10 +89,12 @@ async def find_private(client, info: dict | None, join: bool):
         return await client.get_entity(info["id"])
     except Exception:
         pass
-    try:
-        return await open_invite(client, info["hash"], join)
-    except Exception as e:
-        err = e
+    err = ValueError("监听账号不在这个群里，也没有邀请链接（请管理员把监听账号拉进群，或者发 /join 名字 邀请链接）")
+    if info.get("hash"):   # 从列表里选的群（管理员直接拉进群，/join 名字）没有邀请链接，只能按 id 找
+        try:
+            return await open_invite(client, info["hash"], join)
+        except Exception as e:
+            err = e
     await client.get_dialogs()  # 刷新本地记录，再按 id 找一次
     try:
         return await client.get_entity(info["id"])
@@ -1057,15 +1059,16 @@ def restart_soon():
 async def join_command(text: str, cfg: Config, client, restart) -> str:
     """/join 邀请链接：跟一个私人群/频道（会员群）。链接只保存在服务器上：GitHub 仓库是公开的，不能写进 config.yaml。"""
     h = invite_hash(text)
-    if not h:
-        return "用法：/join 邀请链接（t.me/+ 开头的私人群链接）。公开频道请告诉 Claude Code 加到 config.yaml。"
     slots = [c for c in cfg.channels if c.private]
     if not slots:
         return "config.yaml 里还没有私人群的位置，请告诉 Claude Code 加一个。"
     words = text.split()[1:]
     slot = next((c for c in slots if c.username in words), None) or (slots[0] if len(slots) == 1 else None)
     if not slot:
-        return f"有好几个私人群位置，请写明是哪个：/join 名字 邀请链接（名字：{'、'.join(c.username for c in slots)}）"
+        return (f"有好几个私人群位置，请写明是哪个：/join 名字 邀请链接（名字：{'、'.join(c.username for c in slots)}）；"
+                f"管理员直接拉你进群、没有链接的，发 /join 名字，从列表里选")
+    if not h:   # 没有邀请链接（管理员直接把监听账号拉进群）：列出监听账号所在的群，点一下选
+        return await join_list(cfg, client, slot, " ".join(w for w in words if w != slot.username))
     try:
         ent = await open_invite(client, h, join=True)
     except InviteRequestSentError:
@@ -1081,6 +1084,50 @@ async def join_command(text: str, cfg: Config, client, restart) -> str:
     restart()
     kind = "群组，只跟群主/管理员发的消息" if is_group(ent) else "频道"
     return (f"✅ 已连上「{title}」（{kind}）。邀请链接只保存在服务器上。\n"
+            f"3 秒后自动重启开始监听，现在是{cfg.mode_label(slot)}。")
+
+
+JOIN_LIST_MAX = 15   # 「/join 名字」不带链接时，最多列出监听账号最近的这么多个群/频道
+
+
+async def join_list(cfg: Config, client, slot: ChannelCfg, word: str = "") -> str | tuple[str, dict]:
+    """管理员直接把监听账号拉进群、没有邀请链接：列出监听账号所在的群和频道（最近有消息的在前），点一下就是这个位置的群。
+    word：只列名字里有这几个字的。已经在跟的频道/群不列。"""
+    known = {utils.get_peer_id(c.entity) for c in cfg.channels if c.entity is not None}
+    rows = []
+    async for d in client.iter_dialogs(limit=300):
+        if not (d.is_group or d.is_channel) or d.id in known:
+            continue
+        if word and word.lower() not in (d.title or "").lower():
+            continue
+        rows.append([{"text": ("👥 " if d.is_group else "📢 ") + (d.title or str(d.id))[:30],
+                      "callback_data": f"jn:{slot.username}:{d.id}"}])
+        if len(rows) >= JOIN_LIST_MAX:
+            break
+    nobody = ("监听账号不在这个群里：请管理员把监听账号（就是登录机器人用的那个 Telegram 号）也拉进去，"
+              f"或者向群主要一个邀请链接，发 /join {slot.username} 邀请链接。")
+    if not rows:
+        return (f"监听账号的群和频道里没有名字带「{word}」的。" if word else "监听账号还没加入别的群或频道。") + "\n" + nobody
+    return (f"「{slot.username}」这个位置要跟哪个群？下面是监听账号所在的群和频道（最近有消息的在前），点一下就连上：\n"
+            f"（列表太长可以发 /join {slot.username} 群名里的几个字；没有你要的群，说明{nobody}）",
+            {"inline_keyboard": rows})
+
+
+async def join_pick(data: str, cfg: Config, client, restart) -> str:
+    """点了 /join 列表里的群：记下这个群（没有邀请链接，以后按群 id 找），重启开始监听。"""
+    parts = data.split(":")
+    slot = next((c for c in cfg.channels if c.private and c.username == parts[1]), None) if len(parts) == 3 else None
+    if not slot or not parts[2].lstrip("-").isdigit():
+        return "按钮过期了，请重新发 /join 名字。"
+    try:
+        ent = await client.get_entity(int(parts[2]))
+    except Exception as e:
+        return f"❌ 找不到这个群：{str(e)[:150]}\n请重新发 /join {slot.username}。"
+    title = getattr(ent, "title", "") or slot.username
+    save_private_group(slot.username, {"id": utils.get_peer_id(ent), "title": title})
+    restart()
+    kind = "群组，只跟群主/管理员发的消息" if is_group(ent) else "频道"
+    return (f"✅ 已连上「{title}」（{kind}）。\n"
             f"3 秒后自动重启开始监听，现在是{cfg.mode_label(slot)}。")
 
 
@@ -1107,6 +1154,8 @@ async def admin_command(text: str, msg: dict, cfg: Config, notifier: Notifier, e
             return await risk_callback(data, cfg, engine)
         if data.startswith(("rules:", "rlpick:", "rlok:")):
             return rules_callback(data, cfg)
+        if data.startswith("jn:"):   # /join 名字（没有邀请链接）列出来的群
+            return await join_pick(data, cfg, client, restart)
         if data.startswith(("paper:", "paperok:")):
             return await paper_callback(data, cfg, engine)
         if data.startswith("bt:"):   # 旧的单个频道按钮
@@ -1373,7 +1422,8 @@ def sources_text(cfg: Config, chans: dict) -> str:
              for c in chans.values()]
     for c in cfg.channels:
         if c.mode != "off" and not any(c is x for x in chans.values()):
-            lines.append(f"• {c.username}：❌ 没连上" + ("（给我发 /join 邀请链接）" if c.private else "（请告诉 Claude Code）"))
+            lines.append(f"• {c.username}：❌ 没连上" + (f"（给我发 /join {c.username} 邀请链接；管理员直接拉你进群的，发 /join {c.username} 从列表里选）"
+                                                     if c.private else "（请告诉 Claude Code）"))
     return "\n".join(lines)
 
 

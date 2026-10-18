@@ -199,7 +199,7 @@ class Notifier:
             await self.send(text, markup)
             return
         if data.startswith(("mode:", "modeok:", "bt:", "bts:", "btgo:", "risk:", "riskok:", "paper:", "paperok:",
-                            "rules:", "rlok:")):  # 面板上的按钮：在原消息上更新
+                            "rules:", "rlok:", "jn:")):  # 面板上的按钮：在原消息上更新
             reply = await handler(f"/cb {data}", m)
             text, markup = reply if isinstance(reply, tuple) else (reply or "", None)
             await self.call("editMessageText", dict(where, text=text[:4000], **({"reply_markup": markup} if markup else {})))
