@@ -4,7 +4,7 @@
 import copy
 
 from config import DEFAULT_RISK
-from engine import (Reject, atr_pct, coin_key, liq_distance, plan_entry, safe_leverage, simulate_candle,
+from engine import (Reject, atr_pct, coin_key, fillable, liq_distance, plan_entry, safe_leverage, simulate_candle,
                     split_qty, split_symbol_candidates, tp_plan)
 from signal_parser import clean_symbol, extract_json, normalize, to_num
 
@@ -77,6 +77,10 @@ check("HYPE：三个止盈按 50/30/20 分", [round(x["frac"], 2) for x in p["tp
 p = plan_entry("long", 0.06969, 0.0718, 0.06753, [], 0.0715, R, 1000, tiers=ALT, exch_max=75)
 check(f"NIL：信号写 50x、止损 5.55% → 只开 {p['leverage']}x（50x 会先强平）", p["leverage"] == 11)
 check("NIL：没给止盈 → 按 2R 设止盈", len(p["tps"]) == 1 and abs(p["rr"] - 2) < 1e-9)
+# 有的群先发简短的单子（没止损止盈），过几分钟才补完整版：程序补的要记下来，完整版来了换成频道的
+check("没给止盈 → 记成程序补的；完整版给了止盈就能换", p["tp_source"] == "fallback" and fillable({"tp_source": "fallback"}, {"take_profits": [0.08]})
+      and plan_entry("long", 0.06969, 0.0718, 0.06753, [0.08], 0.0715, R, 1000, tiers=ALT)["tp_source"] == "signal")
+check("止损、止盈都是信号给的 → 再发一遍也不改", not fillable({"sl_source": "signal", "tp_source": "signal"}, {"stop_loss": 1, "take_profits": [2]}))
 
 # BTC 止损只有 0.5% → 可以开很高，但强平一定在止损外
 p = plan_entry("long", None, None, 81590, [83000], 82000, R, 1000, tiers=BTC, exch_max=125)

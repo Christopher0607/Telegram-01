@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS trades(
   created_at INTEGER, opened_at INTEGER, closed_at INTEGER, expires_at INTEGER,
   last_candle_ts INTEGER, be_moved INTEGER DEFAULT 0,
   exit_reason TEXT, pnl REAL, r_mult REAL, sl_source TEXT, sl_order_id TEXT, exchange TEXT, chase_to REAL,
-  pp_done INTEGER DEFAULT 0
+  pp_done INTEGER DEFAULT 0, tp_source TEXT
 );
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
@@ -37,6 +37,7 @@ TRADE_FIELDS = {
     "last_candle_ts", "be_moved", "exit_reason", "pnl", "r_mult", "sl_source", "sl_order_id", "exchange",
     "chase_to",   # 挂单开仓：没成交的部分改市价时，能接受的最差价格
     "pp_done",    # 频道晒盈利时已经先减过仓、推过保本（profit_post_close_frac < 1），之后再晒就不动了
+    "tp_source",  # signal = 止盈是信号给的；fallback = 信号没给，程序按 fallback_tp_r 设的（或者没设）
 }
 ACTIVE = ("pending", "open")
 
@@ -49,7 +50,7 @@ class DB:
         # 旧版数据库升级：补上新加的列
         for table, col, typ in (("trades", "sl_source", "TEXT"), ("trades", "sl_order_id", "TEXT"),
                                 ("trades", "exchange", "TEXT"), ("trades", "chase_to", "REAL"),
-                                ("trades", "pp_done", "INTEGER DEFAULT 0"),
+                                ("trades", "pp_done", "INTEGER DEFAULT 0"), ("trades", "tp_source", "TEXT"),
                                 ("messages", "has_image", "INTEGER DEFAULT 0")):
             if col not in {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")

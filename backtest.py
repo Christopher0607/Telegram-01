@@ -560,6 +560,7 @@ async def simulate(job_path: str, out_path: str):
         "opened": sum(1 for t in trades if t.get("opened_at")),
         "cancelled": sum(1 for t in trades if t["status"] == "cancelled" and not t.get("opened_at")),
         "skips": sorted(skips.items(), key=lambda kv: -kv[1]),
+        "filled": sum(1 for o in outcomes for p in o.split(" | ") if p.startswith("fill: 换成")),
         "closed": [{"base": t["base"], "side": t["side"], "r": t["r_mult"], "reason": t.get("exit_reason") or "",
                     "opened_at": t.get("opened_at") or t["created_at"], "closed_at": t["closed_at"],
                     "fallback": t.get("sl_source") == "fallback", "mult": mult_of(t),
@@ -593,6 +594,8 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
     lines.append(f"• 实际开单 {res['opened']} 笔" + (f"，跳过 {skipped} 个：" + "、".join(f"{k} {n}" for k, n in res["skips"][:5])
                                                    if skipped else "")
                  + (f"；另有 {res['cancelled']} 张限价单没成交" if res["cancelled"] else ""))
+    if res.get("filled"):
+        lines.append(f"• 其中 {res['filled']} 单频道先发简短的、过一会儿才补止损止盈：已换成频道的止损止盈")
     if res.get("errors"):
         lines.append(f"• 另有 {res['errors']} 个信号没法模拟（{res.get('error_sample') or '出错'}）")
     if not rs:

@@ -164,6 +164,12 @@ def tighter(side: str, new: float, cur: float) -> bool:
     return new > cur if side == "long" else new < cur
 
 
+def fillable(t: dict, act: dict) -> bool:
+    """这一单的止损/止盈是程序补的，频道补发的单子里给了：可以换成频道的（Engine.fill_in）。"""
+    return bool((t.get("sl_source") == "fallback" and act.get("stop_loss"))
+                or (t.get("tp_source") == "fallback" and act.get("take_profits")))
+
+
 EDIT_FOLLOW_SEC = 600  # 频道修改消息：原消息发出 10 分钟内的修改才重新识别（改错字常见），更旧的修改不跟
 
 DEFAULT_MMR = 0.02    # 查不到交易所档位时，按偏保守的 2% 维持保证金率算
@@ -293,7 +299,7 @@ def plan_entry(side, lo, hi, sl, tps, price, risk, equity, free=None, multiplier
         notes.append(f"亏到 {cut:g}R 就止损：止损挂在 {fmt(near)}（信号的止损是 {fmt(sl)}）")
         sl = near
     return {"side": side, "kind": kind, "entry": entry, "sl": sl, "leverage": lev, "qty": qty, "lo": lo, "hi": hi,
-            "tps": [{"price": t, "frac": f} for t, f in zip(tps, fracs)],
+            "tps": [{"price": t, "frac": f} for t, f in zip(tps, fracs)], "tp_source": "signal" if given else "fallback",
             "risk_usdt": qty * per_unit_loss, "rr": rr, "capped": capped, "notes": notes,
             "mmr": mmr, "liq_dist": liq_distance(lev, mmr, fee), "margin": qty * entry / lev}
 
@@ -632,6 +638,14 @@ class Engine:
             return await self.on_profit_post(t, risk)
         return "unknown"
 
+    def same_trade(self, act, ctx, mode) -> dict | None:
+        """同一个频道、同一个币、同方向、还开着的单子：频道把同一单又发了一遍（例如先发简短的，过几分钟再发带止损止盈的完整版）。"""
+        sym = act.get("symbol")
+        if not sym:
+            return None
+        return next((t for t in self.db.active_trades(mode) if t["chat_id"] == ctx.chat_id
+                     and coin_key(t["base"]) == coin_key(sym) and t["side"] == act.get("side")), None)
+
     def resolve_target(self, act, ctx) -> dict | None:
         """跟进指令对应哪一笔交易：优先看「回复了哪条消息」，其次按同频道同币种匹配。"""
         sym = act.get("symbol")
@@ -656,6 +670,11 @@ class Engine:
     # ---------------- 开仓 ----------------
     async def on_open(self, act, ctx, mode, risk, row) -> str:
         head = f"[{MODE_CN[mode]}] {ctx.title}：{act.get('symbol') or '?'} {SIDE_CN.get(act['side'], '')}"
+        same = self.same_trade(act, ctx, mode) if self._conf_ok(act["confidence"], risk["min_open_confidence"]) else None
+        if same:   # 频道把同一单又发了一遍：回复这条消息的指令（止盈、平仓……）也算这一单的
+            self.db.set_message(row, trade_id=same["id"])
+            if fillable(same, act):
+                return await self.fill_in(same, act, ctx, risk)
         try:
             plan = await self.make_plan(act, ctx, mode, risk)
         except Reject as r:
@@ -788,7 +807,8 @@ class Engine:
                     for x in plan["tps"]],
             "leverage": plan["leverage"], "risk_usdt": plan["risk_usdt"], "realized": 0.0,
             "created_at": now, "last_candle_ts": now // 60000 * 60000, "be_moved": 0,
-            "sl_source": plan.get("sl_source", "signal"), "exchange": self.ex.name,
+            "sl_source": plan.get("sl_source", "signal"), "tp_source": plan.get("tp_source", "signal"),
+            "exchange": self.ex.name,
         }
 
     async def open_paper(self, plan, ctx) -> dict:
@@ -1122,13 +1142,24 @@ class Engine:
         return "move_sl: ok"
 
     async def on_update_tp(self, t, act, risk) -> str:
-        sc = t.get("scale") or 1
-        long = t["side"] == "long"
-        ref = await self.xt(t).last_price(t["symbol"]) if t["status"] == "open" else t["entry_price"]
-        new = sorted({p * sc for p in act["take_profits"] if (p * sc > ref if long else p * sc < ref)}, reverse=not long)
+        new = await self.set_tps(t, act["take_profits"], risk)
+        if new is None:
+            return "update_tp: 已平仓"
         if not new:
             await self.notify(f"ℹ️ #{t['id']} {t['base']} 频道给的新止盈位已经过了现价，忽略")
             return "update_tp: 无效"
+        await self.notify(f"🎯 #{t['id']} [{MODE_CN[t['mode']]}] {t['base']} 止盈更新为 {' / '.join(fmt(p) for p in new)}")
+        return "update_tp: ok"
+
+    async def set_tps(self, t, prices, risk) -> list | None:
+        """止盈换成频道给的 prices（按个数套 tp_plans 的比例；已经成交的那几档不动）。
+        返回用上的止盈价；全部已经过了现价返回 []；交易所里已经平仓（已经收尾）返回 None。"""
+        sc = t.get("scale") or 1
+        long = t["side"] == "long"
+        ref = await self.xt(t).last_price(t["symbol"]) if t["status"] == "open" else t["entry_price"]
+        new = sorted({p * sc for p in prices if (p * sc > ref if long else p * sc < ref)}, reverse=not long)
+        if not new:
+            return []
         fr = tp_plan(risk, len(new))
         new = new[:len(fr)]
         items = [{"price": p, "frac": f} for p, f in zip(new, fr)]
@@ -1137,7 +1168,7 @@ class Engine:
             p = (await self.xt(t).positions()).get(t["symbol"])
             if not p or p["side"] != t["side"]:
                 await self.finalize_live(t, "交易所止盈/止损成交")
-                return "update_tp: 已平仓"
+                return None
             t["remaining"] = p["size"]
         filled = [x for x in t["tps"] if x.get("filled")] if t["status"] == "open" else []
         t["tps"] = filled + [dict(x, qty=None, order_id=None, filled=False) for x in items]
@@ -1145,8 +1176,77 @@ class Engine:
             self.assign_tp_qty(t)
         self.db.save_trade(t)
         await self.place_tp_orders(t)
-        await self.notify(f"🎯 #{t['id']} [{MODE_CN[t['mode']]}] {t['base']} 止盈更新为 {' / '.join(fmt(p) for p in new)}")
-        return "update_tp: ok"
+        return new
+
+    async def fill_in(self, t, act, ctx, risk) -> str:
+        """频道先发了简短的单子（没给止损或止盈，程序补的），过一会儿又发了这一单带止损止盈的完整版
+        （2026-10-18 糊糊的内部群：先发「#AVA 0.375附近空」，两分钟后才发止损止盈）：不当成重复跳过，程序补的换成频道的。
+        止损只收紧、不放宽：仓位是按程序补的止损算的，放宽就超过每单风险。换了止损，1R 也按频道的止损重算。"""
+        long, e = t["side"] == "long", t["entry_price"]
+        done, notes = [], []
+        if t.get("sl_source") == "fallback" and act.get("stop_loss"):
+            full = act["stop_loss"] * (t.get("scale") or 1)
+            cut = float(risk.get("stop_loss_r") or 1.0)
+            cut = cut if 0 < cut < 0.999 else 1.0
+            new = e - cut * (e - full)   # 亏到 stop_loss_r 就止损：挂在频道止损的这个比例处
+            if (long and full >= e) or (not long and full <= e):
+                notes.append(f"频道的止损 {fmt(full)} 在开仓价 {fmt(e)} 的另一边，不用，止损还是程序补的 {fmt(t['soft_sl'])}")
+            elif not tighter(t["side"], new, t["soft_sl"]):
+                notes.append(f"频道的止损 {fmt(full)} 比程序补的 {fmt(t['soft_sl'])} 还远，止损还是程序补的"
+                             f"（仓位是按程序补的止损算的，放宽就超过每单风险）")
+            else:
+                if t["status"] == "open":
+                    price = await self.xt(t).last_price(t["symbol"])
+                    if price and ((long and price <= new) or (not long and price >= new)):
+                        return await self.on_close(t, 1.0, f"频道补发的止损 {fmt(new)} 已经被打到（现价 {fmt(price)}），直接离场")
+                fee = self.fee_pair(t["symbol"], risk)[1]
+                was = abs(e - t["sl"]) / cut + 2 * fee * e   # 原来 1R 每个币亏多少（按程序补的止损算）
+                old = t["soft_sl"]
+                moved = await self.move_sl(t, new)
+                if was > 0:
+                    t["risk_usdt"] *= (abs(e - full) + 2 * fee * e) / was
+                t["sl_source"] = "signal"
+                done.append(f"止损：{fmt(old)} → {fmt(new)}｜打到止损约亏 {t['risk_usdt']:.2f}U"
+                            + ("" if moved else "（交易所里原来的止损单留着兜底，新止损由程序盯盘执行）"))
+        if t.get("tp_source") == "fallback" and act.get("take_profits"):
+            old = " / ".join(fmt(x["price"]) for x in t["tps"] if not x.get("filled")) or "没有"
+            new = await self.set_tps(t, act["take_profits"], risk)
+            if new is None:
+                return "fill: 已平仓"
+            if new:
+                t["tp_source"] = "signal"
+                fr = " / ".join(f"{x['frac'] * 100:.0f}%" for x in t["tps"] if not x.get("filled"))
+                done.append(f"止盈：{old} → {' / '.join(fmt(p) for p in new)}（按开仓数量分别平 {fr}）")
+            else:
+                notes.append("频道的止盈位已经过了现价，止盈还是程序设的")
+        self.db.save_trade(t)
+        head = f"#{t['id']} [{MODE_CN[t['mode']]}] {t['base']} {SIDE_CN[t['side']]}：{ctx.title} 补发了这一单的止损止盈"
+        if done:
+            await self.notify("\n".join([f"🔄 {head}，程序补的换成频道的", *done, *[f"注：{n}" for n in notes]]))
+            return "fill: 换成频道的" + "、".join(x.split("：")[0] for x in done)
+        await self.notify(f"ℹ️ {head}，没有改：" + "；".join(notes))
+        return "fill: 没有改"
+
+    async def move_sl(self, t, new) -> bool:
+        """止损整个换到 new，交易所里的止损单也挪过去（先挂新的再撤旧的，任何时候都有止损）。
+        挪不了的（Bitget 的止损跟着仓位走；挂新的失败）只改程序盯盘的止损，交易所里原来的留着兜底，返回 False。"""
+        ex = self.xt(t)
+        if t["mode"] == "live" and ex.attached_sl:
+            t["soft_sl"] = new
+            return False
+        old = t.get("sl_order_id") if t["mode"] == "live" else None
+        if old:
+            try:
+                t["sl_order_id"] = await ex.place_sl(t["symbol"], t["side"], new)
+            except Exception as e:
+                log.warning("#%s 交易所止损挪到 %s 失败：%s", t["id"], fmt(new), e)
+                t["soft_sl"] = new
+                return False
+        t["sl"] = t["soft_sl"] = new   # 还没成交（挂单中）的：成交后按新的止损挂
+        self.db.save_trade(t)
+        if old:
+            await ex.cancel_sl(t["symbol"], old)
+        return True
 
     # ---------------- 实盘收尾 ----------------
     async def finalize_live(self, t, reason: str):
