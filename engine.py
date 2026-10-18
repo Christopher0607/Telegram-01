@@ -1623,13 +1623,15 @@ class Engine:
                     ts = int(c[0])
                     if ts < since or ts + 60000 > now:
                         continue
+                    if t["status"] == "pending" and ts >= (t.get("expires_at") or ts + 1):
+                        break   # 限价单已经过了有效期：之后的 K 线不能再让它成交（回测一次推进好几个小时也对）
                     events += simulate_candle(t, ts, float(c[2]), float(c[3]), tk, bool(risk["breakeven_after_tp1"]),
                                               maker_fee=mk, maker_tp=self.maker_on("paper"))
                     t["last_candle_ts"] = ts
                     if t["status"] not in ("pending", "open"):
                         break
             if t["status"] == "pending" and now > (t.get("expires_at") or 0):
-                t.update(status="cancelled", closed_at=now, exit_reason="限价单超时未成交")
+                t.update(status="cancelled", closed_at=min(now, int(t.get("expires_at") or now)), exit_reason="限价单超时未成交")
                 events.append("限价单超时未成交，已取消")
             self.db.save_trade(t)
             if not events:

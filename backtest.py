@@ -10,14 +10,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import itertools
 import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 import types
+import zlib
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 
 from config import BASE_DIR, DATA_DIR, Config, entry_rule, exit_rules, follows_reduce, rules_code, rules_line
@@ -28,12 +33,55 @@ GATE_1M_KEEP = 9_600 * MIN   # Gate 只给最近 1 万根 1 分钟 K 线（约 6
 BT_DIR = os.path.join(DATA_DIR, "backtest")
 SIDE_CN = {"long": "多", "short": "空"}
 _running: set[str] = set()
+CACHE_KEEP_DAYS = 200   # 缓存（AI 识别结果、历史 K 线）只留最近 200 天的：回测最多 90 天，留点余量
+PARSE_WORKERS = 8       # 同时识别几条消息
+PREFETCH_H = 12         # 模拟前先把每个开仓信号之后 12 小时的 1 分钟 K 线一起下载（同时下几个，比边模拟边下载快）
+MEM_BLOCKS = 3000       # 内存里最多留多少段 K 线（每段 99～200 根），多了的从缓存文件里读，省内存
+PROGRESS_EVERY = 300    # 模拟时最多每 5 分钟发一次进度（模拟进程往标准输出写「PROGRESS 说明」）
+
+
+def cache_db() -> sqlite3.Connection:
+    """回测缓存（data/backtest/cache.db）：同一条消息的 AI 识别结果、已经过去的历史 K 线都不会变，
+    记下来下次直接用：再回测同一个频道（换天数、换规则、几个频道一起）就不用重新识别、重新下载。"""
+    os.makedirs(BT_DIR, exist_ok=True)
+    c = sqlite3.connect(os.path.join(BT_DIR, "cache.db"), timeout=60)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("CREATE TABLE IF NOT EXISTS parsed(k TEXT PRIMARY KEY, v TEXT, ts INTEGER)")
+    c.execute("CREATE TABLE IF NOT EXISTS klines(k TEXT PRIMARY KEY, v BLOB, ts INTEGER)")
+    return c
+
+
+def prune_cache(c: sqlite3.Connection):
+    cut = int(time.time()) - CACHE_KEEP_DAYS * 86400
+    c.execute("DELETE FROM parsed WHERE ts < ?", (cut,))
+    c.execute("DELETE FROM klines WHERE ts < ?", (cut,))
+    c.commit()
+
+
+def parser_version(cfg, parser) -> str:
+    """AI 识别结果对应哪一版：提示词/识别代码（parser 所在的文件）、模型、看不看图，任何一样变了，旧的识别结果都不用。"""
+    try:
+        src = inspect.getsource(sys.modules[type(parser).__module__])
+    except (OSError, TypeError, KeyError):
+        src = type(parser).__qualname__
+    llm = f"{getattr(cfg, 'llm_provider', '')}|{getattr(cfg, 'llm_model', '')}|{getattr(cfg, 'llm_vision', '')}"
+    return hashlib.sha1(f"{src}|{llm}".encode()).hexdigest()[:16]
+
+
+def msg_key(ver: str, ch, m) -> str:
+    """一条消息（这个版本：改过就不一样）的缓存键。"""
+    media = getattr(m, "photo", None) or getattr(m, "document", None)
+    edit = getattr(m, "edit_date", None)
+    raw = f"{ver}|{ch.username}|{getattr(m, 'chat_id', '')}|{m.id}|{int(edit.timestamp()) if edit else 0}|" \
+          f"{getattr(media, 'id', '')}|{getattr(m, 'reply_to_msg_id', None)}|{m.raw_text or ''}"
+    return hashlib.sha1(raw.encode()).hexdigest()
 
 
 # ====================================================================
 # 第 1 步：拉消息 + AI 识别（在主程序里跑）
 # ====================================================================
-async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, progress=None) -> list[dict]:
+async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, progress=None, cfg=None) -> list[dict]:
     """最近 days 天、keep(msg) 通过的消息（群里普通成员的发言不要），逐条 AI 识别。按时间顺序返回。"""
     start = datetime.now(timezone.utc) - timedelta(days=days)
     total, kept = 0, []
@@ -41,28 +89,51 @@ async def collect(client, ch, days: int, keep, build_ctx, parser, vision: bool, 
         total += 1
         if await keep(m):
             kept.append(m)
-    if progress:
-        await progress(f"📥 拉到 {total} 条消息，其中要识别的 {len(kept)} 条，AI 正在逐条识别……")
-    sem = asyncio.Semaphore(4)
+    db = cache_db()
+    try:
+        ver = parser_version(cfg, parser)
+        keys = {m.id: msg_key(ver, ch, m) for m in kept}
+        hit = {}
+        for mid, k in keys.items():
+            r = db.execute("SELECT v FROM parsed WHERE k=?", (k,)).fetchone()
+            if r:
+                hit[mid] = json.loads(r[0])
+        if progress:
+            await progress(f"📥 拉到 {total} 条消息，其中要识别的 {len(kept)} 条"
+                           + (f"（{len(hit)} 条以前识别过，直接用）" if hit else "")
+                           + ("，AI 正在逐条识别……" if len(hit) < len(kept) else "，不用再识别"))
+        sem = asyncio.Semaphore(PARSE_WORKERS)
+        new = []
 
-    async def one(m):
-        async with sem:
-            try:
-                ctx = await build_ctx(ch, m, False, vision)
-            except Exception as e:
-                log.warning("回测：读取消息 %s 失败：%s", m.id, e)
-                return None
-            if not ctx:
-                return None
-            try:
-                parsed = await parser.parse(ctx)
-            except Exception as e:
-                parsed = {"error": str(e)[:200]}
-            return {"id": m.id, "ts": m.date.timestamp(), "text": ctx.text, "reply_to": ctx.reply_to,
-                    "reply_text": ctx.reply_text, "forwarded": ctx.forwarded, "has_image": bool(ctx.image),
-                    "parsed": parsed}
+        async def one(m):
+            if m.id in hit:
+                return hit[m.id]
+            async with sem:
+                try:
+                    ctx = await build_ctx(ch, m, False, vision)
+                except Exception as e:
+                    log.warning("回测：读取消息 %s 失败：%s", m.id, e)
+                    return None
+                if not ctx:
+                    return None
+                try:
+                    parsed = await parser.parse(ctx)
+                except Exception as e:
+                    parsed = {"error": str(e)[:200]}
+                ev = {"id": m.id, "ts": m.date.timestamp(), "text": ctx.text, "reply_to": ctx.reply_to,
+                      "reply_text": ctx.reply_text, "forwarded": ctx.forwarded, "has_image": bool(ctx.image),
+                      "parsed": parsed}
+                if "error" not in parsed:   # 识别失败的下次重新识别
+                    new.append((keys[m.id], json.dumps(ev, ensure_ascii=False), int(ev["ts"])))
+                return ev
 
-    return [e for e in await asyncio.gather(*(one(m) for m in kept)) if e]
+        out = [e for e in await asyncio.gather(*(one(m) for m in kept)) if e]
+        if new:
+            db.executemany("INSERT OR REPLACE INTO parsed(k, v, ts) VALUES(?,?,?)", new)
+            db.commit()
+        return out
+    finally:
+        db.close()
 
 
 async def send_long(send, text: str, limit: int = 3800, markup: dict | None = None) -> None:
@@ -105,7 +176,7 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
 
                 async def progress(t, title=title):   # 几个频道一起时，进度前面写上是哪个频道
                     await send(t.replace("📥 ", f"📥 「{title}」", 1) if multi else t)
-                evs = await collect(client, ch, days, keep_for(ch), build_ctx, parser, cfg.llm_vision, progress)
+                evs = await collect(client, ch, days, keep_for(ch), build_ctx, parser, cfg.llm_vision, progress, cfg)
                 for e in evs:
                     e["ch"] = ch.username
                 events += evs
@@ -129,8 +200,18 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         # 48 种规则组合都要跑一遍：时限比以前放宽一倍（正常远用不到，只防卡死）
         limit = 7200 * (2 if multi else 1) * (2 if days > 30 else 1)
+        sent_at = time.time()
+
+        async def watch():   # 模拟进程报的进度：最多每 5 分钟转发一次，免得等很久没消息
+            nonlocal sent_at
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").strip()
+                if line.startswith("PROGRESS ") and time.time() - sent_at >= PROGRESS_EVERY:
+                    sent_at = time.time()
+                    await send(f"⏳ 「{name}」回测还在跑：{line[len('PROGRESS '):]}")
         try:
-            _, err = await asyncio.wait_for(proc.communicate(), limit)
+            _, err = await asyncio.wait_for(asyncio.gather(watch(), proc.stderr.read()), limit)
+            await proc.wait()
         except asyncio.TimeoutError:
             proc.kill()
             raise RuntimeError(f"模拟超过 {limit // 3600} 小时还没完成")
@@ -159,7 +240,8 @@ def history_exchange(cfg, sim: dict):
             super().__init__(cfg)
             if self.name == "weex":
                 self.ex.rateLimit = 6   # ccxt 按 25 的额度算历史 K 线（实际只算 5），调快一点，还远低于每 10 秒 500 的上限
-            self._blocks: dict = {}
+            self._blocks: OrderedDict = OrderedDict()   # 最近用过的几段 K 线（内存里），更早用过的在缓存文件里
+            self._db = cache_db()
             self._sem = asyncio.Semaphore(4)
             self._old = None            # 更早的 1 分钟 K 线从哪个交易所拿（见 _source）
             self._old_lock = asyncio.Lock()
@@ -184,6 +266,7 @@ def history_exchange(cfg, sim: dict):
             await super().close()
             if self._old:
                 await self._old.close()
+            self._db.close()
 
         def _now(self) -> int:
             return int(sim["now"] * 1000)
@@ -191,9 +274,16 @@ def history_exchange(cfg, sim: dict):
         def _window(self, tf: str) -> int:
             return (99 if self.name == "weex" else 200) * (MIN if tf == "1m" else HOUR)
 
+        def _remember(self, key, rows: list) -> list:
+            self._blocks[key] = rows
+            if len(self._blocks) > MEM_BLOCKS:
+                self._blocks.popitem(last=False)
+            return rows
+
         async def _block(self, symbol: str, tf: str, start: int) -> list:
             key = (symbol, tf, start)
             if key in self._blocks:
+                self._blocks.move_to_end(key)
                 return self._blocks[key]
             w = self._window(tf)
             until = min(start + w - 1, self._now_real())   # WEEX 的结束时间不能是将来
@@ -202,6 +292,10 @@ def history_exchange(cfg, sim: dict):
             src = await self._source(symbol, tf, start)
             if src is None:
                 return []
+            dkey = f"{src.name}|{symbol}|{tf}|{start}"
+            r = self._db.execute("SELECT v FROM klines WHERE k=?", (dkey,)).fetchone()
+            if r:
+                return self._remember(key, json.loads(zlib.decompress(r[0])))
             async with self._sem:
                 for i in range(4):
                     try:
@@ -219,9 +313,12 @@ def history_exchange(cfg, sim: dict):
                             raise
                         await asyncio.sleep(2 * (i + 1))
             rows = [r for r in rows or [] if start <= r[0] < start + w]
-            if start + w <= self._now_real():   # 已经完全过去的时间段才缓存
-                self._blocks[key] = rows
-            return rows
+            if start + w <= self._now_real():   # 已经完全过去的时间段才存进缓存文件（以后的回测还能用）
+                self._db.execute("INSERT OR REPLACE INTO klines(k, v, ts) VALUES(?,?,?)",
+                                 (dkey, zlib.compress(json.dumps(rows).encode()), start // 1000))
+                self._db.commit()
+            # 还没走完的这一段只在这次回测里用：模拟最多到任务结束的时间，那之前的 K 线已经全了
+            return self._remember(key, rows)
 
         @staticmethod
         def _now_real() -> int:
@@ -268,6 +365,27 @@ def history_exchange(cfg, sim: dict):
             return await self.bars(symbol, "1m", since_ms, self._now() // MIN * MIN)
 
     return HistEx()
+
+
+async def prefetch(ex, events: list) -> None:
+    """模拟前先把要用的 K 线一起下载好（同时下 4 段；边模拟边下载一次只下一段，慢好几倍）：
+    每个开仓信号之后 PREFETCH_H 小时的 1 分钟 K 线、之前 42 小时的 1 小时 K 线（算波动率止损、24 小时成交额用）。
+    缓存文件里已经有的不用再下。更久的单子模拟时用到再下。"""
+    want = set()
+    for e in events:
+        if "error" in e["parsed"]:
+            continue
+        for a in e["parsed"].get("actions") or []:
+            if a.get("type") != "open" or not a.get("symbol"):
+                continue
+            sym = ex.resolve(a["symbol"])[0]
+            if not sym:
+                continue
+            t = int(e["ts"] * 1000)
+            for tf, lo, hi in (("1m", t - 10 * MIN, t + PREFETCH_H * HOUR), ("1h", t - 42 * HOUR, t)):
+                w = ex._window(tf)
+                want.update((sym, tf, s) for s in range(lo // w * w, hi, w))
+    await asyncio.gather(*(ex._block(*k) for k in sorted(want)), return_exceptions=True)
 
 
 HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的几种做法（跟现在一样的自动跳过）
@@ -486,6 +604,10 @@ async def simulate(job_path: str, out_path: str):
     multi = len(chans) > 1
     ex = history_exchange(cfg, sim)
     await ex.init()
+    prune_cache(ex._db)
+    t0 = time.time()
+    await prefetch(ex, job["events"])
+    log.info("回测：预先下载行情用了 %.0f 秒", time.time() - t0)
     parsed = {(e.get("ch") or first, str(e["id"])): e["parsed"] for e in job["events"]}
 
     class Parser:
@@ -517,10 +639,10 @@ async def simulate(job_path: str, out_path: str):
         eng = E.Engine(cfg, db, ex, Parser(), Quiet())
 
         async def advance(t: float):
-            # 有限价挂单时一分钟一分钟推进（挂单超时要按时撤）；只有持仓时一次推进到位（逐根 K 线撮合，结果一样）
-            while sim["now"] < t:
-                pending = any(x["status"] == "pending" for x in db.active_trades("paper"))
-                sim["now"] = min(t, sim["now"] + 60) if pending else t
+            # 一次推进到下一条消息：每一单按自己的 K 线逐根撮合，限价单过了有效期以后的 K 线不算（engine.monitor_paper），
+            # 跟一分钟一分钟推进结果一样，快很多
+            if sim["now"] < t:
+                sim["now"] = t
                 await eng.monitor_paper()
 
         try:
@@ -562,12 +684,15 @@ async def simulate(job_path: str, out_path: str):
         now_rules = cfg.risk_for(ch)
         tried = {rules_key(now_rules): stats_of(trades, now_rules)}   # 跑过的每一种做法的成绩：同一种做法只跑一次
 
+        todo = {rules_key({**now_rules, **ov}) for ov in [{}] + [v[1] for v in HEAD_VARIANTS + VARIANTS] + grid_rules()}
+
         async def result(ov: dict) -> dict:
             rules = {**now_rules, **ov}
             key = rules_key(rules)
             if key not in tried:
                 tr, _, _ = await one_pass(ov)
                 tried[key] = stats_of(tr, rules)
+                print(f"PROGRESS {len(todo)} 种规则组合跑完了 {len(tried)} 种", flush=True)
             return tried[key]
 
         seen = {rules_key(now_rules)}
