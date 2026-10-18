@@ -35,7 +35,7 @@ SIDE_CN = {"long": "多", "short": "空"}
 _running: set[str] = set()
 CACHE_KEEP_DAYS = 200   # 缓存（AI 识别结果、历史 K 线）只留最近 200 天的：回测最多 90 天，留点余量
 PARSE_WORKERS = 8       # 同时识别几条消息
-PREFETCH_H = 12         # 模拟前先把每个开仓信号之后 12 小时的 1 分钟 K 线一起下载（同时下几个，比边模拟边下载快）
+PREFETCH_H = 3          # 模拟前先把每个开仓信号之后 3 小时的 1 分钟 K 线一起下载（同时下几个，比边模拟边下载快；更久的模拟时成批下）
 MEM_BLOCKS = 3000       # 内存里最多留多少段 K 线（每段 99～200 根），多了的从缓存文件里读，省内存
 PROGRESS_EVERY = 300    # 模拟时最多每 5 分钟发一次进度（模拟进程往标准输出写「PROGRESS 说明」）
 
@@ -231,6 +231,13 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
 # ====================================================================
 # 第 2 步：用历史行情模拟（单独的进程）
 # ====================================================================
+def fast_history(ex) -> None:
+    """WEEX 的历史 K 线：ccxt 按 25 的额度算（实际只算 5），调快到每 0.15 秒一个，还远低于每 10 秒 500 的上限。
+    放行速度要连 throttler 一起改：ccxt 只在建立交易所对象时按 rateLimit 算一次（以前只改 rateLimit 没用，一直是 0.5 秒一个）。"""
+    ex.rateLimit = 6
+    ex.throttler.config["refillRate"] = 1 / 6
+
+
 def history_exchange(cfg, sim: dict):
     """交易所接口的「历史版」：市场信息、杠杆档位用真实接口；价格、K 线取假时钟当时的历史数据（不偷看未来）。"""
     from exchange import Exchange
@@ -239,7 +246,7 @@ def history_exchange(cfg, sim: dict):
         def __init__(self):
             super().__init__(cfg)
             if self.name == "weex":
-                self.ex.rateLimit = 6   # ccxt 按 25 的额度算历史 K 线（实际只算 5），调快一点，还远低于每 10 秒 500 的上限
+                fast_history(self.ex)
             self._blocks: OrderedDict = OrderedDict()   # 最近用过的几段 K 线（内存里），更早用过的在缓存文件里
             self._db = cache_db()
             self._sem = asyncio.Semaphore(4)
@@ -255,7 +262,7 @@ def history_exchange(cfg, sim: dict):
             async with self._old_lock:
                 if self._old is None:
                     self._old = Exchange(cfg, "weex")
-                    self._old.ex.rateLimit = 6
+                    fast_history(self._old.ex)
                     await self._old.init()
             if symbol not in (self._old.ex.markets or {}):
                 return None
