@@ -10,18 +10,17 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import os
 import re
-import shutil
 import sys
-import tempfile
 import time
 import types
 from datetime import datetime, timedelta, timezone
 
-from config import BASE_DIR, DATA_DIR, Config, entry_rule, exit_rules, follows_reduce, rules_code
+from config import BASE_DIR, DATA_DIR, Config, entry_rule, exit_rules, follows_reduce, rules_code, rules_line
 
 log = logging.getLogger("backtest")
 MIN, HOUR, DAY = 60_000, 3_600_000, 86_400_000
@@ -115,7 +114,8 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
         events.sort(key=lambda e: e["ts"])
         n_err = sum(1 for e in events if "error" in e["parsed"])
         await send(f"🧠 识别完了 {len(events)} 条（{n_err} 条识别失败），正在用历史行情一单单模拟"
-                   + ("（几个频道当成一个账户一起跑，" if multi else "（") + "还会换成新方案和以前的规则各跑一遍做对比）……")
+                   + ("（几个频道当成一个账户一起跑，" if multi else "（")
+                   + f"还会把「🧭 跟单规则」的 {len(grid_rules())} 种组合都跑一遍、挑出最好的，要多等一会儿）……")
         os.makedirs(BT_DIR, exist_ok=True)
         base = key if not multi else "combo-" + key
         job_path = os.path.join(BT_DIR, f"{base}.json")
@@ -298,6 +298,53 @@ VARIANTS = (   # 回测时同一段行情拿来对比的几种完整做法（进
      {"market_entry": False, "allow_limit_orders": True, "close_on_profit_post": False, "follow_reduce": True}),
 )
 VARIANT_TAGS = ("E", "F", "G", "H")   # 报告里给上面几种做法的代号（「采用 F」按钮用），接在 HEAD_VARIANTS 的 A～D 后面
+RULE_GRID = (   # 「⭐ 推荐」在这几项的所有组合里挑（2×3×2×2×2 = 48 种，跟「🧭 跟单规则」面板上能选的一样：main.RULE_ROWS）
+    ({"market_entry": False, "allow_limit_orders": True}, {"market_entry": True}),
+    ({"close_on_profit_post": False}, {"close_on_profit_post": True, "profit_post_close_frac": 1.0},
+     {"close_on_profit_post": True, "profit_post_close_frac": 0.5}),
+    ({"stop_loss_r": 1.0}, {"stop_loss_r": 0.5}),
+    ({"breakeven_after_tp1": True}, {"breakeven_after_tp1": False}),
+    ({"follow_reduce": True}, {"follow_reduce": False}),
+)
+REC_MIN_TRADES = 10    # 平仓不到 10 单的组合不推荐（太少，看不出好坏）
+REC_MIN_GAIN_R = 2.0   # 比现在多赚不到 2R（也不到现在总 R 的 10%）：差别太小，多半是碰巧，不建议换
+# 几十种组合里挑最好的，总有几种是碰巧赚得多；所以建议换的那一种还要前半段、后半段都比现在好（不是靠某几天）
+
+
+def grid_rules() -> list[dict]:
+    """RULE_GRID 的每一种组合 → 要改的设置。"""
+    out = []
+    for combo in itertools.product(*RULE_GRID):
+        ov = {}
+        for o in combo:
+            ov.update(o)
+        out.append(ov)
+    return out
+
+
+def recommend(rows: list, now: dict) -> dict | None:
+    """「⭐ 推荐」：跑过的所有组合按收益率排（每单是固定 U、算不出收益率时按总 R）；回撤比现在深太多（最多深一半，
+    至少允许深 2R）、平仓不到 10 单的不参加。建议换的（pick）：排得比现在靠前、多赚至少 REC_MIN_GAIN_R（或现在总 R 的 10%）、
+    前半段和后半段都比现在好的里面最靠前的那一种；没有就是继续用现在的。
+    rows 里要有 now（现在的规则），每一种要有 h1（前半段的总 R）。返回 {best（第 1 名）, pick（建议换的，没有是 None）, now,
+    top（前 3）, rank（现在排第几）, n（一共跑了几种）, out（不参加排名的有几种）, gain（第 1 名多几 R）, need（至少要多几 R）}；
+    现在的规则平仓不到 10 单（单子太少，挑不出来）返回 None。"""
+    def score(r):
+        return (r["ret"] if r.get("ret") is not None else r["total"], r["total"])
+    if now["n"] < REC_MIN_TRADES:
+        return None
+    floor = min(now["dd"] * 1.5, now["dd"] - 2.0)
+    ok = sorted((r for r in rows if r["n"] >= REC_MIN_TRADES and r["dd"] >= floor), key=score, reverse=True)
+    need = max(REC_MIN_GAIN_R, 0.1 * abs(now["total"]))
+    pick = next((r for r in ok if r is not now and score(r) > score(now) and r["total"] - now["total"] >= need
+                 and steady(r, now)), None)
+    return {"best": ok[0], "pick": pick, "now": now, "top": ok[:3], "rank": ok.index(now) + 1, "n": len(rows),
+            "out": len(rows) - len(ok), "gain": ok[0]["total"] - now["total"], "need": need}
+
+
+def steady(r: dict, now: dict) -> bool:
+    """前半段、后半段都比现在赚得多（不是靠某几天碰巧）。"""
+    return r["h1"] > now["h1"] and r["total"] - r["h1"] > now["total"] - now["h1"]
 
 
 def closed_stats(rs: list) -> dict:
@@ -420,6 +467,7 @@ async def simulate(job_path: str, out_path: str):
     E.now_ms = lambda: int(sim["now"] * 1000)
 
     cfg = Config()
+    live_now = sorted(c.username for c in cfg.channels if cfg.mode_for(c) == "live")   # 现在跑实盘的频道（机器人里切过的也算）
     cfg.live_trading = False   # 全部按模拟盘跑
     cfg.paper_enabled = True   # 主人停了模拟盘也照样回测（回测本来就是模拟）
     for k in ("gate_key", "gate_secret", "weex_key", "weex_secret", "weex_passphrase",
@@ -464,8 +512,7 @@ async def simulate(job_path: str, out_path: str):
         """按一套规则（在现在的风控上改 overrides 这几项）把消息从头喂一遍。返回（所有单子，每条消息的处理结果，是否挂单）。"""
         sim["now"] = float(job["start"])
         cfg.risk = dict(base_risk, **overrides)
-        tmp = tempfile.mkdtemp()
-        db = DB(os.path.join(tmp, "bt.db"))
+        db = DB(":memory:")   # 放内存里：盯盘每分钟都要存一遍单子，写硬盘每次要等 1 毫秒多，几十种组合跑下来慢很多
         eng = E.Engine(cfg, db, ex, Parser(), Quiet())
 
         async def advance(t: float):
@@ -495,12 +542,33 @@ async def simulate(job_path: str, out_path: str):
             return trades, outcomes, eng.maker_on("paper")
         finally:
             db.conn.close()
-            shutil.rmtree(tmp, ignore_errors=True)
+
+    def stats_of(tr: list, rules: dict) -> dict:
+        """一套规则跑出来的单子 → 成绩（对比、推荐都用这个）。"""
+        done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
+        rs = [t["r_mult"] for t in done]
+        mid = (job["start"] + job["end"]) / 2 * 1000
+        return dict(code=rules_code(rules), rules=rules_line(rules), opened=sum(1 for t in tr if t.get("opened_at")),
+                    h1=sum(t["r_mult"] for t in done if t["closed_at"] < mid),
+                    **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
+                    per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
+                                      total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
+                                 for c in (chans if multi else [])])
 
     try:
         trades, outcomes, maker = await one_pass({})
         compare = []
         now_rules = cfg.risk_for(ch)
+        tried = {rules_key(now_rules): stats_of(trades, now_rules)}   # 跑过的每一种做法的成绩：同一种做法只跑一次
+
+        async def result(ov: dict) -> dict:
+            rules = {**now_rules, **ov}
+            key = rules_key(rules)
+            if key not in tried:
+                tr, _, _ = await one_pass(ov)
+                tried[key] = stats_of(tr, rules)
+            return tried[key]
+
         seen = {rules_key(now_rules)}
         # 同一段行情、同一批识别结果，换几条规则再跑：看这几条规则到底帮了多少（效果跟现在或者前面一样的不重复跑）
         for head, tag, (label, ov) in ([(True, v[0], v) for v in HEAD_VARIANTS]
@@ -511,15 +579,11 @@ async def simulate(job_path: str, out_path: str):
             seen.add(key)
             if head:
                 label = f"{label}：{exit_rules({**now_rules, **ov})}"
-            tr, _, _ = await one_pass(ov)
-            done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
-            rs = [t["r_mult"] for t in done]
-            compare.append(dict(label=label, tag=tag, code=rules_code({**now_rules, **ov}), head=head,
-                                opened=sum(1 for t in tr if t.get("opened_at")),
-                                **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
-                                per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
-                                                  total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
-                                             for c in (chans if multi and head else [])]))
+            compare.append(dict(await result(ov), label=label, tag=tag, head=head))
+        # ⭐ 推荐：「🧭 跟单规则」能选的所有组合都跑一遍（上面跑过的不重跑），挑最好的
+        for ov in grid_rules():
+            await result(ov)
+        best = recommend(list(tried.values()), tried[rules_key(now_rules)])
         cfg.risk = base_risk
     finally:
         await ex.close()
@@ -546,7 +610,8 @@ async def simulate(job_path: str, out_path: str):
         "channels": [c["title"] for c in chans],
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
-        "old_source": ex.old_used, "compare": compare,
+        "old_source": ex.old_used, "compare": compare, "best": best,
+        "live_match": sorted(c["username"] for c in chans) == live_now,   # 回测的正好是现在跑实盘的全部频道
         "rules_now": [entry_rule(risk),
                       ("晒盈利不平仓" if not risk.get("close_on_profit_post") else "晒盈利就清仓" if pfrac >= 0.95
                        else "晒盈利先减仓推保本")] + ([f"亏到 {float(risk['stop_loss_r']):g}R 就止损"]
@@ -680,24 +745,75 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
             src = f"{t['ch'][:6]}｜" if t.get("ch") else ""
             lines.append(f"{icon} {datetime.fromtimestamp(t['opened_at'] / 1000, tz).strftime('%m-%d %H:%M')} "
                          f"{src}{t['base']} {SIDE_CN.get(t['side'], '')} {t['r']:+.2f}R｜{t['reason']}")
+    if res.get("best"):
+        lines += recommend_lines(res)
     fee = ("开仓、止盈按挂单手续费（假设挂单都能成交），止损按市价手续费" if res.get("maker")
            else "手续费按市价算")
     old = (f"Gate 只留最近约 7 天的 1 分钟 K 线，更早的用 {res['old_source']} 的行情（同一个币两边价格一般只差 0.1% 左右）；"
            if res.get("old_source") else "")
     lines.append("\n说明：用 1 分钟 K 线模拟，进场按信号那一分钟的价格，同一根 K 线碰到止损和止盈按止损算；"
                  f"{old}{fee}；没算滑点和资金费。历史表现不代表以后。")
-    if report_markup(res):
+    if star_pick(res):
+        lines.append("\n👇 想换成推荐的：点「⭐ 采用推荐」；想换成上面别的：点「采用 X」（都会先问你一次），"
+                     "或者点「🧭 跟单规则」自己一项项改。")
+    elif report_markup(res):
         lines.append("\n👇 想换成上面哪一种：点「采用 X」（会先问你一次），或者点「🧭 跟单规则」自己一项项改。")
     return "\n".join(lines)
 
 
+def star_pick(res: dict) -> dict | None:
+    """「⭐ 采用推荐」按钮换成的那一种：只在有建议换的、而且回测的正好是现在跑实盘的全部频道时给
+    （规则是所有频道一起用的，只看一个频道挑出来的不能直接拿去改全部）。"""
+    rec = res.get("best")
+    return rec["pick"] if rec and rec.get("pick") and res.get("live_match") else None
+
+
+def recommend_lines(res: dict) -> list[str]:
+    """报告最后的「⭐ 推荐」：所有组合里的前 3 名、现在的排第几、建议换不换。"""
+    rec = res["best"]
+    best, now, pick = rec["best"], rec["now"], rec.get("pick")
+
+    def stat(st: dict) -> str:
+        ret = f"｜收益 {st['ret'] * 100:+.0f}%" if st.get("ret") is not None else ""
+        return f"{st['total']:+.1f}R｜胜率 {st['win']:.0f}%｜最大回撤 {st['dd']:.1f}R{ret}（平仓 {st['n']} 单）"
+    lines = [f"\n⭐ 推荐：「🧭 跟单规则」能选的 {rec['n']} 种组合各跑一遍，挑收益最高、回撤不比现在深太多的"]
+    for i, st in enumerate(rec["top"]):
+        mark = "（现在的）" if st["code"] == now["code"] else "（推荐）" if pick and st["code"] == pick["code"] else ""
+        lines.append(f"{i + 1}. {st['rules']}{mark}")
+        lines.append(f"   {stat(st)}")
+    rank = "" if rec["rank"] == 1 else (f"现在的规则排第 {rec['rank']}（共 {rec['n']} 种"
+                                         + (f"，回撤太深、单子太少的 {rec['out']} 种不算）。" if rec["out"] else "）。"))
+    if best["code"] == now["code"]:
+        lines.append("👉 现在的规则就是第 1 名，继续用就行。")
+    elif not pick:
+        why = (f"只比现在多 {rec['gain']:+.1f}R，差别太小" if rec["gain"] < rec["need"]
+               else f"虽然多 {rec['gain']:+.1f}R，但{'前半段' if best['h1'] <= now['h1'] else '后半段'}不如现在，靠的是某几天")
+        lines.append(f"👉 第 1 名{why}，多半是碰巧：继续用现在的就行。{rank}")
+    else:
+        top = next((i + 1 for i, st in enumerate(rec["top"]) if st["code"] == pick["code"]), None)
+        name = f"第 {top} 名" if top else f"「{pick['rules']}」"
+        gain = (f"比现在多 {pick['total'] - now['total']:+.1f}R，前半段、后半段都比现在好，"
+                f"最大回撤 {now['dd']:.1f}R → {pick['dd']:.1f}R")
+        if res.get("live_match"):
+            lines.append(f"👉 建议换成{name}：{gain}。{rank}点下面「⭐ 采用推荐」（会先问你一次）。"
+                         f"{rec['n']} 种里挑最好的难免有碰巧的成分，选 90 天回测更可靠。")
+        else:
+            lines.append(f"👉 对这{'几个频道' if res.get('multi') else '个频道'}来说{name}更好：{gain}。{rank}")
+    if not res.get("live_match"):
+        lines.append(f"（跟单规则是所有频道一起用的，这份只看了「{'、'.join(res.get('channels') or [res.get('title', '')])}」。"
+                     "要换规则，最好发 /backtest 点「🔴 只选实盘频道」、选 90 天一起回测，看那份的推荐）")
+    return lines
+
+
 def report_markup(res: dict) -> dict | None:
-    """回测报告下面的按钮：对比过的每一种做法一个「采用」（点了先问一次，确认了才改「🧭 跟单规则」）。"""
+    """回测报告下面的按钮：「⭐ 采用推荐」（值得换的时候）+ 对比过的每一种做法一个「采用」（点了先问一次，确认了才改「🧭 跟单规则」）。"""
     picks = [c for c in res.get("compare") or [] if c.get("code") and c.get("tag")]
-    if not picks:
+    star = star_pick(res)
+    if not picks and not star:
         return None
     btns = [{"text": f"采用 {c['tag']}", "callback_data": f"rlpick:{c['code']}:{c['tag']}"} for c in picks]
-    rows = [btns[i:i + 4] for i in range(0, len(btns), 4)]
+    rows = ([[{"text": "⭐ 采用推荐", "callback_data": f"rlpick:{star['code']}:⭐推荐"}]] if star else []) \
+        + [btns[i:i + 4] for i in range(0, len(btns), 4)]
     rows.append([{"text": "🧭 跟单规则（自己一项项改）", "callback_data": "rlpick:panel:-"}])
     return {"inline_keyboard": rows}
 
