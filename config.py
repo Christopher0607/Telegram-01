@@ -254,7 +254,7 @@ class Config:
             private = "private" in c   # 私人群：只写个名字，邀请链接用机器人 /join 设置
             self.channels.append(ChannelCfg(
                 username=str(c["private"]).strip() if private else _clean_username(c["username"]),
-                mode=str(c.get("mode", "paper")).lower(),
+                mode="off" if c.get("mode") is False else str(c.get("mode", "paper")).lower(),   # YAML 把不带引号的 off 读成 False
                 risk_multiplier=float(c.get("risk_multiplier", 1.0)),
                 overrides=dict(c.get("overrides") or {}),
                 private=private,

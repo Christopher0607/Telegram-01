@@ -615,6 +615,8 @@ async def simulate(job_path: str, out_path: str):
     for i, c in enumerate(chans):
         cc = cfg.channel_by_username(c["username"])
         cc.title = c["title"]
+        cc.mode = "paper"   # 回测就是按模拟盘跑：频道现在是实盘、模拟还是关掉（config.yaml 写 off）都照样模拟
+        cfg.mode_overrides.pop(cc.username, None)
         chmap[c["username"]] = (cc, -1 - i)
     first = chans[0]["username"]
     ch = chmap[first][0]

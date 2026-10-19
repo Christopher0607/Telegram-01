@@ -31,25 +31,26 @@ timezone_offset_hours: 8       # 时区：北京时间
 daily_report_hour: 22          # 每天几点推送日报（持仓 + 各频道战绩）；-1 = 不推送
 
 channels:
+  # 2026-10-19 用户决定只跟 huhu 这一个群（实盘）：UMIE、vip 改成模拟（还开着的实盘单照常跟频道指令管到平仓，平完再关），其他频道不再监听
   - username: IvanCryptotalk   # UMIE_加密貨幣：部分带止损；止盈/提损/平仓常用「回复」发出
-    mode: live                 # paper 模拟 / live 实盘 / off 不监听
+    mode: paper                # paper 模拟 / live 实盘 / off 不监听
     risk_multiplier: 1.0       # 这个频道的仓位倍数（0.5 = 半仓）
   # 私人群/频道只写一个名字：这个仓库是公开的，邀请链接绝不能写在这里。
   # 用户给机器人发「/join 邀请链接」，链接只保存在服务器上；群组只跟群主/管理员发的消息。
   - private: vip               # 会员群（2026-09-26 加入）
-    mode: live                 # 2026-09-26 用户要求开实盘
+    mode: paper                # 2026-09-26 用户要求开实盘；2026-10-19 改回模拟（只跟 huhu）
   - private: huhu              # 糊糊的内部会员群（2026-10-18 用户加入）；用户当天在机器人里切成了实盘（存在服务器 data/modes.json）
     mode: paper
   - username: zxcccckhf        # 財財加密貨幣頻道：格式最规整（进场/止盈/止损齐全）
-    mode: paper
+    mode: "off"
   - username: chun77chun       # 哈基咪區塊貨幣中心：市价单 + 止盈 + 止损
-    mode: paper
+    mode: "off"
   - username: yuyanjia66       # 預言家：多数喊单不带止损，由程序补止损
-    mode: paper
+    mode: "off"
     # overrides:               # 任何风控参数都能按频道单独设置，例如这个频道的无止损单不跟：
     #   fallback_sl_mode: off
   - username: zishenlaotu      # 糊糊圖圖來炒幣（2026-09-28 加）：免费单只给方向和进场价（止损写「私信助理」），止损由程序按波动率补、止盈按 2R
-    mode: paper
+    mode: "off"
 
 risk:
   # 每单风险、同时最多几单、每天最多亏几单，也可以在机器人里调（「💰 风控设置」按钮 / /risk），保存在服务器上；谁最后改算谁的
