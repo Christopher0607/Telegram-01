@@ -320,7 +320,7 @@ def history_exchange(cfg, sim: dict):
                             raise
                         await asyncio.sleep(2 * (i + 1))
             rows = [r for r in rows or [] if start <= r[0] < start + w]
-            if start + w <= self._now_real():   # 已经完全过去的时间段才存进缓存文件（以后的回测还能用）
+            if start + w <= self._now_real() and rows:   # 已经完全过去的才存（空的可能是接口一时没返回，下次再试）
                 self._db.execute("INSERT OR REPLACE INTO klines(k, v, ts) VALUES(?,?,?)",
                                  (dkey, zlib.compress(json.dumps(rows).encode()), start // 1000))
                 self._db.commit()
@@ -434,7 +434,8 @@ RULE_GRID = (   # 「⭐ 推荐」在这几项的所有组合里挑（2×3×2×2
 )
 REC_MIN_TRADES = 10    # 平仓不到 10 单的组合不推荐（太少，看不出好坏）
 REC_MIN_GAIN_R = 2.0   # 比现在多赚不到 2R（也不到现在总 R 的 10%）：差别太小，多半是碰巧，不建议换
-# 几十种组合里挑最好的，总有几种是碰巧赚得多；所以建议换的那一种还要前半段、后半段都比现在好（不是靠某几天）
+REC_DD_SHALLOWER = 0.3  # 或者：赚得差不多，最大回撤浅了 30% 以上（也至少 2R），也值得换（2026-10-18 那个群 0.5R 止损回撤减半）
+# 几十种组合里挑最好的，总有几种是碰巧好看；所以建议换的那一种还要前半段、后半段分开看也都比现在好（不是靠某几天）
 
 
 def grid_rules() -> list[dict]:
@@ -462,15 +463,24 @@ def recommend(rows: list, now: dict) -> dict | None:
     floor = min(now["dd"] * 1.5, now["dd"] - 2.0)
     ok = sorted((r for r in rows if r["n"] >= REC_MIN_TRADES and r["dd"] >= floor), key=score, reverse=True)
     need = max(REC_MIN_GAIN_R, 0.1 * abs(now["total"]))
-    pick = next((r for r in ok if r is not now and score(r) > score(now) and r["total"] - now["total"] >= need
-                 and steady(r, now)), None)
-    return {"best": ok[0], "pick": pick, "now": now, "top": ok[:3], "rank": ok.index(now) + 1, "n": len(rows),
+    pick, why = next(((r, w) for r in ok if r is not now and score(r) > score(now) for w in [better(r, now, need)] if w),
+                     (None, None))
+    return {"best": ok[0], "pick": pick, "why": why, "now": now, "top": ok[:3], "rank": ok.index(now) + 1, "n": len(rows),
             "out": len(rows) - len(ok), "gain": ok[0]["total"] - now["total"], "need": need}
 
 
-def steady(r: dict, now: dict) -> bool:
-    """前半段、后半段都比现在赚得多（不是靠某几天碰巧）。"""
-    return r["h1"] > now["h1"] and r["total"] - r["h1"] > now["total"] - now["h1"]
+def better(r: dict, now: dict, need: float) -> str | None:
+    """r 比现在好在哪（前半段、后半段分开看也要成立，不是靠某几天碰巧）：
+    "R"  = 多赚至少 need，前后两半都比现在赚得多；
+    "DD" = 赚得差不多（最多少 1R），最大回撤浅了 30% 以上（也至少 2R），前后两半的回撤都不比现在深、赚的都不比现在少 1R 以上。
+    都不是返回 None。"""
+    gain, h2, now_h2 = r["total"] - now["total"], r["total"] - r["h1"], now["total"] - now["h1"]
+    if gain >= need and r["h1"] > now["h1"] and h2 > now_h2:
+        return "R"
+    if (gain >= -1.0 and r["dd"] - now["dd"] >= max(REC_MIN_GAIN_R, REC_DD_SHALLOWER * abs(now["dd"]))
+            and r["dd1"] >= now["dd1"] and r["dd2"] >= now["dd2"] and r["h1"] >= now["h1"] - 1 and h2 >= now_h2 - 1):
+        return "DD"
+    return None
 
 
 def closed_stats(rs: list) -> dict:
@@ -680,6 +690,8 @@ async def simulate(job_path: str, out_path: str):
         mid = (job["start"] + job["end"]) / 2 * 1000
         return dict(code=rules_code(rules), rules=rules_line(rules), opened=sum(1 for t in tr if t.get("opened_at")),
                     h1=sum(t["r_mult"] for t in done if t["closed_at"] < mid),
+                    dd1=closed_stats([t["r_mult"] for t in done if t["closed_at"] < mid])["dd"],
+                    dd2=closed_stats([t["r_mult"] for t in done if t["closed_at"] >= mid])["dd"],
                     **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
                     per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
                                       total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
@@ -919,14 +931,18 @@ def recommend_lines(res: dict) -> list[str]:
     if best["code"] == now["code"]:
         lines.append("👉 现在的规则就是第 1 名，继续用就行。")
     elif not pick:
-        why = (f"只比现在多 {rec['gain']:+.1f}R，差别太小" if rec["gain"] < rec["need"]
+        why = (f"只比现在多 {rec['gain']:+.1f}R，回撤也没有明显变小" if rec["gain"] < rec["need"]
                else f"虽然多 {rec['gain']:+.1f}R，但{'前半段' if best['h1'] <= now['h1'] else '后半段'}不如现在，靠的是某几天")
         lines.append(f"👉 第 1 名{why}，多半是碰巧：继续用现在的就行。{rank}")
     else:
         top = next((i + 1 for i, st in enumerate(rec["top"]) if st["code"] == pick["code"]), None)
         name = f"第 {top} 名" if top else f"「{pick['rules']}」"
+        ret = (f"，收益 {now['ret'] * 100:+.0f}% → {pick['ret'] * 100:+.0f}%、中途最多回撤 {now['ret_dd'] * 100:.0f}% → "
+               f"{pick['ret_dd'] * 100:.0f}%" if pick.get("ret") is not None and now.get("ret") is not None else "")
         gain = (f"比现在多 {pick['total'] - now['total']:+.1f}R，前半段、后半段都比现在好，"
-                f"最大回撤 {now['dd']:.1f}R → {pick['dd']:.1f}R")
+                f"最大回撤 {now['dd']:.1f}R → {pick['dd']:.1f}R{ret}" if rec.get("why") != "DD" else
+                f"总 R 差不多（{now['total']:+.1f}R → {pick['total']:+.1f}R），最大回撤从 {now['dd']:.1f}R 降到 {pick['dd']:.1f}R，"
+                f"前半段、后半段的回撤都比现在小{ret}")
         if res.get("live_match"):
             lines.append(f"👉 建议换成{name}：{gain}。{rank}点下面「⭐ 采用推荐」（会先问你一次）。"
                          f"{rec['n']} 种里挑最好的难免有碰巧的成分，选 90 天回测更可靠。")
