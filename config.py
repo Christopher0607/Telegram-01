@@ -21,6 +21,9 @@ MODES_PATH = os.path.join(DATA_DIR, "modes.json")
 RISK_PATH = os.path.join(DATA_DIR, "risk.json")   # 主人在机器人里调的风控设置（/risk）
 PAPER_PATH = os.path.join(DATA_DIR, "paper.json")  # 主人在机器人里停止/恢复模拟盘
 RULES_PATH = os.path.join(DATA_DIR, "rules.json")  # 主人在机器人里改的跟单规则（🧭 跟单规则 / /rules）
+# 这个时间（UTC 秒）之前在机器人里切换的模式不算。2026-10-19 只跟 huhu：糊糊的免费频道在 config.yaml 里先关掉、十几分钟后
+# 又按模拟加回来，当时启动还不会清理作废的切换（drop_stale_overrides），它 09-30 在机器人里切成实盘的记录又冒了出来。
+MODE_RESET_BEFORE = {"zishenlaotu": 1792368921}   # 2026-10-19 00:15:21 UTC（关掉它的那次提交）
 RISK_KEYS = ("risk_per_trade_pct", "risk_per_trade_usdt")    # 每单风险（这两项一起改）
 LIMIT_KEYS = ("max_open_positions", "max_daily_losses")      # 同时最多几单、每天最多亏几单（机器人里也能改）
 # 跟单规则：进场怎么进、晒盈利平不平、止损放哪、第一止盈后推不推保本、跟不跟频道减仓（机器人里也能改，回测里对比的就是这几项）
@@ -369,6 +372,43 @@ class Config:
         os.makedirs(DATA_DIR, exist_ok=True)
         with open(MODES_PATH, "w", encoding="utf-8") as f:
             json.dump(self.mode_overrides, f, ensure_ascii=False)
+
+    def drop_stale_overrides(self) -> list[str]:
+        """机器人启动时清掉作废的「机器人里改过」：config.yaml 后来改了那一项（记下的 base 对不上了），就以 config.yaml 为准，
+        记录也删掉。不删的话，config.yaml 哪天改回原来的值，很久以前的切换又会冒出来（比如频道改回模拟后又变成实盘）。
+        返回删了哪几项（写日志用）。只在机器人主程序里调用（回测进程不改这些文件）。"""
+        gone = []
+        names = {c.username: c for c in self.channels}
+        for u, o in list(self.mode_overrides.items()):
+            if (u not in names or not isinstance(o, dict) or o.get("base") != names[u].mode
+                    or (o.get("at") or 0) < MODE_RESET_BEFORE.get(u, 0)):
+                del self.mode_overrides[u]
+                gone.append(f"模式 {u}")
+        if gone:
+            with open(MODES_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.mode_overrides, f, ensure_ascii=False)
+        o = _load_json(PAPER_PATH)
+        if o and o.get("base") != self.paper_yaml:
+            with open(PAPER_PATH, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            gone.append("模拟盘开关")
+        ro = self.rules_override if isinstance(self.rules_override, dict) else {}
+        drop = [k for k, e in ro.items() if k not in RULE_KEYS or not isinstance(e, dict) or e.get("base") != self.rules_yaml[k]]
+        for k in drop:
+            del ro[k]
+            gone.append(f"规则 {k}")
+        if drop:
+            with open(RULES_PATH, "w", encoding="utf-8") as f:
+                json.dump(ro, f, ensure_ascii=False)
+        o = self.risk_override if isinstance(self.risk_override, dict) else {}
+        drop = [k for k, e in o.items()
+                if not isinstance(e, dict) or e.get("base") != (self.risk_yaml if k == "trade" else self.limits_yaml.get(k, object()))]
+        for k in drop:
+            del o[k]
+            gone.append(f"风控 {k}")
+        if drop:
+            self._save_risk_override()
+        return gone
 
     def mode_for(self, ch: ChannelCfg) -> str:
         """实际生效的模式：只有总开关 live_trading 打开且频道设为 live 才真实下单；

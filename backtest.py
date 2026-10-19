@@ -194,7 +194,10 @@ async def run_many(client, cfg, chs: list, days: int, keep_for, build_ctx, parse
         with open(job_path, "w", encoding="utf-8") as f:
             json.dump({"channel": chs[0].username, "title": name, "start": end - days * 86400, "end": end,
                        "channels": [{"username": c.username, "title": c.title or c.username} for c in chs],
-                       "days": days, "equity": equity, "events": events}, f, ensure_ascii=False)
+                       "days": days, "equity": equity, "events": events,
+                       # 现在跑实盘的频道（主程序里按机器人里切过的算）：报告里说这份推荐能不能直接用
+                       "live": [{"username": c.username, "title": c.title or c.username}
+                                for c in cfg.channels if cfg.mode_for(c) == "live"]}, f, ensure_ascii=False)
         proc = await asyncio.create_subprocess_exec(
             sys.executable, os.path.abspath(__file__), "simulate", job_path, out_path, cwd=BASE_DIR,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -449,38 +452,42 @@ def grid_rules() -> list[dict]:
     return out
 
 
+def score(r: dict) -> tuple:
+    """排名用：收益率（每单是固定 U、算不出收益率时按总 R），一样的再比总 R。"""
+    return (r["ret"] if r.get("ret") is not None else r["total"], r["total"])
+
+
 def recommend(rows: list, now: dict) -> dict | None:
-    """「⭐ 推荐」：跑过的所有组合按收益率排（每单是固定 U、算不出收益率时按总 R）；回撤比现在深太多（最多深一半，
-    至少允许深 2R）、平仓不到 10 单的不参加。建议换的（pick）：排得比现在靠前、多赚至少 REC_MIN_GAIN_R（或现在总 R 的 10%）、
-    前半段和后半段都比现在好的里面最靠前的那一种；没有就是继续用现在的。
-    rows 里要有 now（现在的规则），每一种要有 h1（前半段的总 R）。返回 {best（第 1 名）, pick（建议换的，没有是 None）, now,
-    top（前 3）, rank（现在排第几）, n（一共跑了几种）, out（不参加排名的有几种）, gain（第 1 名多几 R）, need（至少要多几 R）}；
+    """「⭐ 推荐」：跑过的所有组合按 score 排；回撤比现在深太多（最多深一半，至少允许深 2R）、平仓不到 10 单的不参加。
+    建议换的（pick）只在前 3 名里挑（报告里列出来的那几种）：排得比现在靠前、judge 说值得换的最靠前的那一种；没有就是继续用现在的。
+    rows 里要有 now（现在的规则），每一种要有 halves（前半段、后半段各自的成绩）。返回 {best（第 1 名）, pick, why（"R"/"DD"）,
+    no（第 1 名为什么不建议换）, now, top（前 3）, rank（现在排第几）, n（一共跑了几种）, out（不参加排名的有几种）}；
     现在的规则平仓不到 10 单（单子太少，挑不出来）返回 None。"""
-    def score(r):
-        return (r["ret"] if r.get("ret") is not None else r["total"], r["total"])
     if now["n"] < REC_MIN_TRADES:
         return None
     floor = min(now["dd"] * 1.5, now["dd"] - 2.0)
     ok = sorted((r for r in rows if r["n"] >= REC_MIN_TRADES and r["dd"] >= floor), key=score, reverse=True)
     need = max(REC_MIN_GAIN_R, 0.1 * abs(now["total"]))
-    pick, why = next(((r, w) for r in ok if r is not now and score(r) > score(now) for w in [better(r, now, need)] if w),
-                     (None, None))
-    return {"best": ok[0], "pick": pick, "why": why, "now": now, "top": ok[:3], "rank": ok.index(now) + 1, "n": len(rows),
-            "out": len(rows) - len(ok), "gain": ok[0]["total"] - now["total"], "need": need}
+    judged = [(r, *judge(r, now, need)) for r in ok[:3] if r is not now and score(r) > score(now)]
+    pick, why = next(((r, w) for r, w, _ in judged if w), (None, None))
+    return {"best": ok[0], "pick": pick, "why": why, "no": judged[0][2] if judged and judged[0][0] is ok[0] else "",
+            "now": now, "top": ok[:3], "rank": ok.index(now) + 1, "n": len(rows), "out": len(rows) - len(ok)}
 
 
-def better(r: dict, now: dict, need: float) -> str | None:
-    """r 比现在好在哪（前半段、后半段分开看也要成立，不是靠某几天碰巧）：
-    "R"  = 多赚至少 need，前后两半都比现在赚得多；
-    "DD" = 赚得差不多（最多少 1R），最大回撤浅了 30% 以上（也至少 2R），前后两半的回撤都不比现在深、赚的都不比现在少 1R 以上。
-    都不是返回 None。"""
-    gain, h2, now_h2 = r["total"] - now["total"], r["total"] - r["h1"], now["total"] - now["h1"]
-    if gain >= need and r["h1"] > now["h1"] and h2 > now_h2:
-        return "R"
-    if (gain >= -1.0 and r["dd"] - now["dd"] >= max(REC_MIN_GAIN_R, REC_DD_SHALLOWER * abs(now["dd"]))
-            and r["dd1"] >= now["dd1"] and r["dd2"] >= now["dd2"] and r["h1"] >= now["h1"] - 1 and h2 >= now_h2 - 1):
-        return "DD"
-    return None
+def judge(r: dict, now: dict, need: float) -> tuple[str | None, str]:
+    """r 值不值得换：("R" 多赚不少 / "DD" 赚得差不多、最大回撤明显浅, "") 或者 (None, 为什么不换)。
+    多赚 = 至少 need；回撤明显浅 = 浅 30% 以上、至少 2R，总 R 最多少 need 的一半。
+    几十种里挑最好的总有碰巧的，所以还要前半段、后半段分开算的收益（算不出收益率时按总 R）都比现在高。"""
+    gain, dd_gain = r["total"] - now["total"], r["dd"] - now["dd"]
+    kind = ("R" if gain >= need else
+            "DD" if gain >= -need / 2 and dd_gain >= max(REC_MIN_GAIN_R, REC_DD_SHALLOWER * abs(now["dd"])) else None)
+    if not kind:
+        return None, f"只比现在多 {gain:+.1f}R，回撤也没有明显变小"
+    worse = [i for i in (0, 1) if score(r["halves"][i]) <= score(now["halves"][i])]
+    if worse:
+        good = f"多赚 {gain:+.1f}R" if kind == "R" else f"最大回撤从 {now['dd']:.1f}R 降到 {r['dd']:.1f}R"
+        return None, f"虽然{good}，但{('前半段', '后半段')[worse[0]]}反而不如现在（好处只在某一段）"
+    return kind, ""
 
 
 def closed_stats(rs: list) -> dict:
@@ -603,7 +610,9 @@ async def simulate(job_path: str, out_path: str):
     E.now_ms = lambda: int(sim["now"] * 1000)
 
     cfg = Config()
-    live_now = sorted(c.username for c in cfg.channels if cfg.mode_for(c) == "live")   # 现在跑实盘的频道（机器人里切过的也算）
+    live = job.get("live")   # 现在跑实盘的频道（主程序里算好的；旧的任务文件里没有就自己算）
+    if live is None:
+        live = [{"username": c.username, "title": c.username} for c in cfg.channels if cfg.mode_for(c) == "live"]
     cfg.live_trading = False   # 全部按模拟盘跑
     cfg.paper_enabled = True   # 主人停了模拟盘也照样回测（回测本来就是模拟）
     for k in ("gate_key", "gate_secret", "weex_key", "weex_secret", "weex_passphrase",
@@ -685,15 +694,19 @@ async def simulate(job_path: str, out_path: str):
         finally:
             db.conn.close()
 
+    def half(ts: list) -> dict:
+        """前半段或后半段的成绩：总 R、最大回撤、收益率（推荐时分开比，看好处是不是只在某一段）。"""
+        rs = [t["r_mult"] for t in ts]
+        return {"total": sum(rs), "dd": closed_stats(rs)["dd"],
+                "ret": money(rs, pct, fixed, equity, [mult_of(t) for t in ts]).get("ret")}
+
     def stats_of(tr: list, rules: dict) -> dict:
         """一套规则跑出来的单子 → 成绩（对比、推荐都用这个）。"""
         done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
         rs = [t["r_mult"] for t in done]
         mid = (job["start"] + job["end"]) / 2 * 1000
         return dict(code=rules_code(rules), rules=rules_line(rules), opened=sum(1 for t in tr if t.get("opened_at")),
-                    h1=sum(t["r_mult"] for t in done if t["closed_at"] < mid),
-                    dd1=closed_stats([t["r_mult"] for t in done if t["closed_at"] < mid])["dd"],
-                    dd2=closed_stats([t["r_mult"] for t in done if t["closed_at"] >= mid])["dd"],
+                    halves=[half([t for t in done if (t["closed_at"] < mid) == first]) for first in (True, False)],
                     **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
                     per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
                                       total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
@@ -758,7 +771,8 @@ async def simulate(job_path: str, out_path: str):
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
         "old_source": ex.old_used, "compare": compare, "best": best,
-        "live_match": sorted(c["username"] for c in chans) == live_now,   # 回测的正好是现在跑实盘的全部频道
+        "live_match": sorted(c["username"] for c in chans) == sorted(c["username"] for c in live),   # 回测的正好是全部实盘频道
+        "live_titles": [c["title"] for c in live],
         "rules_now": [entry_rule(risk),
                       ("晒盈利不平仓" if not risk.get("close_on_profit_post") else "晒盈利就清仓" if pfrac >= 0.95
                        else "晒盈利先减仓推保本")] + ([f"亏到 {float(risk['stop_loss_r']):g}R 就止损"]
@@ -933,26 +947,24 @@ def recommend_lines(res: dict) -> list[str]:
     if best["code"] == now["code"]:
         lines.append("👉 现在的规则就是第 1 名，继续用就行。")
     elif not pick:
-        why = (f"只比现在多 {rec['gain']:+.1f}R，回撤也没有明显变小" if rec["gain"] < rec["need"]
-               else f"虽然多 {rec['gain']:+.1f}R，但{'前半段' if best['h1'] <= now['h1'] else '后半段'}不如现在，靠的是某几天")
-        lines.append(f"👉 第 1 名{why}，多半是碰巧：继续用现在的就行。{rank}")
+        lines.append(f"👉 第 1 名{rec.get('no') or '跟现在差不多'}，多半是碰巧：继续用现在的就行。{rank}")
     else:
-        top = next((i + 1 for i, st in enumerate(rec["top"]) if st["code"] == pick["code"]), None)
-        name = f"第 {top} 名" if top else f"「{pick['rules']}」"
+        name = f"第 {next(i + 1 for i, st in enumerate(rec['top']) if st['code'] == pick['code'])} 名"
         ret = (f"，收益 {now['ret'] * 100:+.0f}% → {pick['ret'] * 100:+.0f}%、中途最多回撤 {now['ret_dd'] * 100:.0f}% → "
                f"{pick['ret_dd'] * 100:.0f}%" if pick.get("ret") is not None and now.get("ret") is not None else "")
-        gain = (f"比现在多 {pick['total'] - now['total']:+.1f}R，前半段、后半段都比现在好，"
-                f"最大回撤 {now['dd']:.1f}R → {pick['dd']:.1f}R{ret}" if rec.get("why") != "DD" else
-                f"总 R 差不多（{now['total']:+.1f}R → {pick['total']:+.1f}R），最大回撤从 {now['dd']:.1f}R 降到 {pick['dd']:.1f}R，"
-                f"前半段、后半段的回撤都比现在小{ret}")
+        gain = (f"比现在多 {pick['total'] - now['total']:+.1f}R，最大回撤 {now['dd']:.1f}R → {pick['dd']:.1f}R" if rec["why"] == "R"
+                else f"总 R 差不多（{now['total']:+.1f}R → {pick['total']:+.1f}R），最大回撤从 {now['dd']:.1f}R 降到 {pick['dd']:.1f}R")
+        gain += f"，前半段、后半段分开算也都比现在好{ret}"
         if res.get("live_match"):
             lines.append(f"👉 建议换成{name}：{gain}。{rank}点下面「⭐ 采用推荐」（会先问你一次）。"
                          f"{rec['n']} 种里挑最好的难免有碰巧的成分，选 90 天回测更可靠。")
         else:
             lines.append(f"👉 对这{'几个频道' if res.get('multi') else '个频道'}来说{name}更好：{gain}。{rank}")
     if not res.get("live_match"):
-        lines.append(f"（跟单规则是所有频道一起用的，这份只看了「{'、'.join(res.get('channels') or [res.get('title', '')])}」。"
-                     "要换规则，最好发 /backtest 点「🔴 只选实盘频道」、选 90 天一起回测，看那份的推荐）")
+        live = "、".join(res.get("live_titles") or [])
+        lines.append(f"（跟单规则是所有频道一起用的，这份只看了「{'、'.join(res.get('channels') or [res.get('title', '')])}」，"
+                     + (f"你现在跑实盘的是「{live}」。" if live else "现在没有频道在跑实盘。")
+                     + "要换规则，最好发 /backtest 点「🔴 只选实盘频道」、选 90 天一起回测，看那份的推荐）")
     return lines
 
 

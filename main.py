@@ -1584,7 +1584,7 @@ async def cmd_replay(cfg: Config, n: int):
 def sources_text(cfg: Config, chans: dict) -> str:
     """启动消息里的频道列表：每个频道/群是实盘还是模拟；没连上的也列出来，免得以为在跟。"""
     lines = [f"• {c.title}{'（群组：只跟群主/管理员）' if c.is_group else ''}：{cfg.mode_label(c)}"
-             for c in chans.values()]
+             f"{'（机器人里切的）' if cfg.channel_mode(c) != c.mode else ''}" for c in chans.values()]
     for c in cfg.channels:
         if c.mode != "off" and not any(c is x for x in chans.values()):
             lines.append(f"• {c.username}：❌ 没连上" + (f"（给我发 /join {c.username} 邀请链接；管理员直接拉你进群的，发 /join {c.username} 从列表里选）"
@@ -1629,6 +1629,9 @@ async def attach_old_exchanges(engine: Engine, cfg: Config, notifier: Notifier):
 
 
 async def cmd_run(cfg: Config):
+    gone = cfg.drop_stale_overrides()
+    if gone:
+        log.info("config.yaml 改过的这几项，机器人里以前的切换已作废：%s", "、".join(gone))
     db = DB(os.path.join(DATA_DIR, "trader.db"))
     ex = Exchange(cfg)
     if cfg.live_trading and not ex.has_keys:
