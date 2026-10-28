@@ -2,11 +2,14 @@
 
 也负责「手机上完成部署」的两件事：
 - 绑定主人：没有 TG_OWNER_ID 时，谁先给机器人发 /start <SETUP_PIN>，谁就是主人（保存到 data/owner.json）
+- 换主人：原来的账号登不进去时，新账号发 /start <换主人口令>（config.yaml 的 owner_transfer_sha256，每个口令只能用一次）
 - 在机器人对话里完成监听账号登录（等待主人回复验证码）
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -14,6 +17,8 @@ import re
 import time
 
 import httpx
+
+from config import save_secrets
 
 log = logging.getLogger("notifier")
 
@@ -47,6 +52,10 @@ def owner_file(data_dir: str) -> str:
     return os.path.join(data_dir, "owner.json")
 
 
+def transfer_file(data_dir: str) -> str:
+    return os.path.join(data_dir, "owner_transfer.json")   # 用过的换主人口令（只记 SHA-256）
+
+
 def load_owner(data_dir: str) -> int:
     try:
         with open(owner_file(data_dir)) as f:
@@ -56,11 +65,13 @@ def load_owner(data_dir: str) -> int:
 
 
 class Notifier:
-    def __init__(self, bot_token: str, owner_id: int, tg_client=None, data_dir: str = ""):
+    def __init__(self, bot_token: str, owner_id: int, tg_client=None, data_dir: str = "", transfer_hash: str = ""):
         self.token = bot_token
         self.owner_id = int(owner_id or 0)
         self.tg = tg_client
         self.data_dir = data_dir
+        self.transfer_hash = (transfer_hash or "").lower()   # 换主人口令的 SHA-256（config.yaml 的 owner_transfer_sha256）
+        self.on_owner_change = None                          # 换了主人以后调用（主程序：重启）
         self.offset: int | None = None
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(70.0, connect=10.0))
 
@@ -133,7 +144,7 @@ class Notifier:
         res = r.json().get("result") or []
         if res:
             self.offset = res[-1]["update_id"] + 1
-        return res
+        return await self._take_transfer(res)
 
     @staticmethod
     def _private_msg(u: dict) -> dict | None:
@@ -143,15 +154,72 @@ class Notifier:
         return m
 
     async def skip_backlog(self):
-        """丢弃启动前积压的旧消息。"""
+        """丢弃启动前积压的旧消息（里面的换主人口令照样认：机器人重启的时候发来的也算）。"""
         if self.offset is not None:
             return
         try:
+            r = await self.http.get(f"{self.api}/getUpdates", params={"timeout": 0})
+            await self._take_transfer(r.json().get("result") or [])
             r = await self.http.get(f"{self.api}/getUpdates", params={"offset": -1, "timeout": 0})
             res = r.json().get("result") or []
             self.offset = res[-1]["update_id"] + 1 if res else 0
         except Exception as e:
             log.warning("getUpdates 初始化失败：%s", e)
+
+    # ---------------- 换主人 ----------------
+    def _used_transfers(self) -> list:
+        try:
+            with open(transfer_file(self.data_dir)) as f:
+                return list(json.load(f).get("used") or [])
+        except Exception:
+            return []
+
+    def _is_transfer(self, text: str) -> bool:
+        """这条消息是不是还没用过的换主人口令：/start 口令、/owner 口令，或者只发口令（只比对 SHA-256）。"""
+        parts = text.split()
+        if not self.transfer_hash or not 1 <= len(parts) <= 2:
+            return False
+        if len(parts) == 2 and parts[0].lower().split("@")[0] not in ("/start", "/owner"):
+            return False
+        digest = hashlib.sha256(parts[-1].encode()).hexdigest()
+        return hmac.compare_digest(digest, self.transfer_hash) and digest not in self._used_transfers()
+
+    async def _take_transfer(self, res: list) -> list:
+        """收到的消息里有别的账号发来的换主人口令：把它设成主人。这条消息不再交给后面处理。"""
+        keep = []
+        for u in res:
+            m = self._private_msg(u)
+            if m and (m.get("from") or {}).get("id") != self.owner_id and self._is_transfer(m["text"]):
+                await self._transfer_owner(m)
+                continue
+            keep.append(u)
+        return keep
+
+    async def _transfer_owner(self, m: dict):
+        """把发口令的账号设成主人：存到 data/owner.json，data/secrets.env 的 TG_OWNER_ID 也改掉（建服务器时写了 TG_OWNER_ID 的话，
+        它比 owner.json 优先）。口令作废、消息删掉，原来的主人收到一条提醒，然后（主程序）重启。"""
+        old, new = self.owner_id, int(m["from"]["id"])
+        self.owner_id = new
+        if self.data_dir:
+            with open(owner_file(self.data_dir), "w") as f:
+                json.dump({"id": new}, f)
+            with open(transfer_file(self.data_dir), "w") as f:
+                json.dump({"used": self._used_transfers() + [self.transfer_hash], "from": old, "to": new,
+                           "at": int(time.time())}, f)
+            save_secrets({"TG_OWNER_ID": str(new)})
+        log.warning("机器人的主人换成了 %s（原来是 %s）", new, old)
+        await self.delete(m)
+        await self.send("✅ 已把这个账号绑定为机器人的主人：以后通知发到这里，也只有这个账号能控制它。\n"
+                        "机器人 3 秒后重启，重启好了会发「🚀 信号跟单已启动」。")
+        if old and old != new:
+            try:
+                await self.http.post(f"{self.api}/sendMessage", json={"chat_id": old, "text": (
+                    "⚠️ 这个机器人的主人已经换成另一个 Telegram 账号：这个账号不再收到通知，也不能再控制它。"
+                    "如果不是你本人操作的，请马上告诉 Claude Code。")})
+            except Exception as e:
+                log.warning("提醒原来的主人失败：%s", e)
+        if self.on_owner_change:
+            self.on_owner_change()
 
     async def next_owner_message(self, timeout_s: int) -> dict | None:
         """等主人发来下一条文字消息，最多等 timeout_s 秒。"""

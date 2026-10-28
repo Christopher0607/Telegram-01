@@ -1639,7 +1639,8 @@ async def cmd_run(cfg: Config):
         cfg.live_trading = False
     client = make_client(cfg)
     await client.connect()
-    notifier = Notifier(cfg.tg_bot_token, cfg.tg_owner_id, client, DATA_DIR)
+    notifier = Notifier(cfg.tg_bot_token, cfg.tg_owner_id, client, DATA_DIR, cfg.owner_transfer)
+    notifier.on_owner_change = restart_soon   # 换了主人（新账号发了换主人口令）：重启，按新主人重新读设置
     authorized = await client.is_user_authorized()
     if not notifier.owner_id:
         if authorized and not cfg.setup_pin:

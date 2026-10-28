@@ -11,6 +11,11 @@
 # 2026-09-28 换回 Gate（手续费低）：新单在 Gate 开，WEEX 上没平完的单子程序继续在 WEEX 管到平仓。
 live_trading: true
 
+# 换一个 Telegram 账号当机器人的主人（原来的账号登不进去时用）：新账号打开机器人，发「/start 口令」（或者只发口令）。
+# 这里只写口令的 SHA-256（仓库是公开的），口令本身只在对话里告诉用户；每个口令只能用一次（用过的记在服务器 data/owner_transfer.json）。
+# 2026-10-28：用户原来的 Telegram 账号被登出，改用另一个账号接收通知、控制机器人。
+owner_transfer_sha256: "4315272dc8cf03ccddd132abf60b135802c9a4a7b2a641408640a46805855caa"
+
 exchange:
   name: gate                   # gate、weex 或 bitget（新开的实盘单、模拟盘行情都用这个交易所；旧交易所没平完的单子继续在旧交易所管）
   margin_mode: isolated        # isolated 逐仓（推荐：最坏情况只亏这一单的保证金）/ cross 全仓

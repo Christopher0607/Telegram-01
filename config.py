@@ -234,6 +234,7 @@ class Config:
         self.paper_enabled = o["enabled"] if isinstance(o.get("enabled"), bool) and o.get("base") == self.paper_yaml \
             else self.paper_yaml
         self.tz_offset = float(raw.get("timezone_offset_hours", 8))
+        self.owner_transfer = str(raw.get("owner_transfer_sha256") or "").strip().lower()   # 换主人口令的 SHA-256
         self.report_hour = int(raw.get("daily_report_hour", 22))
 
         self.risk = copy.deepcopy(DEFAULT_RISK)
