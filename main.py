@@ -272,8 +272,33 @@ def ai_text(db: DB, cfg: Config, n: int) -> str:
 
 
 # ============================== 在机器人对话里登录 ==============================
+PHONE_RE = re.compile(r"\+\d{7,15}")
+
+
+async def switch_phone(m: dict, notifier: Notifier) -> bool:
+    """/phone +手机号：换一个 Telegram 账号来监听频道（原来的号收不到验证码时用，2026-10-28 用户原来的号码不是自己的）。
+    号码只存在服务器 data/secrets.env 的 TG_PHONE（仓库是公开的，不能写进去），存好就重启、用新号码登录。
+    不是 /phone 返回 False；是的话返回 True（号码不对就提示用法，接着等）。"""
+    text = m["text"].strip()
+    if not text.lower().startswith("/phone"):
+        return False
+    await notifier.delete(m)
+    num = re.sub(r"[\s\-()]", "", text[len("/phone"):])
+    if not PHONE_RE.fullmatch(num):
+        await notifier.send("用法：/phone +手机号（要带 + 和国家码，例如 /phone +8613800000000）")
+        return True
+    save_secrets({"TG_PHONE": num})
+    await notifier.send(f"✅ 监听频道的账号改成 {num[:4]}****{num[-3:]}，3 秒后重启，然后给这个号发登录验证码。\n"
+                        "私人群（会员群）要这个账号也在群里才能跟：请群管理员把它拉进群，或者要一个邀请链接，登录好以后发 /join 名字 邀请链接"
+                        "（管理员直接拉进群的，发 /join 名字，从列表里点）。")
+    restart_soon()
+    await asyncio.sleep(30)   # 等重启，别再给原来的号发验证码
+    return True
+
+
 async def bot_login(client, cfg: Config, notifier: Notifier):
-    """监听账号没登录时，通过你自己的机器人要验证码完成登录（手机上就能完成，不需要 SSH）。"""
+    """监听账号没登录时，通过你自己的机器人要验证码完成登录（手机上就能完成，不需要 SSH）。
+    这个号收不到验证码的话，主人发 /phone +新手机号 换一个账号监听（switch_phone）。"""
     phone = cfg.tg_phone
     if not phone:
         sys.exit("❌ .env 里没有 TG_PHONE")
@@ -295,12 +320,15 @@ async def bot_login(client, cfg: Config, notifier: Notifier):
         await notifier.send(f"🔐 需要登录监听频道用的 Telegram 账号 {masked}。\n"
                             f"验证码已发到这个账号里官方的「Telegram」对话。\n"
                             f"请把验证码的数字用空格隔开发给我，例如：1 2 3 4 5\n"
-                            f"（原样直接发，Telegram 会认为验证码泄露而作废）")
+                            f"（原样直接发，Telegram 会认为验证码泄露而作废）\n"
+                            f"这个号收不到验证码的话，发 /phone +手机号（带国家码）换一个账号来监听频道。")
         code = ""
         while not code:
             m = await notifier.next_owner_message(1800)
             if not m:
                 break
+            if await switch_phone(m, notifier):
+                continue
             if m["text"].strip().startswith("/"):
                 continue  # 比如又点了一次绑定链接（/start 口令）：口令不是验证码
             await notifier.delete(m)
@@ -308,9 +336,12 @@ async def bot_login(client, cfg: Config, notifier: Notifier):
             if not code:
                 await notifier.send("没看到数字。请把验证码的数字用空格隔开发给我，例如：1 2 3 4 5")
         if not code:
-            await notifier.send("⌛ 30 分钟没收到验证码。随便发一条消息给我，我就重新发送验证码。")
-            while not await notifier.next_owner_message(3600):
-                pass
+            await notifier.send("⌛ 30 分钟没收到验证码。随便发一条消息给我，我就重新发送验证码"
+                                "（这个号收不到的话，发 /phone +手机号 换一个账号）。")
+            m = None
+            while not m:
+                m = await notifier.next_owner_message(3600)
+            await switch_phone(m, notifier)
             continue
         try:
             await client.sign_in(phone, code, phone_code_hash=sent.phone_code_hash)
