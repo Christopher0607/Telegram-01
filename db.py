@@ -156,6 +156,17 @@ class DB:
         return [self._row(r) for r in self.conn.execute(
             "SELECT * FROM trades WHERE status='closed' ORDER BY id")]
 
+    def pnl_closed(self, mode: str, since_ms: int | None = None, before_ms: int | None = None) -> float:
+        """已平仓单子的盈亏合计（U）：since_ms 以后（含）、before_ms 以前平仓的。"""
+        q, args = "SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode=? AND status='closed'", [mode]
+        if since_ms is not None:
+            q += " AND closed_at>=?"
+            args.append(since_ms)
+        if before_ms is not None:
+            q += " AND closed_at<?"
+            args.append(before_ms)
+        return float(self.conn.execute(q, args).fetchone()["s"] or 0)
+
     def paper_realized(self) -> float:
         r = self.conn.execute(
             "SELECT COALESCE(SUM(pnl),0) s FROM trades WHERE mode='paper' AND status='closed'").fetchone()

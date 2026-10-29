@@ -40,6 +40,7 @@ DEFAULT_RISK = {
     "max_margin_pct": 25.0,           # 单笔保证金最多占权益 %
     "max_open_positions": 3,          # 同时最多几单（持仓+挂单）
     "max_daily_losses": 0,            # 每天最多亏几单（实盘/模拟分开算）：到了当天不再开新仓，第二天 0 点恢复；0 = 不限
+    "daily_profit_stop_pct": 0,       # 当天（0 点起）赚到开盘权益的这么多 %：全部平仓、撤挂单，当天不再开新仓；0 = 不用。现在只有模拟盘/回测
     "fallback_sl_mode": "atr",        # 信号没给止损时：atr 按波动率补 / pct 固定百分比 / off 不跟
     "fallback_sl_atr_mult": 2.0,      # atr 模式：止损距离 = 1 小时 ATR(14) × 此倍数
     "fallback_sl_min_pct": 1.5,       # 补的止损离进场价最近 %
@@ -117,9 +118,11 @@ def exit_rules(r: dict) -> str:
     frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
     a = ("晒盈利不平仓" if not r.get("close_on_profit_post") else "晒盈利全部平掉" if frac >= 0.95
          else "晒盈利先平一半、剩下推保本" if abs(frac - 0.5) < 1e-9 else f"晒盈利先平 {frac * 100:.0f}%、剩下推保本")
+    stop = float(r.get("daily_profit_stop_pct") or 0)
     return (a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
             + "｜" + ("第一止盈后推保本" if r.get("breakeven_after_tp1", True) else "第一止盈后不推保本")
-            + "｜" + ("跟频道减仓" if follows_reduce(r) else "频道减仓不跟"))
+            + "｜" + ("跟频道减仓" if follows_reduce(r) else "频道减仓不跟")
+            + (f"｜当天赚到总权益 {stop:g}% 就全部平仓、当天不再开" if stop > 0 else ""))
 
 
 def rules_line(r: dict) -> str:

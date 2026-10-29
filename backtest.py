@@ -407,7 +407,12 @@ HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的�
     ("D", {"follow_reduce": True}),   # 跟频道的减仓指令（现在已经跟的话，下面那个反过来对比不跟）
     ("D", {"follow_reduce": False}),
     ("原来", {"profit_post_close_frac": 1.0, "stop_loss_r": 1.0}),
+    # 当天账户赚到开盘权益的这么多 % 就全部平仓、当天不再开（engine.monitor_paper，2026-10-29 用户想试）。
+    # 只是回测对比：「🧭 跟单规则」里还没有这个开关，所以没有「采用」按钮，也不参加「⭐ 推荐」
+    ("I", {"daily_profit_stop_pct": 10}),
+    ("J", {"daily_profit_stop_pct": 20}),
 )
+EXTRA_KEYS = ("daily_profit_stop_pct",)   # 回测里能比、但「🧭 跟单规则」里还改不了的规则
 
 
 def rules_key(r: dict) -> tuple:
@@ -416,7 +421,8 @@ def rules_key(r: dict) -> tuple:
     frac, cut = float(r.get("profit_post_close_frac") or 1.0), float(r.get("stop_loss_r") or 1.0)
     return (me, None if me else bool(r.get("allow_limit_orders")), cop,
             (1.0 if frac >= 0.95 else round(frac, 4)) if cop else None, 1.0 if cut >= 0.999 else round(cut, 4),
-            bool(r.get("breakeven_after_tp1", True)), follows_reduce(r), bool(r.get("follow_close", True)))
+            bool(r.get("breakeven_after_tp1", True)), follows_reduce(r), bool(r.get("follow_close", True)),
+            float(r.get("daily_profit_stop_pct") or 0))
 VARIANTS = (   # 回测时同一段行情拿来对比的几种完整做法（进场怎么进、晒盈利平不平）；跟现在一样的自动跳过
     ("进场一律市价、晒盈利就清仓、跟频道减仓（09-29～10-09 用的）",
      {"market_entry": True, "close_on_profit_post": True, "profit_post_close_frac": 1.0, "follow_reduce": True}),
@@ -705,7 +711,9 @@ async def simulate(job_path: str, out_path: str):
         done = sorted((t for t in tr if t["status"] == "closed" and t.get("r_mult") is not None), key=lambda t: t["closed_at"])
         rs = [t["r_mult"] for t in done]
         mid = (job["start"] + job["end"]) / 2 * 1000
-        return dict(code=rules_code(rules), rules=rules_line(rules), opened=sum(1 for t in tr if t.get("opened_at")),
+        extra = any(float(rules.get(k) or 0) for k in EXTRA_KEYS)   # 机器人里还改不了：不给「采用」按钮、不参加推荐
+        return dict(code="" if extra else rules_code(rules), extra=extra, rules=rules_line(rules),
+                    opened=sum(1 for t in tr if t.get("opened_at")),
                     halves=[half([t for t in done if (t["closed_at"] < mid) == first]) for first in (True, False)],
                     **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
                     per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
@@ -743,7 +751,7 @@ async def simulate(job_path: str, out_path: str):
         # ⭐ 推荐：「🧭 跟单规则」能选的所有组合都跑一遍（上面跑过的不重跑），挑最好的
         for ov in grid_rules():
             await result(ov)
-        best = recommend(list(tried.values()), tried[rules_key(now_rules)])
+        best = recommend([r for r in tried.values() if not r.get("extra")], tried[rules_key(now_rules)])
         cfg.risk = base_risk
     finally:
         await ex.close()
@@ -889,6 +897,8 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
             for c in head:
                 lines.append(f"• {c['label']}")
                 lines += detail(c)
+                if c.get("extra"):
+                    lines.append("   （只是回测看看：机器人里还没有这个开关，想用的话告诉 Claude Code）")
                 if c.get("per_channel") and res.get("per_channel"):
                     was = {x["title"]: x["total"] for x in res["per_channel"]}
                     lines.append("   各频道：" + "；".join(f"{x['title']} {was.get(x['title'], 0):+.1f}R → {x['total']:+.1f}R"

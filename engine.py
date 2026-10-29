@@ -494,15 +494,22 @@ class Engine:
     # ---------------- 每天最多亏几单 ----------------
     def day_start_ms(self) -> int:
         """今天 0 点（按 config 的 timezone_offset_hours，默认北京时间）。"""
-        d = datetime.fromtimestamp(now_ms() / 1000, timezone(timedelta(hours=self.cfg.tz_offset)))
-        return int(d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+        return self.day_start_of(now_ms())
 
     def losses_today(self, mode: str) -> int:
         """今天（0 点以后）平仓的亏损单数：亏了超过 0.1R 才算，保本出场不算。"""
         return self.db.count_losses(mode, self.day_start_ms())
 
+    def day_key(self, ms: int) -> str:
+        """ms 这一刻是哪一天（按 timezone_offset_hours，默认北京时间）。"""
+        return datetime.fromtimestamp(ms / 1000, timezone(timedelta(hours=self.cfg.tz_offset))).strftime("%Y-%m-%d")
+
     def daily_block(self, mode: str, risk: dict | None = None) -> str | None:
-        """今天的亏损单数到了每日上限（max_daily_losses）：当天不再开新仓，第二天 0 点恢复。没到返回 None。"""
+        """今天不能再开新仓的原因：当天已经赚够收工（daily_profit_stop_pct），或者亏损单数到了每日上限（max_daily_losses）。
+        第二天 0 点恢复。都没有返回 None。"""
+        stop = float((risk or self.cfg.risk).get("daily_profit_stop_pct") or 0)
+        if stop > 0 and self.db.kv_get(f"profit_stop:{mode}") == self.day_key(now_ms()):
+            return f"今天{MODE_CN[mode]}已经赚到总权益 {stop:g}%，全部平仓收工了，明天 0 点自动恢复"
         lim = int((risk or self.cfg.risk).get("max_daily_losses") or 0)
         if lim <= 0:
             return None
@@ -1606,41 +1613,111 @@ class Engine:
         await self.notify(f"✅ #{t['id']} [实盘] {t['base']} 限价单成交 @{fmt(t['entry_price'])}，数量 {fmt(p['size'])}")
 
     async def monitor_paper(self):
+        """模拟盘盯盘：每一单按自己的 1 分钟 K 线逐根撮合（回测时一次推进到下一条消息）。
+        所有单子按 K 线的时间一起往前推：打开「当天赚够就收工」（daily_profit_stop_pct）时，每一分钟都要算整个账户当天赚了多少
+        （今天 0 点以后平掉的单子 + 还开着的单子按这一分钟的收盘价算），赚到开盘权益的这么多 % 就全部平仓、撤掉挂单，
+        当天不再开新仓（daily_block）。没打开时跟一单一单推进结果完全一样。"""
         trades = self.db.active_trades("paper")
         now = now_ms()
+        stop_pct = float(self.cfg.risk.get("daily_profit_stop_pct") or 0)
+        feeds, failed = {}, set()
         for t in trades:
-            risk = self.risk_of(t)
-            events: list[str] = []
             since = int(t.get("last_candle_ts") or t["created_at"]) + 60000
             if since + 60000 <= now:
                 try:
                     candles = await self.ex.ohlcv(t["symbol"], since)
                 except Exception as e:
                     log.warning("拉 K 线失败 %s：%s", t["symbol"], e)
+                    failed.add(t["id"])
                     continue
-                mk, tk = self.fee_pair(t["symbol"], risk)
-                for c in candles:
-                    ts = int(c[0])
-                    if ts < since or ts + 60000 > now:
-                        continue
-                    if t["status"] == "pending" and ts >= (t.get("expires_at") or ts + 1):
-                        break   # 限价单已经过了有效期：之后的 K 线不能再让它成交（回测一次推进好几个小时也对）
-                    events += simulate_candle(t, ts, float(c[2]), float(c[3]), tk, bool(risk["breakeven_after_tp1"]),
-                                              maker_fee=mk, maker_tp=self.maker_on("paper"))
-                    t["last_candle_ts"] = ts
-                    if t["status"] not in ("pending", "open"):
-                        break
+                feeds[t["id"]] = [c for c in candles if int(c[0]) >= since and int(c[0]) + 60000 <= now]
+        by_ts: dict[int, list] = {}
+        for t in trades:
+            for c in feeds.get(t["id"], []):
+                by_ts.setdefault(int(c[0]), []).append((t, c))
+        events: dict[int, list[str]] = {t["id"]: [] for t in trades}
+        how = {}   # 每一单的手续费（挂单、市价）、第一止盈后推不推保本：先算好，不用每根 K 线都算
+        for t in trades:
+            risk = self.risk_of(t)
+            how[t["id"]] = (*self.fee_pair(t["symbol"], risk), bool(risk["breakeven_after_tp1"]))
+        maker_tp = self.maker_on("paper")
+        stopped: set = set()   # 停下来的单子：限价单过了有效期（之后的 K 线不能再让它成交，回测一次推进好几个小时也对）
+        last_px: dict[int, float] = {}
+        day, stop_day = None, self.db.kv_get("profit_stop:paper")
+        for ts in sorted(by_ts):
+            for t, c in by_ts[ts]:
+                if t["id"] in stopped or t["status"] not in ("pending", "open"):
+                    continue
+                if t["status"] == "pending" and ts >= (t.get("expires_at") or ts + 1):
+                    stopped.add(t["id"])
+                    continue
+                mk, tk, be = how[t["id"]]
+                events[t["id"]] += simulate_candle(t, ts, float(c[2]), float(c[3]), tk, be, maker_fee=mk, maker_tp=maker_tp)
+                t["last_candle_ts"] = ts
+                last_px[t["id"]] = float(c[4])
+            if stop_pct <= 0:
+                continue
+            key = self.day_key(ts)
+            if key != day:   # 换了一天：开盘权益 = 模拟本金 + 今天 0 点以前平掉的单子
+                day, d0 = key, self.day_start_of(ts)
+                base = self.cfg.paper_equity + self.db.pnl_closed("paper", before_ms=d0) + sum(
+                    t["pnl"] or 0 for t in trades if t["status"] == "closed" and t["closed_at"] < d0)
+                before = self.db.pnl_closed("paper", since_ms=d0)   # 今天之前几轮已经平掉的
+            if stop_day == key:
+                continue
+            gain = before + sum(self.paper_pnl_now(t, last_px.get(t["id"]), d0, how[t["id"]][1]) for t in trades)
+            if base > 0 and gain >= base * stop_pct / 100:
+                await self.paper_profit_stop(trades, ts, last_px, events, stop_pct, gain, base, how)
+                stop_day = key
+                self.db.kv_set("profit_stop:paper", key)
+        for t in trades:
+            if t["id"] in failed:
+                continue
             if t["status"] == "pending" and now > (t.get("expires_at") or 0):
                 t.update(status="cancelled", closed_at=min(now, int(t.get("expires_at") or now)), exit_reason="限价单超时未成交")
-                events.append("限价单超时未成交，已取消")
+                events[t["id"]].append("限价单超时未成交，已取消")
             self.db.save_trade(t)
-            if not events:
+            ev = events[t["id"]]
+            if not ev:
                 continue
             if t["status"] == "closed":
-                await self.notify(self.close_text(t, None, events))
+                await self.notify(self.close_text(t, None, ev))
                 await self.after_close(t)
             else:
-                await self.notify(f"📈 #{t['id']} [模拟] {t['base']} {SIDE_CN[t['side']]}：" + "；".join(events))
+                await self.notify(f"📈 #{t['id']} [模拟] {t['base']} {SIDE_CN[t['side']]}：" + "；".join(ev))
+
+    def day_start_of(self, ms: int) -> int:
+        """ms 这一刻所在那一天的 0 点（按 timezone_offset_hours）。"""
+        d = datetime.fromtimestamp(ms / 1000, timezone(timedelta(hours=self.cfg.tz_offset)))
+        return int(d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+
+    @staticmethod
+    def paper_pnl_now(t: dict, px: float | None, day0: int, taker_fee: float) -> float:
+        """这一单算进「今天赚了多少」的部分（U）：今天平掉的算全部盈亏；还开着的算已实现的加上按 px 现在平掉的浮动盈亏
+        （扣市价平仓手续费）；以前平掉的、还没成交的限价单不算。"""
+        if t["status"] == "closed":
+            return (t["pnl"] or 0) if (t.get("closed_at") or 0) >= day0 else 0.0
+        if t["status"] != "open":
+            return 0.0
+        px = px or t["entry_price"]
+        sign = 1 if t["side"] == "long" else -1
+        return (t.get("realized") or 0) + sign * (px - t["entry_price"]) * t["remaining"] - t["remaining"] * px * taker_fee
+
+    async def paper_profit_stop(self, trades: list[dict], ts: int, last_px: dict, events: dict, pct: float,
+                                gain: float, base: float, how: dict):
+        """模拟盘当天赚够了：还开着的按这一分钟的收盘价全部平掉（市价手续费），还没成交的限价单撤掉。"""
+        reason = f"当天赚到总权益 {pct:g}%，全部平仓收工"
+        for t in trades:
+            if t["status"] == "open":
+                px = last_px.get(t["id"]) or t["entry_price"]
+                exit_part(t, px, t["remaining"], how[t["id"]][1])
+                finish(t, ts, reason)
+                events[t["id"]].append(f"{reason} @{fmt(px)}")
+            elif t["status"] == "pending":
+                t.update(status="cancelled", closed_at=ts, exit_reason=f"当天赚到总权益 {pct:g}%，撤掉挂单")
+                events[t["id"]].append(f"当天赚到总权益 {pct:g}%，撤掉挂单")
+        await self.notify(f"💰 今天模拟盘已经赚了 {gain:+.2f}U（开盘权益 {base:.2f}U 的 {gain / base * 100:.1f}%），"
+                          f"到了「当天赚到总权益 {pct:g}% 就收工」：全部平仓，今天不再开新的模拟仓，明天 0 点恢复。")
 
     async def maybe_daily_report(self):
         """每天 daily_report_hour 点推送一次日报（持仓 + 各频道战绩）。"""
