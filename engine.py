@@ -1198,6 +1198,15 @@ class Engine:
             new = e - cut * (e - full)   # 亏到 stop_loss_r 就止损：挂在频道止损的这个比例处
             if (long and full >= e) or (not long and full <= e):
                 notes.append(f"频道的止损 {fmt(full)} 在开仓价 {fmt(e)} 的另一边，不用，止损还是程序补的 {fmt(t['soft_sl'])}")
+            elif risk.get("resize_on_fill") and t["mode"] == "paper" and not any(x.get("filled") for x in t["tps"]):
+                price = await self.xt(t).last_price(t["symbol"]) if t["status"] == "open" else None
+                if price and ((long and price <= new) or (not long and price >= new)):
+                    return await self.on_close(t, 1.0, f"频道补发的止损 {fmt(new)} 已经被打到（现价 {fmt(price)}），直接离场")
+                if t["status"] == "open" and not price:
+                    notes.append("拿不到现价，没按频道的止损调整仓位，止损还是程序补的")
+                else:
+                    done.append(self.resize_to_sl(t, full, new, risk, price))
+                    e = t["entry_price"]
             elif not tighter(t["side"], new, t["soft_sl"]):
                 notes.append(f"频道的止损 {fmt(full)} 比程序补的 {fmt(t['soft_sl'])} 还远，止损还是程序补的"
                              f"（仓位是按程序补的止损算的，放宽就超过每单风险）")
@@ -1233,6 +1242,44 @@ class Engine:
             return "fill: 换成频道的" + "、".join(x.split("：")[0] for x in done)
         await self.notify(f"ℹ️ {head}，没有改：" + "；".join(notes))
         return "fill: 没有改"
+
+    def resize_to_sl(self, t, full: float, new: float, risk: dict, price: float | None) -> str:
+        """频道补发了止损（resize_on_fill，现在只有模拟盘/回测）：仓位改成「打到频道的止损正好亏开仓时定的每单风险」。
+        开仓时仓位是按程序补的止损算的：频道的止损更近 → 按现价加仓；更远 → 按现价减掉一部分，止损放宽到频道的。
+        还没成交的限价单直接改数量。加仓受保证金上限（max_margin_pct）限制，加不满就少加。返回给主人看的一句话。"""
+        tk = self.fee_pair(t["symbol"], risk)[1]
+        target, e, old_sl = t["risk_usdt"], t["entry_price"], t["soft_sl"]
+
+        def per_unit(at: float) -> float:   # 从 at 这个价格开的每个币，打到频道的止损亏多少（含开平手续费）
+            return abs(at - full) + 2 * tk * at
+
+        q = t["remaining"] if t["status"] == "open" else t["qty"]
+        if t["status"] != "open":   # 限价单还没成交：直接改数量
+            t["qty"] = target / per_unit(e)
+            what = f"还没成交的限价单数量 {q:g} → {t['qty']:g}"
+        elif q * per_unit(e) < target:   # 频道的止损更近：加仓
+            add = (target - q * per_unit(e)) / per_unit(price)
+            cap = self.paper_equity() * float(risk["max_margin_pct"]) / 100 * (t.get("leverage") or 1) / price
+            capped = q + add > cap
+            add = max(0.0, min(add, cap - q))
+            if add > 0:
+                t["realized"] = (t.get("realized") or 0.0) - add * price * tk
+                t["entry_price"] = (q * e + add * price) / (q + add)
+                t["qty"], t["remaining"] = t["qty"] + add, q + add
+            what = f"按现价 {fmt(price)} 加仓 {add:g}（{q:g} → {q + add:g}）" + ("，到保证金上限，加不满" if capped else "")
+        else:   # 频道的止损更远：减仓
+            keep = target / per_unit(e)
+            exit_part(t, price, q - keep, tk)
+            t["qty"] = keep
+            what = f"按现价 {fmt(price)} 减仓 {q - keep:g}（{q:g} → {keep:g}）"
+        n = t["remaining"] if t["status"] == "open" else t["qty"]
+        for x in t["tps"]:
+            x["qty"] = n * x["frac"] if t["status"] == "open" else None
+        t["sl"] = t["soft_sl"] = new
+        t["sl_source"] = "signal"
+        t["risk_usdt"] = n * per_unit(t["entry_price"])
+        return (f"仓位按频道的止损调整：{what}｜止损 {fmt(old_sl)} → {fmt(new)}｜打到止损约亏 {t['risk_usdt']:.2f}U"
+                f"（每单风险 {target:.2f}U）")
 
     async def move_sl(self, t, new) -> bool:
         """止损整个换到 new，交易所里的止损单也挪过去（先挂新的再撤旧的，任何时候都有止损）。

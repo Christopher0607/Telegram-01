@@ -411,8 +411,10 @@ HEAD_VARIANTS = (   # 报告里单独拿出来跟现在的规则逐项对比的�
     # 只是回测对比：「🧭 跟单规则」里还没有这个开关，所以没有「采用」按钮，也不参加「⭐ 推荐」
     ("I", {"daily_profit_stop_pct": 10}),
     ("J", {"daily_profit_stop_pct": 20}),
+    # 频道后补止损时按它加减仓，打到止损正好亏每单风险（engine.resize_to_sl，2026-11-04 用户想试）；同样只是回测对比
+    ("K", {"resize_on_fill": True}),
 )
-EXTRA_KEYS = ("daily_profit_stop_pct",)   # 回测里能比、但「🧭 跟单规则」里还改不了的规则
+EXTRA_KEYS = ("daily_profit_stop_pct", "resize_on_fill")   # 回测里能比、但「🧭 跟单规则」里还改不了的规则
 
 
 def rules_key(r: dict) -> tuple:
@@ -422,7 +424,7 @@ def rules_key(r: dict) -> tuple:
     return (me, None if me else bool(r.get("allow_limit_orders")), cop,
             (1.0 if frac >= 0.95 else round(frac, 4)) if cop else None, 1.0 if cut >= 0.999 else round(cut, 4),
             bool(r.get("breakeven_after_tp1", True)), follows_reduce(r), bool(r.get("follow_close", True)),
-            float(r.get("daily_profit_stop_pct") or 0))
+            float(r.get("daily_profit_stop_pct") or 0), bool(r.get("resize_on_fill")))
 VARIANTS = (   # 回测时同一段行情拿来对比的几种完整做法（进场怎么进、晒盈利平不平）；跟现在一样的自动跳过
     ("进场一律市价、晒盈利就清仓、跟频道减仓（09-29～10-09 用的）",
      {"market_entry": True, "close_on_profit_post": True, "profit_post_close_frac": 1.0, "follow_reduce": True}),
@@ -539,6 +541,43 @@ def money(rs: list, pct: float | None, fixed: float | None, equity: float | None
     if equity:
         out.update(ret=cum / equity, ret_dd=mdd)
     return out
+
+
+def money_real(pnls: list, pct: float | None, fixed: float | None, equity: float | None, start: float | None) -> dict:
+    """按模拟账户每一单实际赚亏的钱（U，按平仓顺序）算收益，返回的样子跟 money 一样。
+    每单风险是权益 %：模拟账户从 start（模拟本金）开始，开仓时按当时的权益算仓位（复利），收益率 = 最后的权益 / start - 1；
+    每单固定 U：钱加起来，知道现在的实盘权益 equity 再换成收益率。
+    money 假设每一单都正好亏满设定的风险；但频道先发简短的、后补止损时，仓位是按程序补的止损算的，频道的止损更近，
+    这一单打到止损就亏不满（2026-11-04 发现，那个群一大半的单子是这样），所以按实际的钱算才准。"""
+    if pct and start:
+        eq = pk = start
+        mdd = 0.0
+        for p in pnls:
+            eq += p
+            pk = max(pk, eq)
+            mdd = min(mdd, eq / pk - 1)
+        return {"ret": eq / start - 1, "ret_dd": mdd}
+    if not fixed:
+        return {}
+    cum = pk = dd_u = mdd = 0.0
+    for p in pnls:
+        cum += p
+        pk = max(pk, cum)
+        dd_u = min(dd_u, cum - pk)
+        if equity:
+            mdd = min(mdd, (cum - pk) / (equity + pk))
+    out = {"pnl_u": cum, "dd_u": dd_u}
+    if equity:
+        out.update(ret=cum / equity, ret_dd=mdd)
+    return out
+
+
+def money_of(res: dict, rs: list, mults: list) -> dict:
+    """报告里的收益：结果里有每一单实际赚亏的钱就按钱算（money_real），旧的结果只有 R 就按 R 算（money）。"""
+    pn = [t.get("pnl") for t in res.get("closed") or []]
+    if pn and all(p is not None for p in pn):
+        return money_real(pn, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), res.get("start_equity"))
+    return money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), mults)
 
 
 COPY_WINDOW_H = 24   # 别的频道 24 小时内发过同一个币、同一方向、点位几乎一样的信号，算「照抄」
@@ -700,11 +739,13 @@ async def simulate(job_path: str, out_path: str):
         finally:
             db.conn.close()
 
-    def half(ts: list) -> dict:
-        """前半段或后半段的成绩：总 R、最大回撤、收益率（推荐时分开比，看好处是不是只在某一段）。"""
+    start = float(cfg.paper_equity)   # 模拟账户的本金（每单按权益 % 算仓位时，收益率按它算）
+
+    def half(ts: list, at: float) -> dict:
+        """前半段或后半段的成绩：总 R、最大回撤、收益率（推荐时分开比，看好处是不是只在某一段）。at：这一段开始时的模拟权益。"""
         rs = [t["r_mult"] for t in ts]
         return {"total": sum(rs), "dd": closed_stats(rs)["dd"],
-                "ret": money(rs, pct, fixed, equity, [mult_of(t) for t in ts]).get("ret")}
+                "ret": money_real([t["pnl"] for t in ts], pct, fixed, equity, at).get("ret")}
 
     def stats_of(tr: list, rules: dict) -> dict:
         """一套规则跑出来的单子 → 成绩（对比、推荐都用这个）。"""
@@ -712,10 +753,11 @@ async def simulate(job_path: str, out_path: str):
         rs = [t["r_mult"] for t in done]
         mid = (job["start"] + job["end"]) / 2 * 1000
         extra = any(float(rules.get(k) or 0) for k in EXTRA_KEYS)   # 机器人里还改不了：不给「采用」按钮、不参加推荐
+        h1, h2 = [t for t in done if t["closed_at"] < mid], [t for t in done if t["closed_at"] >= mid]
         return dict(code="" if extra else rules_code(rules), extra=extra, rules=rules_line(rules),
                     opened=sum(1 for t in tr if t.get("opened_at")),
-                    halves=[half([t for t in done if (t["closed_at"] < mid) == first]) for first in (True, False)],
-                    **closed_stats(rs), **money(rs, pct, fixed, equity, [mult_of(t) for t in done]),
+                    halves=[half(h1, start), half(h2, start + sum(t["pnl"] for t in h1))],
+                    **closed_stats(rs), **money_real([t["pnl"] for t in done], pct, fixed, equity, start),
                     per_channel=[dict(title=c["title"], n=sum(1 for t in done if t.get("channel") == c["username"]),
                                       total=sum(t["r_mult"] for t in done if t.get("channel") == c["username"]))
                                  for c in (chans if multi else [])])
@@ -774,7 +816,7 @@ async def simulate(job_path: str, out_path: str):
                                 **closed_stats([t["r_mult"] for t in closed if t.get("channel") == c["username"]])))
     out = {
         "title": job["title"], "start": job["start"], "end": job["end"], "days": job["days"], "risk_pct": pct,
-        "risk_usdt": fixed, "equity": equity, "multi": multi, "per_channel": per_channel, "copies": copies,
+        "risk_usdt": fixed, "equity": equity, "start_equity": start, "multi": multi, "per_channel": per_channel, "copies": copies,
         "channels": [c["title"] for c in chans],
         "limits": [int(risk.get("max_open_positions") or 0), int(risk.get("max_daily_losses") or 0)],
         "maker": maker, "errors": len(errors), "error_sample": errors[0][:80] if errors else "",
@@ -795,7 +837,7 @@ async def simulate(job_path: str, out_path: str):
         "cancelled": sum(1 for t in trades if t["status"] == "cancelled" and not t.get("opened_at")),
         "skips": sorted(skips.items(), key=lambda kv: -kv[1]),
         "filled": sum(1 for o in outcomes for p in o.split(" | ") if p.startswith("fill: 换成")),
-        "closed": [{"base": t["base"], "side": t["side"], "r": t["r_mult"], "reason": t.get("exit_reason") or "",
+        "closed": [{"base": t["base"], "side": t["side"], "r": t["r_mult"], "pnl": t["pnl"], "reason": t.get("exit_reason") or "",
                     "opened_at": t.get("opened_at") or t["created_at"], "closed_at": t["closed_at"],
                     "fallback": t.get("sl_source") == "fallback", "mult": mult_of(t),
                     "ch": chmap[t["channel"]][0].title if multi and t.get("channel") in chmap else ""} for t in closed],
@@ -841,10 +883,10 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         fb = [t["r"] for t in res["closed"] if t["fallback"]]
         if fb:
             lines.append(f"• 其中信号没给止损、程序补止损的 {len(fb)} 单：总 {sum(fb):+.1f}R")
-        m = money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), mults)
+        m = money_of(res, rs, mults)
         if res.get("risk_pct"):
-            lines.append(f"💰 收益率：按每单亏总权益 {res['risk_pct']:g}% 算（复利），这段时间 {m['ret'] * 100:+.0f}%，"
-                         f"中途最多回撤 {m['ret_dd'] * 100:.0f}%")
+            lines.append(f"💰 收益率：每单开仓时按亏总权益 {res['risk_pct']:g}% 算仓位（复利），按每一单实际赚亏的钱算，"
+                         f"这段时间 {m['ret'] * 100:+.0f}%，中途最多回撤 {m['ret_dd'] * 100:.0f}%")
         elif res.get("risk_usdt"):
             u = res["risk_usdt"]
             if m.get("ret") is not None:
@@ -876,7 +918,7 @@ def report_text(res: dict, tz_hours: float = 8) -> str:
         if not real:
             lines.append("• 没发现照抄的频道")
     if res.get("compare"):
-        now = {**closed_stats(rs), **money(rs, res.get("risk_pct"), res.get("risk_usdt"), res.get("equity"), mults)}
+        now = {**closed_stats(rs), **money_of(res, rs, mults)}
         has_ret = now.get("ret") is not None
 
         def row(st: dict) -> str:

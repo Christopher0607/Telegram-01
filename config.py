@@ -41,6 +41,7 @@ DEFAULT_RISK = {
     "max_open_positions": 3,          # 同时最多几单（持仓+挂单）
     "max_daily_losses": 0,            # 每天最多亏几单（实盘/模拟分开算）：到了当天不再开新仓，第二天 0 点恢复；0 = 不限
     "daily_profit_stop_pct": 0,       # 当天（0 点起）赚到开盘权益的这么多 %：全部平仓、撤挂单，当天不再开新仓；0 = 不用。现在只有模拟盘/回测
+    "resize_on_fill": False,          # 频道后补止损时，按它的止损加/减仓，让打到止损正好亏每单风险（不然只收紧止损、亏不满）。现在只有模拟盘/回测
     "fallback_sl_mode": "atr",        # 信号没给止损时：atr 按波动率补 / pct 固定百分比 / off 不跟
     "fallback_sl_atr_mult": 2.0,      # atr 模式：止损距离 = 1 小时 ATR(14) × 此倍数
     "fallback_sl_min_pct": 1.5,       # 补的止损离进场价最近 %
@@ -122,7 +123,8 @@ def exit_rules(r: dict) -> str:
     return (a + "｜" + ("打到信号止损才平" if cut >= 0.999 else f"亏到 {cut:g}R 就止损")
             + "｜" + ("第一止盈后推保本" if r.get("breakeven_after_tp1", True) else "第一止盈后不推保本")
             + "｜" + ("跟频道减仓" if follows_reduce(r) else "频道减仓不跟")
-            + (f"｜当天赚到总权益 {stop:g}% 就全部平仓、当天不再开" if stop > 0 else ""))
+            + (f"｜当天赚到总权益 {stop:g}% 就全部平仓、当天不再开" if stop > 0 else "")
+            + ("｜频道补发止损后按它加减仓、每单亏满设定的风险" if r.get("resize_on_fill") else ""))
 
 
 def rules_line(r: dict) -> str:
