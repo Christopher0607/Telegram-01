@@ -6,6 +6,8 @@
   python deploy/do_deploy.py destroy --yes        删除服务器（服务器上的交易记录、Telegram 登录会一起删除）
   python deploy/do_deploy.py manual --repo 用户名/仓库名   生成 deploy/manual-user-data.sh：用户不用 Claude、
         自己在 DigitalOcean 网页上建服务器时贴进「Initialization scripts」的开机脚本（改了 cloud-init.sh 要重新生成）
+  python deploy/do_deploy.py bundle --env-file deploy.env --pass-file /仓库外面/口令.txt   把机器人 Token、DeepSeek Key、
+        Telegram API（和手机号）用口令加密成 deploy/secrets.enc（可以提交）；重开时用户只填口令。口令只告诉用户，绝不提交、不打印
 
 变量来源：环境变量，或 --env-file 文件（KEY=VALUE，每行一个；文件里的值优先）
   必填：DIGITALOCEAN_TOKEN（要有 Write 权限） TG_API_ID TG_API_HASH TG_PHONE TG_BOT_TOKEN DEEPSEEK_API_KEY
@@ -22,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import sys
 import time
 import urllib.error
@@ -34,6 +37,14 @@ REQUIRED = ["TG_API_ID", "TG_API_HASH", "TG_PHONE", "TG_BOT_TOKEN", "DEEPSEEK_AP
 OPTIONAL = ["TG_OWNER_ID", "ANTHROPIC_API_KEY", "BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE"]
 NETWORK_HINT = ("如果是在 Claude Code 云端运行：请用户编辑当前环境，Network access 选 Custom，"
                 "Allowed domains 加入 api.digitalocean.com，并勾选包含默认列表，保存后开一个新会话。")
+
+# ---- 加密的密钥包（2026-11-26 用户要求：重开时只建服务器、登录 Telegram、设交易所 API，别的都存在仓库里）----
+# 仓库是公开的，只能放加密后的；口令绝不提交、不打印（只在对话里告诉用户）。开机脚本用同样的参数解开（Ubuntu 自带 openssl）。
+BUNDLE_KEYS = ["TG_API_ID", "TG_API_HASH", "TG_PHONE", "TG_BOT_TOKEN", "DEEPSEEK_API_KEY"]   # DigitalOcean / GitHub / 交易所的密钥绝不放
+BUNDLE_PATH = os.path.join(HERE, "secrets.enc")
+ENC_ARGS = "-aes-256-cbc -pbkdf2 -iter 1000000 -md sha256 -a"
+PASS_CHARS = "abcdefghijkmnpqrstuvwxyz23456789"   # 32 个字符（去掉了容易看错的 l、o、0、1），24 位 = 120 bit
+MIN_PASS = 20
 
 
 def read_env_file(path: str) -> dict:
@@ -92,22 +103,33 @@ def collect(args) -> tuple[str, dict, str]:
     return token, env, val("GITHUB_READ_TOKEN")
 
 
+def env_errors(env: dict) -> list[str]:
+    """各个值的格式（create 和 bundle 共用）。"""
+    def g(k):
+        return env.get(k) or ""
+    errs = []
+    if g("TG_API_ID") and not g("TG_API_ID").isdigit():
+        errs.append("TG_API_ID 应该是纯数字")
+    if g("TG_API_HASH") and not re.fullmatch(r"[0-9a-fA-F]{32}", g("TG_API_HASH")):
+        errs.append("TG_API_HASH 应该是 32 位的 0-9、a-f")
+    if g("TG_PHONE") and not re.fullmatch(r"\+\d{6,15}", g("TG_PHONE")):
+        errs.append("TG_PHONE 要带国家码，例如 +8613800000000")
+    if g("TG_BOT_TOKEN") and not re.fullmatch(r"\d+:[\w-]{20,}", g("TG_BOT_TOKEN")):
+        errs.append("TG_BOT_TOKEN 格式不对（应类似 123456789:AAH...）")
+    if g("TG_OWNER_ID") and not g("TG_OWNER_ID").isdigit():
+        errs.append("TG_OWNER_ID 应该是纯数字")
+    errs += [f"{k} 里不能有空格或换行" for k, v in env.items() if re.search(r"\s", v or "")]
+    return errs
+
+
 def validate(token: str, env: dict, repo: str, branch: str) -> list[str]:
     errs = [] if token else ["缺少 DIGITALOCEAN_TOKEN"]
     errs += [f"缺少 {k}" for k in REQUIRED if not env.get(k)]
-    if env["TG_API_ID"] and not env["TG_API_ID"].isdigit():
-        errs.append("TG_API_ID 应该是纯数字")
-    if env["TG_PHONE"] and not re.fullmatch(r"\+\d{6,15}", env["TG_PHONE"]):
-        errs.append("TG_PHONE 要带国家码，例如 +8613800000000")
-    if env["TG_BOT_TOKEN"] and not re.fullmatch(r"\d+:[\w-]{20,}", env["TG_BOT_TOKEN"]):
-        errs.append("TG_BOT_TOKEN 格式不对（应类似 123456789:AAH...）")
-    if env["TG_OWNER_ID"] and not env["TG_OWNER_ID"].isdigit():
-        errs.append("TG_OWNER_ID 应该是纯数字")
+    errs += env_errors(env)
     if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo or ""):
         errs.append("--repo 格式应为 用户名/仓库名")
     if not re.fullmatch(r"[\w./-]+", branch or ""):
         errs.append("--branch 格式不对")
-    errs += [f"{k} 里不能有换行" for k, v in env.items() if "\n" in v or "\r" in v]
     return errs
 
 
@@ -119,9 +141,13 @@ def render_user_data(repo: str, branch: str, env: dict, gh_token: str, pin: str 
     return tpl.replace("__BRANCH__", branch).replace("__REPO_URL__", url).replace("__ENV__", "\n".join(lines))
 
 
-MANUAL_HEAD = """# 自己在 DigitalOcean 网页上建服务器时用（不用 Claude）：整段复制到建服务器页面的「Initialization scripts」里，
-# 只把下面 6 行等号后面的「填这里」换成你自己的值（等号两边不要加空格），别的都不要动。步骤见 README「自己重开」。
+MANUAL_HEAD = """# 自己在 DigitalOcean 网页上建服务器时用（不用 Claude）：贴进建服务器页面的「Initialization scripts」。步骤见 README「自己重开」。
+# 一般贴 README 里那段 4 行的短开机脚本（口令写在里面），它会下载这个文件来跑。直接整段贴这个文件也行：
+#   有口令：只把下面 TGST_PASS 那一行的「填这里」换成口令。机器人 Token 这些密钥用口令加密存在仓库的 deploy/secrets.enc 里，开机时解开。
+#   没有口令：把下面 6 行等号后面的「填这里」换成你自己的值（等号两边不要加空格），别的都不要动。
+#   填了的值（或者短脚本里 export 的）比加密包里的优先：有口令、只换了某一个密钥，就只填那一个。
 # 这个文件由 deploy/do_deploy.py manual 从 cloud-init.sh 生成。
+[ -n "${TGST_PASS:-}" ] || TGST_PASS='填这里'
 cat > /root/tgst.env <<'ENVEOF'
 TG_API_ID=填这里
 TG_API_HASH=填这里
@@ -130,21 +156,56 @@ TG_BOT_TOKEN=填这里
 DEEPSEEK_API_KEY=填这里
 SETUP_PIN=填这里
 ENVEOF
+for k in TG_API_ID TG_API_HASH TG_PHONE TG_BOT_TOKEN DEEPSEEK_API_KEY SETUP_PIN; do
+  if [ -n "${!k:-}" ]; then echo "$k=${!k}" >> /root/tgst.env; fi
+done
 chmod 600 /root/tgst.env
+"""
+# 替换 cloud-init.sh 里写 .env 的那一段：有口令就解开加密包，再用上面填的值盖过去（同一个名字只留最后一个）
+ENV_MERGE = """# 有口令：解开仓库里加密的密钥（deploy/secrets.enc），绑定主人的口令（SETUP_PIN）也用它；最上面填了的值优先
+: > /root/tgst.dec
+if [ -n "$TGST_PASS" ] && [ "$TGST_PASS" != '填这里' ]; then
+  if [ -f deploy/secrets.enc ] && TGST_PASS="$TGST_PASS" openssl enc -d __ENC_ARGS__ -in deploy/secrets.enc -pass env:TGST_PASS > /root/tgst.dec 2>/dev/null \\
+      && grep -q '^TG_BOT_TOKEN=' /root/tgst.dec; then
+    echo "SETUP_PIN=$TGST_PASS" >> /root/tgst.dec
+    echo "口令对了：用 deploy/secrets.enc 里加密的密钥"
+  else
+    : > /root/tgst.dec
+    echo "❌ 口令不对（或者仓库里没有 deploy/secrets.enc）：只用最上面填的值"
+  fi
+fi
+cp /root/tgst.dec .env
+while IFS= read -r line; do
+  case "$line" in *=填这里|"") continue ;; esac
+  grep -v "^${line%%=*}=" .env > .env.tmp || true
+  mv .env.tmp .env
+  echo "$line" >> .env
+done < /root/tgst.env
+rm -f /root/tgst.env /root/tgst.dec
 """
 
 
 def render_manual(repo: str, branch: str) -> str:
-    """用户自己在网页上建服务器用的开机脚本：跟 render_user_data 一样，只是 6 个变量放在最上面让用户自己填。"""
+    """用户自己在网页上建服务器用的开机脚本：跟 render_user_data 一样，只是变量放在最上面让用户自己填，
+    或者只填口令、解开仓库里加密的密钥（deploy/secrets.enc）。"""
     with open(os.path.join(HERE, "cloud-init.sh"), encoding="utf-8") as f:
         tpl = f.read()
     block = "cat > .env <<'ENVEOF'\n__ENV__\nENVEOF\n"
     if block not in tpl:
         sys.exit("❌ cloud-init.sh 里找不到写 .env 的那一段，manual 要跟着改")
     shebang, body = tpl.split("\n", 1)
-    body = body.replace(block, "cp /root/tgst.env .env && rm -f /root/tgst.env\n")
+    body = body.replace(block, ENV_MERGE.replace("__ENC_ARGS__", ENC_ARGS))
     body = body.replace("__BRANCH__", branch).replace("__REPO_URL__", f"https://github.com/{repo}.git")
     return shebang + "\n" + MANUAL_HEAD + body
+
+
+def short_boot(repo: str, branch: str, pw: str = "你的口令") -> str:
+    """贴进 DigitalOcean「Initialization scripts」的短开机脚本（口令写在里面，用户存在备忘录里）：下载 manual-user-data.sh 来跑。"""
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/deploy/manual-user-data.sh"
+    return ("#!/bin/bash\n"
+            f"export TGST_PASS='{pw}'\n"
+            f"for i in 1 2 3 4 5 6; do curl -fsSL {url} -o /root/tgst-boot.sh && break; sleep 20; done\n"
+            "bash /root/tgst-boot.sh\n")
 
 
 def cmd_manual(args):
@@ -153,7 +214,57 @@ def cmd_manual(args):
     out = os.path.join(HERE, "manual-user-data.sh")
     with open(out, "w", encoding="utf-8") as f:
         f.write(render_manual(args.repo, args.branch))
-    print(f"✅ 已生成 {out}（仓库要是公开的，服务器才拉得到代码）")
+    print(f"✅ 已生成 {out}（仓库要是公开的，服务器才拉得到代码）\n有口令时贴进 DigitalOcean 的短脚本：\n"
+          + short_boot(args.repo, args.branch))
+
+
+def new_pass() -> str:
+    return "-".join("".join(secrets.choice(PASS_CHARS) for _ in range(4)) for _ in range(6))
+
+
+def run_openssl(mode: str, data: bytes, pw: str) -> bytes:
+    """mode：-e 加密 / -d 解密，参数跟开机脚本里的一样。口令经环境变量传给 openssl，不出现在命令行里。"""
+    r = subprocess.run(["openssl", "enc", mode, *ENC_ARGS.split(), "-pass", "env:TGST_PASS"],
+                       input=data, capture_output=True, env={**os.environ, "TGST_PASS": pw})
+    if r.returncode != 0:
+        raise ValueError(r.stderr.decode("utf-8", "replace").strip()[:200] or "openssl 出错")
+    return r.stdout
+
+
+def make_bundle(env: dict, pw: str) -> bytes:
+    """把 BUNDLE_KEYS 里有值的几项加密（KEY=VALUE 每行一个），并确认解得回来。"""
+    plain = "".join(f"{k}={env[k]}\n" for k in BUNDLE_KEYS if env.get(k)).encode()
+    enc = run_openssl("-e", plain, pw)
+    if run_openssl("-d", enc, pw) != plain:
+        raise ValueError("加密以后解不回原文")
+    return enc
+
+
+def cmd_bundle(args):
+    root = os.path.dirname(HERE)
+    pass_file = os.path.abspath(args.pass_file)
+    if os.path.commonpath([pass_file, root]) == root:
+        sys.exit("❌ 口令文件不能放在仓库里（会被提交）：放到仓库外面，例如 Claude 的 scratchpad")
+    filevals = read_env_file(args.env_file) if args.env_file else {}
+    env = {k: (filevals.get(k) or os.environ.get(k) or "").strip() for k in BUNDLE_KEYS}
+    env["TG_PHONE"] = re.sub(r"[\s\-()]", "", env["TG_PHONE"])
+    errs = [f"缺少 {k}" for k in BUNDLE_KEYS if k != "TG_PHONE" and not env[k]] + env_errors(env)
+    if errs:
+        sys.exit("❌ " + "；".join(errs))
+    if os.path.exists(pass_file):
+        with open(pass_file, encoding="utf-8") as f:
+            pw = f.read().strip()
+    else:
+        pw = new_pass()
+        with os.fdopen(os.open(pass_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(pw + "\n")
+    if len(pw) < MIN_PASS or re.search(r"[\s'\"\\$`]", pw):
+        sys.exit(f"❌ 口令至少 {MIN_PASS} 位、不能有空格和引号：加密包放在公开仓库里，口令短了能被硬猜出来")
+    with open(args.out, "wb") as f:
+        f.write(make_bundle(env, pw))
+    keys = [k for k in BUNDLE_KEYS if env[k]]
+    print(f"✅ 已加密写入 {args.out}：{'、'.join(keys)}" + ("" if env["TG_PHONE"] else "（没有手机号：登录时机器人会问）"))
+    print(f"   口令在 {pass_file}（不要提交、不要打印）")
 
 
 def cmd_create(args):
@@ -250,8 +361,12 @@ def main():
     m = sub.add_parser("manual")
     m.add_argument("--repo", required=True, help="GitHub 仓库，格式 用户名/仓库名（要是公开的）")
     m.add_argument("--branch", default="main")
+    b = sub.add_parser("bundle", parents=[common])
+    b.add_argument("--pass-file", required=True, help="口令文件（没有就新生成一个写进去）：放在仓库外面，不要提交")
+    b.add_argument("--out", default=BUNDLE_PATH)
     args = p.parse_args()
-    {"create": cmd_create, "status": cmd_status, "destroy": cmd_destroy, "manual": cmd_manual}[args.cmd](args)
+    {"create": cmd_create, "status": cmd_status, "destroy": cmd_destroy, "manual": cmd_manual,
+     "bundle": cmd_bundle}[args.cmd](args)
 
 
 if __name__ == "__main__":

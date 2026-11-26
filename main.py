@@ -296,14 +296,37 @@ async def switch_phone(m: dict, notifier: Notifier) -> bool:
     return True
 
 
+ASK_PHONE = ("📱 请发用来监听频道的 Telegram 账号的手机号（带 + 和国家码），例如 +8613800000000\n"
+             "要是你自己能收到验证码的号。号码只存在服务器上，发过来我就删掉这条消息。")
+
+
+async def ask_phone(cfg: Config, notifier: Notifier) -> str:
+    """开机时没有 TG_PHONE（加密的密钥包里没放手机号，2026-11-26）：问主人要。发「+手机号」或「/phone +手机号」都行。
+    存进服务器 data/secrets.env 的 TG_PHONE（仓库是公开的，不能写进去）。"""
+    await notifier.send(ASK_PHONE)
+    while True:
+        m = await notifier.next_owner_message(3600)
+        if not m:
+            continue
+        text = m["text"].strip()
+        is_cmd = text.lower().startswith("/phone")
+        if text.startswith("/") and not is_cmd:
+            continue   # 比如又点了一次绑定链接（/start 口令）
+        await notifier.delete(m)
+        num = re.sub(r"[\s\-()]", "", text[len("/phone"):] if is_cmd else text)
+        if PHONE_RE.fullmatch(num):
+            save_secrets({"TG_PHONE": num})
+            cfg.tg_phone = num
+            return num
+        await notifier.send("没看懂这个号码：要带 + 和国家码，例如 +8613800000000")
+
+
 async def bot_login(client, cfg: Config, notifier: Notifier):
     """监听账号没登录时，通过你自己的机器人要验证码完成登录（手机上就能完成，不需要 SSH）。
-    这个号收不到验证码的话，主人发 /phone +新手机号 换一个账号监听（switch_phone）。"""
-    phone = cfg.tg_phone
-    if not phone:
-        sys.exit("❌ .env 里没有 TG_PHONE")
-    masked = phone[:4] + "****" + phone[-3:]
+    没有手机号就先问（ask_phone）；这个号收不到验证码的话，主人发 /phone +新手机号 换一个账号监听（switch_phone）。"""
     await notifier.skip_backlog()
+    phone = cfg.tg_phone or await ask_phone(cfg, notifier)
+    masked = phone[:4] + "****" + phone[-3:]
     while True:
         try:
             sent = await client.send_code_request(phone)
@@ -1144,6 +1167,25 @@ async def join_list(cfg: Config, client, slot: ChannelCfg, word: str = "") -> st
             {"inline_keyboard": rows})
 
 
+async def prompt_unjoined(cfg: Config, client, chans: dict, db: DB, notifier: Notifier):
+    """新服务器上私人群还没连上（以前连的记录在旧服务器的 data/ 里，跟着删了）：启动后主动列出监听账号所在的群，
+    主人点一下就连上（跟「/join 名字」一样）。每个位置只问一次（记在数据库里），之后看启动消息里的「❌ 没连上」。"""
+    for c in cfg.channels:
+        if not c.private or c.mode == "off" or any(c is x for x in chans.values()):
+            continue
+        key = f"join_prompted:{c.username}"
+        if db.kv_get(key):
+            continue
+        db.kv_set(key, int(time.time()))
+        try:
+            reply = await join_list(cfg, client, c)
+        except Exception as e:
+            log.warning("列出监听账号的群失败：%s", e)
+            continue
+        text, markup = reply if isinstance(reply, tuple) else (reply, None)
+        await notifier.send(f"🔗 私人群「{c.username}」还没连上（连上以后是{cfg.mode_label(c)}）。\n{text}", markup)
+
+
 async def join_pick(data: str, cfg: Config, client, restart) -> str:
     """点了 /join 列表里的群：记下这个群（没有邀请链接，以后按群 id 找），重启开始监听。"""
     parts = data.split(":")
@@ -1756,6 +1798,7 @@ async def cmd_run(cfg: Config):
                         f"｜{ex.label} API：{'已设置' if ex.has_keys else '未设置'}\n{modes}\n"
                         f"🧭 跟单规则：{rules_line(cfg.risk)}\n"
                         f"常用功能点输入框下方的按钮，全部命令发 /help", KEYBOARD)
+    await prompt_unjoined(cfg, client, chans, db, notifier)
     log.info("开始监听 %d 个频道", len(chans))
     try:
         await client.run_until_disconnected()

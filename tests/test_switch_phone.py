@@ -52,8 +52,10 @@ class FakeClient:
 def msg(t): return {"text": t, "chat": {"id": 1}, "message_id": 1}
 
 
-async def run(msgs):
+async def run(msgs, phone=None):
     cfg = C.Config()
+    if phone is not None:
+        cfg.tg_phone = phone
     n, c = FakeNotifier(msgs), FakeClient()
     try:
         await M.bot_login(c, cfg, n)
@@ -90,6 +92,17 @@ async def main():
 
     out, n, c = await run([msg("/status"), msg("9 8 7 6 5")])
     check("别的命令照旧不当验证码", out == "logged_in" and c.signed == [("+8613800000000", "98765")])
+
+    # 开机时没有手机号（2026-11-26 加密的密钥包里可以不放手机号）：先问，发「+号码」或「/phone +号码」都行
+    out, n, c = await run([msg("/start abcd-efgh"), msg("hello"), msg("+60 11-2222 3333"), msg("4 5 6 7 8")], phone="")
+    check("没有手机号：先问手机号", n.sent[0].startswith("📱 请发用来监听频道的 Telegram 账号的手机号"))
+    check("/start 口令（又点了一次绑定链接）不当号码", "/start abcd-efgh" not in n.deleted)
+    check("看不懂的：提示一下、删掉", "hello" in n.deleted and any("没看懂这个号码" in t for t in n.sent))
+    check("发「+号码」→ 存进 secrets.env，直接给这个号发验证码登录（不用重启）", out == "logged_in"
+          and "TG_PHONE=+601122223333" in secrets() and c.phones == ["+601122223333"] and c.signed == [("+601122223333", "45678")])
+    check("号码那条消息删掉", "+60 11-2222 3333" in n.deleted)
+    out, n, c = await run([msg("/phone +8613811112222"), msg("1 1 1 1 1")], phone="")
+    check("发「/phone +号码」也行", out == "logged_in" and c.signed == [("+8613811112222", "11111")])
     print(f"\n{ok} passed")
 
 asyncio.run(main())

@@ -238,14 +238,17 @@ class Notifier:
 
     async def discover_owner(self, pin: str) -> int:
         """首次部署：等用户给机器人发 /start <pin>，把他记为主人。
-        不丢弃积压消息：服务器装好之前就发来的 /start <pin> 也要认（口令每次部署随机生成，旧消息里不会有）。"""
-        log.info("等待主人绑定：请在 Telegram 给机器人发送 /start %s", pin)
+        不丢弃积压消息：服务器装好之前就发来的 /start <pin> 也要认（Claude 建服务器时口令每次随机生成；用户自己重开用的是固定的口令，
+        绑定以后这条消息马上删掉）。"""
+        # 重开时口令就是绑定口令（do_deploy bundle，2026-11-26）：长的不写进日志，用户可能把日志截图发出去
+        log.info("等待主人绑定：请在 Telegram 给机器人发送 /start %s", pin if len(pin) <= 10 else pin[:2] + "…（口令）")
         while not self.owner_id:
             try:
                 for u in await self._updates(50):
                     m = self._private_msg(u)
                     if m and pin in m["text"]:
                         self.owner_id = int(m["from"]["id"])
+                        await self.delete(m)   # 口令别留在聊天记录里
                         if self.data_dir:
                             with open(owner_file(self.data_dir), "w") as f:
                                 json.dump({"id": self.owner_id}, f)
