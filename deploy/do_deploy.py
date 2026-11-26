@@ -4,6 +4,8 @@
   python deploy/do_deploy.py create --repo 用户名/仓库名 [--branch main] [--env-file deploy.env] [--bot-username xxx_bot] [--dry-run]
   python deploy/do_deploy.py status
   python deploy/do_deploy.py destroy --yes        删除服务器（服务器上的交易记录、Telegram 登录会一起删除）
+  python deploy/do_deploy.py manual --repo 用户名/仓库名   生成 deploy/manual-user-data.sh：用户不用 Claude、
+        自己在 DigitalOcean 网页上建服务器时贴进「Initialization scripts」的开机脚本（改了 cloud-init.sh 要重新生成）
 
 变量来源：环境变量，或 --env-file 文件（KEY=VALUE，每行一个；文件里的值优先）
   必填：DIGITALOCEAN_TOKEN（要有 Write 权限） TG_API_ID TG_API_HASH TG_PHONE TG_BOT_TOKEN DEEPSEEK_API_KEY
@@ -117,6 +119,43 @@ def render_user_data(repo: str, branch: str, env: dict, gh_token: str, pin: str 
     return tpl.replace("__BRANCH__", branch).replace("__REPO_URL__", url).replace("__ENV__", "\n".join(lines))
 
 
+MANUAL_HEAD = """# 自己在 DigitalOcean 网页上建服务器时用（不用 Claude）：整段复制到建服务器页面的「Initialization scripts」里，
+# 只把下面 6 行等号后面的「填这里」换成你自己的值（等号两边不要加空格），别的都不要动。步骤见 README「自己重开」。
+# 这个文件由 deploy/do_deploy.py manual 从 cloud-init.sh 生成。
+cat > /root/tgst.env <<'ENVEOF'
+TG_API_ID=填这里
+TG_API_HASH=填这里
+TG_PHONE=填这里
+TG_BOT_TOKEN=填这里
+DEEPSEEK_API_KEY=填这里
+SETUP_PIN=填这里
+ENVEOF
+chmod 600 /root/tgst.env
+"""
+
+
+def render_manual(repo: str, branch: str) -> str:
+    """用户自己在网页上建服务器用的开机脚本：跟 render_user_data 一样，只是 6 个变量放在最上面让用户自己填。"""
+    with open(os.path.join(HERE, "cloud-init.sh"), encoding="utf-8") as f:
+        tpl = f.read()
+    block = "cat > .env <<'ENVEOF'\n__ENV__\nENVEOF\n"
+    if block not in tpl:
+        sys.exit("❌ cloud-init.sh 里找不到写 .env 的那一段，manual 要跟着改")
+    shebang, body = tpl.split("\n", 1)
+    body = body.replace(block, "cp /root/tgst.env .env && rm -f /root/tgst.env\n")
+    body = body.replace("__BRANCH__", branch).replace("__REPO_URL__", f"https://github.com/{repo}.git")
+    return shebang + "\n" + MANUAL_HEAD + body
+
+
+def cmd_manual(args):
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", args.repo or ""):
+        sys.exit("❌ --repo 格式应为 用户名/仓库名")
+    out = os.path.join(HERE, "manual-user-data.sh")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(render_manual(args.repo, args.branch))
+    print(f"✅ 已生成 {out}（仓库要是公开的，服务器才拉得到代码）")
+
+
 def cmd_create(args):
     token, env, gh = collect(args)
     errs = validate(token, env, args.repo, args.branch)
@@ -208,8 +247,11 @@ def main():
     sub.add_parser("status", parents=[common])
     d = sub.add_parser("destroy", parents=[common])
     d.add_argument("--yes", action="store_true")
+    m = sub.add_parser("manual")
+    m.add_argument("--repo", required=True, help="GitHub 仓库，格式 用户名/仓库名（要是公开的）")
+    m.add_argument("--branch", default="main")
     args = p.parse_args()
-    {"create": cmd_create, "status": cmd_status, "destroy": cmd_destroy}[args.cmd](args)
+    {"create": cmd_create, "status": cmd_status, "destroy": cmd_destroy, "manual": cmd_manual}[args.cmd](args)
 
 
 if __name__ == "__main__":

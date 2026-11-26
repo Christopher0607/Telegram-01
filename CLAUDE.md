@@ -2,7 +2,7 @@
 
 这个仓库是一个 Telegram 信号跟单机器人：监听 4 个喊单频道 → DeepSeek 解析 → 代码风控 → 交易所 USDT 永续模拟/实盘下单（`config.yaml` 的 `exchange.name`：gate、weex 或 bitget；2026-09-26 迁到 WEEX，2026-09-28 又换回 Gate，见日常操作「换交易所」） → 通过用户自己的 Telegram 机器人推送通知和每日日报。代码说明见 README.md，风控参数在 config.yaml。
 
-**2026-11-24 起项目暂停**：用户认为这些喊单群没有真实的交易能力、成绩都是运气，决定不跟了，自己去关掉 DigitalOcean 上的 `tg-signal-trader` 服务器。当时请他按顺序做：机器人里「🛑 全部平仓」→ Gate App 确认没有持仓、没有剩下的止损/计划委托 → 删掉 Gate（还有 WEEX，如果还在）的 API Key → Telegram「设备」里结束服务器那个登录（地点新加坡）→ DigitalOcean 里 Destroy `tg-signal-trader`（关机照样收费；**别动博悦 V9**，整个账号注销会连它一起删）。代码留在 GitHub。以后要重新开：按下面「首次部署」重新建服务器、重新登录 Telegram、重新设交易所 API（服务器 IP 会变，白名单要改），交易记录不会保留。
+**2026-11-24 起项目暂停**：用户认为这些喊单群没有真实的交易能力、成绩都是运气，决定不跟了，自己去关掉 DigitalOcean 上的 `tg-signal-trader` 服务器。当时请他按顺序做：机器人里「🛑 全部平仓」→ Gate App 确认没有持仓、没有剩下的止损/计划委托 → 删掉 Gate（还有 WEEX，如果还在）的 API Key → Telegram「设备」里结束服务器那个登录（地点新加坡）→ DigitalOcean 里 Destroy `tg-signal-trader`（关机照样收费；**别动博悦 V9**，整个账号注销会连它一起删）。代码留在 GitHub。以后要重新开：按下面「首次部署」重新建服务器、重新登录 Telegram、重新设交易所 API（服务器 IP 会变，白名单要改），交易记录不会保留。**用户不用 Claude 也能自己重开**（2026-11-26 用户要求）：README「自己重开」一节，手机浏览器在 DigitalOcean 网页上建服务器，把 `deploy/manual-user-data.sh`（`python deploy/do_deploy.py manual --repo 用户名/仓库名` 从 `cloud-init.sh` 生成，改了 cloud-init.sh 要重新生成）贴进「Initialization scripts」、填 6 个值（含 `SETUP_PIN`），再在机器人里 `/start PIN` 绑定、登录。停之前机器人里的设置（都存在已删掉的服务器 data/ 里，config.yaml 没改，重开后要在机器人里改回）：每单亏总权益 10%、同时最多 15 单、每天最多亏 6 单；跟单规则：挂限价等回调｜晒盈利全部平掉｜打到信号止损才平｜第一止盈后推保本｜频道减仓不跟；实盘：UMIE、huhu、糊糊圖圖，其他模拟。用过的换主人口令 2026-11-26 已从 config.yaml 清空（新服务器上没有「用过」的记录，留着旧口令又能用）。
 
 **用户（俊宇）只用手机，不是程序员。** 用中文沟通，每步做完用一两句话告诉他结果。需要他操作时，给出手机上能照做的具体步骤。
 

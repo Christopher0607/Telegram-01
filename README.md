@@ -17,6 +17,45 @@
 交易所现在用 Gate（`config.yaml` 里 `exchange.name: gate`；也支持 `weex`、`bitget`）。WEEX 的 API 用 `/weex KEY SECRET PASSPHRASE` 设置、`/weextest` 实测，换交易所前可以先测。
 换交易所时，旧交易所上还没平完的实盘单不用先平掉：只要旧交易所的 API 还在，程序会继续在旧交易所管到平仓（止损、止盈、保本、跟频道平仓、「🔍 核对止损止盈」都照常），新单在新交易所开；「📊 状态」里会多一行「🔚 旧交易所（收尾）」。Gate API：给机器人发 `/ip` 拿到服务器 IP，在 Gate 建子账户 API（只给「合约」读写权限、不给提现、IP 白名单填这个 IP），然后发 `/gate KEY SECRET` 给机器人。机器人验证通过后才会保存，并会删掉你这条消息。第一次开实盘前发一次 `/gatetest`：用 1 张 BTC 合约（约 8U，花费约 0.01U）实测开仓、挂止损、止损触发平仓。
 
+## 自己重开（不用 Claude，只要手机浏览器）
+
+2026-11 服务器已经删掉（项目暂停）。代码都在这个仓库里，想重开就照下面做，大约 30 分钟。
+**交易记录、机器人里改过的设置都跟着旧服务器删掉了**，重开后是一个全新的机器人，默认全部模拟盘。
+
+**1. 先准备 6 个值**（记在手机备忘录里）
+| 名字 | 去哪拿 |
+|---|---|
+| `TG_API_ID`、`TG_API_HASH` | 手机浏览器打开 my.telegram.org → 用你的 Telegram 号登录 → API development tools → 随便填个名字建一个 → 复制 api_id 和 api_hash |
+| `TG_PHONE` | 用来监听频道的 Telegram 号的手机号，带 + 和国家码，例如 `+60123456789`。**要是你自己能收短信的号** |
+| `TG_BOT_TOKEN` | Telegram 找 @BotFather → `/mybots` → 选你的机器人 → API Token（没有就 `/newbot` 新建一个，名字别带 Telegram、跟单之类的字，会被删） |
+| `DEEPSEEK_API_KEY` | platform.deepseek.com → API keys |
+| `SETUP_PIN` | 自己随便想 6 位数字，例如 `482913`，第 3 步要用 |
+
+**2. 在 DigitalOcean 建服务器**（手机浏览器打开 cloud.digitalocean.com）
+1. Create → Droplets。
+2. 地区选 Singapore；系统选 Ubuntu 24.04；大小选 Basic → Regular → 每月 6 美元那一档（1 GB）。
+3. 登录方式选 Password，自己设一个 root 密码记好。
+4. 打开 Advanced Options → 勾「Add Initialization scripts」。
+5. 在这个仓库里打开 `deploy/manual-user-data.sh` → 点 Raw → 全选、复制 → 粘贴进去 → 把最上面 6 行的「填这里」换成第 1 步的值（等号两边不要加空格）。
+6. 名字填 `tg-signal-trader` → Create Droplet。
+
+**3. 10～15 分钟后，在 Telegram 里给你的机器人发 `/start 你的6位数字`**
+- 机器人说验证码已发送 → 到 Telegram 官方「Telegram」对话里看验证码 → **数字用空格隔开**发给机器人（例如 `1 2 3 4 5`）；开了二步验证的再发密码。
+- 看到「🚀 信号跟单已启动」就好了。半小时还没反应：DigitalOcean 里点这台服务器 → Access → Launch Droplet Console，用 root 和你设的密码登录，运行 `tail -50 /var/log/tgst-setup.log` 截图找人看。
+
+**4. 恢复设置**（这些都在机器人里点，不用改代码）
+- 交易所：发 `/ip` 拿到服务器 IP → Gate 建 API（只给合约权限、不给提现、IP 白名单填这个 IP）→ 发 `/gate KEY SECRET` → 发 `/gatetest` 实测一次。
+- 私人群（`huhu` 是糊糊的内部会员群、`vip` 是会员群）：让群管理员把监听的号拉进群，再发 `/join huhu`（或 `/join vip`）从列表里点；有邀请链接就发 `/join huhu 链接`。公开频道会自动加入。
+- 停之前（2026-11）用的设置，想照旧就在机器人里改回去：
+  - 「💰 风控设置」：每单亏总权益 10%、同时最多 15 单、每天最多亏 6 单；
+  - 「🧭 跟单规则」：挂限价等回调｜晒盈利全部平掉｜打到信号止损才平｜第一止盈后推保本｜频道减仓不跟；
+  - 「⚙️ 实盘/模拟」：UMIE、huhu、糊糊圖圖 三个实盘，其他模拟。
+- 建议先用模拟盘跑一阵、用 `/backtest` 看看再切实盘。
+
+**不用了要删服务器**：DigitalOcean 里点这台服务器 → Destroy。只关机照样收费。同一个账号里别的服务器（例如博悦 V9）别动。
+
+---
+
 下面是有电脑、能 SSH 时的手动部署步骤，用手机部署不用看。
 
 ---
