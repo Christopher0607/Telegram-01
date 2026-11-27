@@ -45,6 +45,8 @@ BUNDLE_PATH = os.path.join(HERE, "secrets.enc")
 ENC_ARGS = "-aes-256-cbc -pbkdf2 -iter 1000000 -md sha256 -a"
 PASS_CHARS = "abcdefghijkmnpqrstuvwxyz23456789"   # 32 个字符（去掉了容易看错的 l、o、0、1），24 位 = 120 bit
 MIN_PASS = 20
+# 没有加密包时用户在短开机脚本里自己 export 的值（2026-11-27 用户决定重开时再填；手机号不用填，登录时机器人会问）
+FILL_KEYS = ["TG_API_ID", "TG_API_HASH", "TG_BOT_TOKEN", "DEEPSEEK_API_KEY", "SETUP_PIN"]
 
 
 def read_env_file(path: str) -> dict:
@@ -199,13 +201,19 @@ def render_manual(repo: str, branch: str) -> str:
     return shebang + "\n" + MANUAL_HEAD + body
 
 
-def short_boot(repo: str, branch: str, pw: str = "你的口令") -> str:
-    """贴进 DigitalOcean「Initialization scripts」的短开机脚本（口令写在里面，用户存在备忘录里）：下载 manual-user-data.sh 来跑。"""
+def short_boot(repo: str, branch: str, pw: str = "你的口令", values: dict | None = None) -> str:
+    """贴进 DigitalOcean「Initialization scripts」的短开机脚本（用户存在备忘录里）：下载 manual-user-data.sh 来跑。
+    有加密包：只 export 口令；values 给了就 export 这些值（README 里让用户自己填的那段：FILL_KEYS 全是「填这里」）。"""
     url = f"https://raw.githubusercontent.com/{repo}/{branch}/deploy/manual-user-data.sh"
-    return ("#!/bin/bash\n"
-            f"export TGST_PASS='{pw}'\n"
-            f"for i in 1 2 3 4 5 6; do curl -fsSL {url} -o /root/tgst-boot.sh && break; sleep 20; done\n"
+    head = "".join(f"export {k}='{v}'\n" for k, v in values.items()) if values is not None else f"export TGST_PASS='{pw}'\n"
+    return ("#!/bin/bash\n" + head
+            + f"for i in 1 2 3 4 5 6; do curl -fsSL {url} -o /root/tgst-boot.sh && break; sleep 20; done\n"
             "bash /root/tgst-boot.sh\n")
+
+
+def fill_boot(repo: str, branch: str) -> str:
+    """README「自己重开」里让用户把「填这里」换成自己的值的那段短开机脚本。"""
+    return short_boot(repo, branch, values={k: "填这里" for k in FILL_KEYS})
 
 
 def cmd_manual(args):
@@ -214,8 +222,8 @@ def cmd_manual(args):
     out = os.path.join(HERE, "manual-user-data.sh")
     with open(out, "w", encoding="utf-8") as f:
         f.write(render_manual(args.repo, args.branch))
-    print(f"✅ 已生成 {out}（仓库要是公开的，服务器才拉得到代码）\n有口令时贴进 DigitalOcean 的短脚本：\n"
-          + short_boot(args.repo, args.branch))
+    print(f"✅ 已生成 {out}（仓库要是公开的，服务器才拉得到代码）\n贴进 DigitalOcean 的短脚本（README 里那段）：\n"
+          + fill_boot(args.repo, args.branch) + "\n有加密包、口令时：\n" + short_boot(args.repo, args.branch))
 
 
 def new_pass() -> str:

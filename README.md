@@ -19,32 +19,46 @@
 
 ## 自己重开（不用 Claude，只要手机浏览器）
 
-2026-11 服务器已经删掉（项目暂停）。代码、设置和加密的密钥都在这个仓库里，重开只要做 3 件事：**建服务器、登录 Telegram、设交易所 API**，大约 20 分钟。
+2026-11 服务器已经删掉（项目暂停）。代码和设置都在这个仓库里，重开只要做 3 件事：**建服务器、登录 Telegram、设交易所 API**，大约 30 分钟。
 **交易记录跟着旧服务器删掉了**（实盘单的成交记录 Gate App 里还查得到）。
 
-你要有：**口令**和一段 **4 行的开机脚本**（2026-11 Claude Code 给你的，存在手机备忘录 / Telegram 收藏夹里）。
-机器人 Token、DeepSeek Key、Telegram API 用这个口令加密存在 `deploy/secrets.enc`，开机时自动解开。
+**0. 先在手机备忘录里准备好开机脚本**：复制下面这段，把 5 个「填这里」换成你自己的值（单引号留着）。
+
+```
+#!/bin/bash
+export TG_API_ID='填这里'
+export TG_API_HASH='填这里'
+export TG_BOT_TOKEN='填这里'
+export DEEPSEEK_API_KEY='填这里'
+export SETUP_PIN='填这里'
+for i in 1 2 3 4 5 6; do curl -fsSL https://raw.githubusercontent.com/Christopher0607/Telegram-01/main/deploy/manual-user-data.sh -o /root/tgst-boot.sh && break; sleep 20; done
+bash /root/tgst-boot.sh
+```
+
+| 名字 | 去哪拿 |
+|---|---|
+| `TG_API_ID`、`TG_API_HASH` | 手机浏览器打开 my.telegram.org → 用你的 Telegram 号登录 → API development tools（没有就随便填个名字建一个）→ 复制 api_id 和 api_hash |
+| `TG_BOT_TOKEN` | Telegram 找 @BotFather → `/mybots` → 选你的机器人 → API Token（别点 Revoke；没有机器人就 `/newbot` 新建一个，名字别带 Telegram、跟单之类的字，会被删） |
+| `DEEPSEEK_API_KEY` | platform.deepseek.com → API keys（以前的 Key 只看得到一部分的话，就新建一个） |
+| `SETUP_PIN` | 自己随便想 6 位数字，例如 `482913`，第 2 步要用 |
+
+手机号不用写，登录时机器人会问。（以后要是让 Claude Code 做了「加密的密钥包」，你会拿到一个口令：那就把 5 行 `export` 换成一行 `export TGST_PASS='口令'`，第 2 步发 `/start 口令`。）
 
 **1. 在 DigitalOcean 建服务器**（手机浏览器打开 cloud.digitalocean.com）
 1. Create → Droplets。
 2. 地区选 Singapore；系统选 Ubuntu 24.04；大小选 Basic → Regular → 每月 6 美元那一档（1 GB）。
 3. 登录方式选 Password，自己设一个 root 密码记好。
-4. 打开 Advanced Options → 勾「Add Initialization scripts」→ 把那段开机脚本整段粘贴进去。它长这样（`你的口令` 那里是你的口令）：
-   ```
-   #!/bin/bash
-   export TGST_PASS='你的口令'
-   for i in 1 2 3 4 5 6; do curl -fsSL https://raw.githubusercontent.com/Christopher0607/Telegram-01/main/deploy/manual-user-data.sh -o /root/tgst-boot.sh && break; sleep 20; done
-   bash /root/tgst-boot.sh
-   ```
+4. 打开 Advanced Options → 勾「Add Initialization scripts」→ 把备忘录里那段开机脚本整段粘贴进去。
 5. 名字填 `tg-signal-trader` → Create Droplet。
 
 **2. 10～15 分钟后，在 Telegram 里登录**
-1. 给你的机器人发 `/start 你的口令`。
-2. 机器人问手机号 → 发监听频道用的号（带 + 和国家码，例如 `+60123456789`，要是你自己能收验证码的号）。加密包里存了手机号就不会问。
+1. 给你的机器人发 `/start 你的SETUP_PIN`。
+2. 机器人问手机号 → 发监听频道用的号（带 + 和国家码，例如 `+60123456789`，要是你自己能收验证码的号）。
 3. 机器人说验证码已发送 → 到官方「Telegram」对话里看验证码 → **数字用空格隔开**发给机器人（例如 `1 2 3 4 5`）；开了二步验证的再发密码。
 4. 看到「🚀 信号跟单已启动」就好了。公开频道自动加入；私人群（`huhu`、`vip`）机器人会列出你这个号所在的群，点一下哪个是它就连上
    （没列出来：请群管理员把这个号拉进群，再发 `/join huhu`；有邀请链接就发 `/join huhu 链接`）。
-- 半小时还没反应：DigitalOcean 里点这台服务器 → Access → Launch Droplet Console，用 root 和你设的密码登录，运行 `tail -50 /var/log/tgst-setup.log` 截图找人看。里面写「❌ 口令不对」就是口令抄错了。
+- 半小时还没反应：DigitalOcean 里点这台服务器 → Access → Launch Droplet Console，用 root 和你设的密码登录，运行 `tail -50 /var/log/tgst-setup.log` 截图找人看。
+- 值填错了（例如机器人说「❌ 发送登录验证码失败」）：这时还没开始交易，在 DigitalOcean 里 Destroy 这台服务器，改好备忘录里的开机脚本再建一台。
 
 **3. 交易所 API**：发 `/ip` 拿到服务器 IP → Gate 建 API（只给合约权限、不给提现、IP 白名单填这个 IP）→ 发 `/gate KEY SECRET` → 发 `/gatetest` 实测一次。
 
@@ -55,20 +69,6 @@
 
 ⚠️ **实盘会真实下单，每单打到止损约亏总权益的 10%。** 第 3 步 `/gatetest` 通过以后就会开始真实下单。
 想先模拟着看看，在「⚙️ 实盘/模拟」里切回模拟；想改风险在「💰 风控设置」里改。
-
-**某个密钥换了**（例如 DeepSeek Key 重新建了、机器人换了一个）：开机脚本 `export TGST_PASS=...` 那一行下面加一行，例如 `export DEEPSEEK_API_KEY='新的'`
-（能加的：`TG_API_ID`、`TG_API_HASH`、`TG_PHONE`、`TG_BOT_TOKEN`、`DEEPSEEK_API_KEY`），加了的比加密包里的优先。
-
-**口令丢了**：不用口令也能开，只是要自己准备 6 个值：在这个仓库里打开 `deploy/manual-user-data.sh` → 点 Raw → 全选、复制，
-贴进第 1 步的 Initialization scripts（代替那段短脚本），把最上面 6 行的「填这里」换成下面的值（等号两边不要加空格）；第 2 步发 `/start 你自己定的SETUP_PIN`。
-
-| 名字 | 去哪拿 |
-|---|---|
-| `TG_API_ID`、`TG_API_HASH` | 手机浏览器打开 my.telegram.org → 用你的 Telegram 号登录 → API development tools → 随便填个名字建一个 → 复制 api_id 和 api_hash |
-| `TG_PHONE` | 用来监听频道的 Telegram 号的手机号，带 + 和国家码，例如 `+60123456789`。**要是你自己能收短信的号** |
-| `TG_BOT_TOKEN` | Telegram 找 @BotFather → `/mybots` → 选你的机器人 → API Token（没有就 `/newbot` 新建一个，名字别带 Telegram、跟单之类的字，会被删） |
-| `DEEPSEEK_API_KEY` | platform.deepseek.com → API keys |
-| `SETUP_PIN` | 自己随便想 6 位数字，例如 `482913`，第 2 步要用 |
 
 **不用了要删服务器**：DigitalOcean 里点这台服务器 → Destroy。只关机照样收费。同一个账号里别的服务器（例如博悦 V9）别动。
 

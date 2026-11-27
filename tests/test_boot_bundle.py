@@ -93,6 +93,19 @@ check("有口令但仓库里没有加密包：提示、只用填了的值", "❌
 env, _, _ = boot()
 check("什么都没填：.env 是空的（机器人会说缺少设置，不会拿「填这里」当值）", env == "")
 
+# 3b. 没有加密包（2026-11-27 用户决定重开时再填）：README 里那段短开机脚本，自己 export 5 个值
+fill = D.fill_boot(REPO, "main")
+with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+    check("README「自己重开」里那段开机脚本就是 fill_boot 生成的（5 个「填这里」、语法没问题）",
+          fill in f.read() and fill.count("='填这里'") == len(D.FILL_KEYS) == 5
+          and subprocess.run(["bash", "-n", "-c", fill]).returncode == 0)
+mine = {k: FAKE.get(k, "482913") for k in D.FILL_KEYS}
+env, out, left = boot(exported=mine)
+check("没有口令、短脚本里 export 了 5 个值：.env 就是这 5 个（手机号登录时机器人问）",
+      lines(env) == lines("".join(f"{k}={v}\n" for k, v in mine.items())) and "口令" not in out and left == [], env)
+env, _, _ = boot(exported=dict(mine, DEEPSEEK_API_KEY="填这里"))
+check("有一个忘了换（还是「填这里」）：这一项不写进 .env", "DEEPSEEK_API_KEY" not in env and "TG_BOT_TOKEN=" in env)
+
 # 4. 生成加密包的命令
 tmp = tempfile.mkdtemp()
 ef = os.path.join(tmp, "deploy.env")
